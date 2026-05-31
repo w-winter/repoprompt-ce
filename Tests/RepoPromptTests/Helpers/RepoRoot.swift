@@ -30,6 +30,15 @@ enum RepoRoot {
             current = parent
         }
     }
+
+    static func relativePath(for fileURL: URL, relativeTo rootURL: URL) -> String {
+        let rootPath = rootURL.standardizedFileURL.path
+        let filePath = fileURL.standardizedFileURL.path
+        let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+
+        guard filePath.hasPrefix(prefix) else { return filePath }
+        return String(filePath.dropFirst(prefix.count))
+    }
 }
 
 enum RepoRootError: Error, CustomStringConvertible {

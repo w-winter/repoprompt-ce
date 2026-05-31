@@ -22,7 +22,7 @@ final class PromptResourceMirrorRemovalTests: XCTestCase {
 
         for file in try swiftFiles(under: scannedRoots) {
             let contents = try String(contentsOf: file, encoding: .utf8)
-            let displayPath = file.path.replacingOccurrences(of: repoRoot.path + "/", with: "")
+            let displayPath = RepoRoot.relativePath(for: file, relativeTo: repoRoot)
 
             for fragment in forbiddenFragments {
                 XCTAssertFalse(

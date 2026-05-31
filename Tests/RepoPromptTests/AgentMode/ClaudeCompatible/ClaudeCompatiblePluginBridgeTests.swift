@@ -145,7 +145,7 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
             guard resourceValues.isRegularFile == true else { continue }
             let contents = try String(contentsOf: url, encoding: .utf8)
             guard contents.contains("import RepoPromptClaudeCompatibleProvider") else { continue }
-            imports.append(url.path.replacingOccurrences(of: repoRoot.path + "/", with: ""))
+            imports.append(RepoRoot.relativePath(for: url, relativeTo: repoRoot))
         }
         return imports.sorted()
     }

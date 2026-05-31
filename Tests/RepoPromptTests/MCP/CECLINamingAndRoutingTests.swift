@@ -41,7 +41,7 @@ final class CECLINamingAndRoutingTests: XCTestCase {
             includingPropertiesForKeys: nil
         )
         .filter { $0.pathExtension == "swift" }
-        .map { $0.path.replacingOccurrences(of: root.path + "/", with: "") }
+        .map { RepoRoot.relativePath(for: $0, relativeTo: root) }
         .sorted()
 
         let relativePaths = [
