@@ -200,3 +200,7 @@ publish Developer ID signed, notarized GitHub Releases through the protected
 workflow documented in [`docs/releasing.md`](docs/releasing.md). See
 [`docs/open-source-readiness.md`](docs/open-source-readiness.md) for the
 remaining public-readiness inventory.
+
+RepoPrompt CE starts its independent release history at `1.0.0`. Contributors
+prepare testable release candidates; maintainers own public tags, Apple
+credentials, Sparkle signing keys, draft GitHub Releases, and final promotion.

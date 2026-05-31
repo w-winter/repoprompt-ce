@@ -25,9 +25,20 @@ ad-hoc signed, intended for packaging validation, and not distributable.
 Read [`docs/releasing.md`](../../../docs/releasing.md) before publishing.
 
 Use the protected GitHub **Publish Release** workflow for production
-distribution. It requires an existing pushed tag and the `release` environment
-secrets documented there. Do not paste private keys, profiles, certificate
-exports, or passwords into logs or chat.
+draft creation. It requires an existing pushed tag and the `release`
+environment secrets documented there. Review and test the resulting immutable
+draft assets before promoting the existing draft without rebuilding it. Do not
+paste private keys, profiles, certificate exports, or passwords into logs or
+chat.
+
+RepoPrompt CE starts its independent release history at `1.0.0 (1)`.
+Increment `BUILD_NUMBER` monotonically for every later public update.
+
+For an explicit private-source updater smoke test, use the maintainer-only
+`Scripts/publish_public_update_test.sh` helper documented in
+[`docs/releasing.md`](../../../docs/releasing.md). It publishes only verified
+Developer ID signed, notarized ZIPs to the public artifact-only update
+repository.
 
 Before a tag, commit, or push, run the repository-local
 `$rpce-contribution-check` skill and follow its approval requirements.

@@ -8,26 +8,39 @@ Release/debug packaging currently derives app identity from [`version.env`](../v
 
 - `APP_NAME=RepoPrompt`
 - `DISPLAY_NAME="RepoPrompt CE"`
-- `MARKETING_VERSION=2.1.24`
-- `BUILD_NUMBER=326`
+- `MARKETING_VERSION=1.0.0`
+- `BUILD_NUMBER=1`
 - `BUNDLE_ID=com.pvncher.repoprompt.ce`
 - `SIGNING_TEAM_ID=648A27MST5`
 
-Treat these values as maintainer-owned release metadata. Contributors should not change bundle IDs, signing team IDs, Sparkle keys, or release channels unless a maintainer has explicitly provided the replacement values. Forks that need a branded app should override locally or carry their own release metadata patch.
+RepoPrompt CE starts a new public release line at `1.0.0 (1)`. The separate CE
+bundle identifier, Sparkle key pair, and appcast intentionally do not inherit
+the closed app's version history. Treat these values as maintainer-owned
+release metadata. Contributors should not change bundle IDs, signing team IDs,
+Sparkle keys, or release channels unless a maintainer has explicitly provided
+the replacement values. Forks that need a branded app should override locally
+or carry their own release metadata patch.
 
 `./Scripts/package_app.sh release` produces a signed release `.app` bundle. A signed release requires `SIGN_IDENTITY` and a `REPOPROMPT_PROVISIONING_PROFILE` for `648A27MST5.com.pvncher.repoprompt.ce`, renders the CE entitlements template, uses timestamped hardened-runtime signing, verifies the signed bundle identifier/team, uses Keychain-backed secure storage, copies the root `LICENSE` and `THIRD_PARTY_NOTICES.md` files into `Contents/Resources/Legal`, and recursively copies root [`ThirdPartyLicenses/`](../ThirdPartyLicenses/) into `Contents/Resources/Legal/ThirdPartyLicenses/` in the packaged app.
 
-[`Scripts/release.sh`](../Scripts/release.sh) adds a secret-free ad-hoc release-candidate lane plus the maintainer publishing lane: Developer ID signing, notarization, stapling, ZIP and DMG generation, signed Sparkle appcast generation, checksums, and GitHub Release publication. The protected GitHub workflow and required environment secrets are documented in [`docs/releasing.md`](releasing.md).
+[`Scripts/release.sh`](../Scripts/release.sh) adds a secret-free ad-hoc release-candidate lane plus the maintainer publishing lane: Developer ID signing, notarization, stapling, ZIP and DMG generation, Sparkle EdDSA-signed update archive metadata, checksums, and GitHub Release draft creation. The contributor and maintainer process, protected GitHub workflow, required environment secrets, and public Sparkle follow-ups are documented in [`docs/releasing.md`](releasing.md).
 
 ## Sparkle metadata
 
 [`AppBundle/Info.plist.template`](../AppBundle/Info.plist.template) currently contains Sparkle fields:
 
-- `SUFeedURL=https://github.com/repoprompt/repoprompt-ce/releases/latest/download/appcast.xml`
+- `SUFeedURL=https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml`
 - `SUPublicEDKey=<public EdDSA key committed in the plist>`
 - `SUBundleName=RepoPrompt CE.app`
 
 These are documented as maintainer-owned release/update-channel values. Do not replace them with guessed fork values. The inherited Sparkle EdDSA key pair was rotated to a CE-specific pair on 2026-05-31: only the new public key is committed, the private key is stored in the GitHub `release` environment, and the app-side Sparkle integrity checks agree with the plist values.
+
+The stable feed is hosted in the deliberately public, artifact-only
+[`repoprompt/repoprompt-ce-updates`](https://github.com/repoprompt/repoprompt-ce-updates)
+repository. This keeps the appcast and signed updater ZIP anonymously
+downloadable while the source repository remains private during validation.
+The organization currently disables GitHub Pages creation, so the feed uses
+public GitHub Release assets in that repository rather than Pages.
 
 ## Dependency pins
 
@@ -76,6 +89,8 @@ Remaining blockers:
 - Enable a GitHub configuration that exposes required-reviewer protection for the `release` environment, or document and enforce an equivalent maintainer approval gate before treating the publishing workflow as protected. The current private-repository settings do not expose a required-reviewer control.
 - Scrub the historical contributor cohort from existing git history before the repository is made public.
 - Finish the comprehensive notice inventory for SwiftPM dependencies.
+- Harden the public Sparkle promotion path before treating automatic updates as production-ready: validate that the CI private key matches the committed public key, publish an existing reviewed draft without rebuilding it, explicitly mark the intended stable tag as GitHub's latest release, and run anonymous post-publish feed, archive-signature, and checksum smoke checks.
+- Automate mirroring reviewed release assets into the public `repoprompt-ce-updates` repository. The maintainer-only [`Scripts/publish_public_update_test.sh`](../Scripts/publish_public_update_test.sh) helper provides the explicit private-repository smoke path in the meantime.
 
 ## Contributor validation touchpoints
 
