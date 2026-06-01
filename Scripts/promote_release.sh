@@ -46,6 +46,10 @@ require_file() {
     [[ -f "$1" ]] || fail "Missing required file: $1"
 }
 
+smoke_embedded_mcp_helper() {
+    "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh" "$@"
+}
+
 require_env() {
     [[ -n "${!1:-}" ]] || fail "Missing required environment variable: $1"
 }
@@ -149,6 +153,7 @@ validate_app_bundle() {
 
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/validate_packaged_legal.sh" "$app_bundle"
+    smoke_embedded_mcp_helper "$app_bundle" "Reviewed ZIP MCP helper"
 }
 
 validate_dmg_matches_zip_app() {
@@ -160,6 +165,7 @@ validate_dmg_matches_zip_app() {
     [[ -d "$dmg_app" ]] || fail "DMG does not contain $APP_NAME.app at its root"
     diff -qr "$APP_BUNDLE" "$dmg_app" ||
         fail "DMG app contents do not match the verified update ZIP app"
+    smoke_embedded_mcp_helper "$dmg_app" "Mounted DMG MCP helper"
 
     hdiutil detach "$DMG_MOUNT_POINT" >/dev/null
     DMG_MOUNT_POINT=""
@@ -236,6 +242,7 @@ verify_source_release() {
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/verify_remote_release_commit.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_signature.swift"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh"
     "$CONTROL_PLANE_SCRIPTS_DIR/verify_remote_release_commit.sh" "$RELEASE_TAG" "$RELEASE_COMMIT"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh"

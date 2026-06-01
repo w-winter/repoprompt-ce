@@ -139,6 +139,7 @@ class LocalProductionInstallerTests(unittest.TestCase):
             entitlements,
             {
                 "com.apple.security.cs.allow-jit": True,
+                "com.apple.security.cs.disable-library-validation": True,
                 "com.apple.security.files.bookmarks.app-scope": True,
                 "com.apple.security.temporary-exception.mach-lookup.global-name": [
                     "__BUNDLE_ID__-spks",

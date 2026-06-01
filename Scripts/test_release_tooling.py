@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import os
+import plistlib
 import shutil
 import stat
 import subprocess
@@ -17,6 +18,78 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 class ReleaseToolingTests(unittest.TestCase):
+    def test_custom_packaging_resigns_sparkle_helpers_without_recursive_entitlement_propagation(self) -> None:
+        package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+        staged_signing_script = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
+        info_plist = plistlib.loads((SCRIPT_DIR.parent / "AppBundle" / "Info.plist.template").read_bytes())
+
+        for script in (package_script, staged_signing_script):
+            self.assertIn('sign_path "$framework/Versions/B/XPCServices/Installer.xpc"', script)
+            self.assertIn(
+                'sign_path "$framework/Versions/B/XPCServices/Downloader.xpc" --preserve-metadata=entitlements',
+                script,
+            )
+            self.assertIn('sign_path "$framework/Versions/B/Autoupdate"', script)
+            self.assertIn('sign_path "$framework/Versions/B/Updater.app"', script)
+            self.assertIn('sign_path "$framework"', script)
+
+        self.assertIn('APP_SIGN_ARGS=()', package_script)
+        self.assertNotIn('APP_SIGN_ARGS=(--deep)', package_script)
+        self.assertNotIn('sign_path "$APP_BUNDLE" --deep', staged_signing_script)
+        self.assertNotIn("SUEnableInstallerLauncherService", info_plist)
+        self.assertIn("trap 'finish $?' EXIT", package_script)
+        self.assertIn('local status="$1" now total', package_script)
+
+    def test_release_paths_smoke_embedded_mcp_helper_after_signing_and_before_publish(self) -> None:
+        package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+        staged_signing_script = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
+        promote_script = (SCRIPT_DIR / "promote_release.sh").read_text(encoding="utf-8")
+        public_update_script = (SCRIPT_DIR / "publish_public_update_test.sh").read_text(encoding="utf-8")
+
+        package_outer_sign = package_script.index('sign_path "$APP_BUNDLE" "${APP_SIGN_ARGS[@]}"')
+        package_smoke = package_script.index('"$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh"')
+        self.assertLess(package_outer_sign, package_smoke)
+
+        staged_outer_sign = staged_signing_script.index('sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"')
+        staged_smoke = staged_signing_script.index('"$SCRIPT_DIR/smoke_embedded_mcp_helper.sh"')
+        self.assertLess(staged_outer_sign, staged_smoke)
+
+        validate_app_bundle = promote_script.split("validate_app_bundle() {", 1)[1].split("\n}", 1)[0]
+        self.assertLess(
+            validate_app_bundle.index('codesign --verify --deep --strict --verbose=2 "$app_bundle"'),
+            validate_app_bundle.index('smoke_embedded_mcp_helper "$app_bundle" "Reviewed ZIP MCP helper"'),
+        )
+        validate_dmg = promote_script.split("validate_dmg_matches_zip_app() {", 1)[1].split("\n}", 1)[0]
+        self.assertLess(
+            validate_dmg.index('diff -qr "$APP_BUNDLE" "$dmg_app"'),
+            validate_dmg.index('smoke_embedded_mcp_helper "$dmg_app" "Mounted DMG MCP helper"'),
+        )
+        self.assertLess(
+            validate_dmg.index('smoke_embedded_mcp_helper "$dmg_app" "Mounted DMG MCP helper"'),
+            validate_dmg.index('hdiutil detach "$DMG_MOUNT_POINT"'),
+        )
+        self.assertLess(
+            public_update_script.index('"$ROOT_DIR/Scripts/smoke_embedded_mcp_helper.sh"'),
+            public_update_script.index('gh release create "$PUBLIC_UPDATE_TAG"'),
+        )
+
+    def test_embedded_mcp_helper_smoke_rejects_exit_137(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        helper = temp_dir / "RepoPrompt.app" / "Contents" / "MacOS" / "repoprompt-mcp"
+        helper.parent.mkdir(parents=True)
+        helper.write_text("#!/usr/bin/env bash\nexit 137\n", encoding="utf-8")
+        helper.chmod(0o755)
+
+        result = subprocess.run(
+            [str(SCRIPT_DIR / "smoke_embedded_mcp_helper.sh"), str(temp_dir / "RepoPrompt.app"), "Fixture helper"],
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Fixture helper failed --version smoke (exit 137)", result.stderr)
+
     def test_sparkle_start_is_deferred_until_release_bundle_verification(self) -> None:
         app_delegate = (SCRIPT_DIR.parent / "Sources" / "RepoPrompt" / "App" / "AppDelegate.swift").read_text(
             encoding="utf-8"

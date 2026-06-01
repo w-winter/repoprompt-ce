@@ -68,16 +68,26 @@ sign_path() {
     codesign --force --sign "$SIGN_IDENTITY" --timestamp --options runtime "$@" "$path"
 }
 
-sign_path "$STAGED_SPARKLE_FRAMEWORK"
+sign_sparkle_framework() {
+    local framework="$1"
+    sign_path "$framework/Versions/B/XPCServices/Installer.xpc"
+    sign_path "$framework/Versions/B/XPCServices/Downloader.xpc" --preserve-metadata=entitlements
+    sign_path "$framework/Versions/B/Autoupdate"
+    sign_path "$framework/Versions/B/Updater.app"
+    sign_path "$framework"
+}
+
+sign_sparkle_framework "$STAGED_SPARKLE_FRAMEWORK"
 sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
 sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
-sign_path "$APP_BUNDLE" --deep --entitlements "$app_entitlements"
+sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"
 codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 codesign -d --entitlements :- "$APP_BUNDLE" > "$signed_entitlements"
 plutil -convert xml1 -o "$canonical_app_entitlements" "$app_entitlements"
 plutil -convert xml1 -o "$canonical_signed_entitlements" "$signed_entitlements"
 cmp "$canonical_app_entitlements" "$canonical_signed_entitlements" ||
     fail "Signed app entitlements do not match trusted release policy"
+"$SCRIPT_DIR/smoke_embedded_mcp_helper.sh" "$APP_BUNDLE" "Developer ID staged app MCP helper"
 
 signature_details="$(codesign -dv --verbose=4 "$APP_BUNDLE" 2>&1)"
 identifier="$(printf '%s\n' "$signature_details" | awk -F= '/^Identifier=/{print $2; exit}')"

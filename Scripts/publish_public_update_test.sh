@@ -35,6 +35,8 @@ trap cleanup EXIT
     fail "Set CONFIRM_PUBLIC_UPDATE_TEST=1 to acknowledge that this publishes a signed test update publicly."
 [[ -f "$UPDATE_ZIP" ]] || fail "Missing update ZIP: $UPDATE_ZIP"
 [[ -x "$GENERATE_APPCAST" ]] || fail "Missing Sparkle generate_appcast tool: $GENERATE_APPCAST"
+[[ -x "$ROOT_DIR/Scripts/smoke_embedded_mcp_helper.sh" ]] ||
+    fail "Missing embedded MCP helper smoke script"
 
 for command in codesign curl ditto gh plutil shasum xcrun; do
     require_command "$command"
@@ -66,6 +68,7 @@ printf '%s\n' "$signature_details" | grep -q '^Authority=Developer ID Applicatio
 [[ "$team_identifier" == "$SIGNING_TEAM_ID" ]] ||
     fail "Signed app team mismatch: expected $SIGNING_TEAM_ID, got ${team_identifier:-<missing>}"
 xcrun stapler validate "$APP_BUNDLE"
+"$ROOT_DIR/Scripts/smoke_embedded_mcp_helper.sh" "$APP_BUNDLE" "Public updater ZIP MCP helper"
 
 bundle_identifier="$(plutil -extract CFBundleIdentifier raw "$APP_BUNDLE/Contents/Info.plist")"
 marketing_version="$(plutil -extract CFBundleShortVersionString raw "$APP_BUNDLE/Contents/Info.plist")"

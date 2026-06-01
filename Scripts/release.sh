@@ -74,6 +74,7 @@ run_preflight() {
     require_file "$ROOT_DIR/Vendor/Sparkle/PROVENANCE.md"
     require_file "$ROOT_DIR/Vendor/Sparkle/SHA256SUMS"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/sign_staged_release.sh"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/extract_staged_release.py"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_staged_release.sh"
     require_file "$RUN_WITHOUT_GITHUB_TOKENS"
