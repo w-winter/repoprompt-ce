@@ -380,10 +380,16 @@ case "$*" in
 PLIST
     ;;
   *-r-*)
-    [[ "${FAKE_MISSING_REQUIREMENT:-0}" != "1" ]] || exit 1
+    [[ "${FAKE_MISSING_REQUIREMENT:-0}" != "1" ]] || exit 0
     printf 'designated => identifier "fixture"\n' >&2
     ;;
-  *) printf 'Identifier=fixture\nTeamIdentifier=not set\n' >&2 ;;
+  *)
+    if [[ "${FAKE_CERTIFICATE_BACKED:-0}" == "1" ]]; then
+      printf 'Identifier=fixture\nTeamIdentifier=TEAMID\nAuthority=Developer ID Application: Fixture\n' >&2
+    else
+      printf 'Identifier=fixture\nTeamIdentifier=not set\n' >&2
+    fi
+    ;;
 esac
 """,
             encoding="utf-8",
@@ -437,12 +443,57 @@ esac
             text=True,
             capture_output=True,
         )
-        self.assertNotEqual(missing_requirement.returncode, 0)
-        self.assertIn("could not read designated requirement", missing_requirement.stderr)
-        env.pop("FAKE_MISSING_REQUIREMENT")
+        self.assertEqual(missing_requirement.returncode, 0, missing_requirement.stderr)
+        missing_requirement_manifest = json.loads(
+            (app.parent / "missing-requirement.json").read_text(encoding="utf-8")
+        )
+        self.assertIsNone(missing_requirement_manifest["bundle_signing"]["designated_requirement"])
+        for executable in missing_requirement_manifest["executables"]:
+            self.assertIsNone(executable["signing"]["designated_requirement"])
+
+        env["FAKE_CERTIFICATE_BACKED"] = "1"
+        certificate_backed_missing_requirement = subprocess.run(
+            [
+                str(writer),
+                "write",
+                "--app",
+                str(app),
+                "--output",
+                str(app.parent / "certificate-backed-missing-requirement.json"),
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(certificate_backed_missing_requirement.returncode, 0)
+        self.assertIn(
+            "certificate-backed signed path did not expose a designated requirement",
+            certificate_backed_missing_requirement.stderr,
+        )
+        env.pop("FAKE_CERTIFICATE_BACKED")
 
         info["RepoPromptSigningMode"] = "developer-id"
         (app / "Contents" / "Info.plist").write_bytes(plistlib.dumps(info))
+        developer_id_missing_requirement = subprocess.run(
+            [
+                str(writer),
+                "write",
+                "--app",
+                str(app),
+                "--output",
+                str(app.parent / "developer-id-missing-requirement.json"),
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(developer_id_missing_requirement.returncode, 0)
+        self.assertIn(
+            "signed path did not expose a designated requirement",
+            developer_id_missing_requirement.stderr,
+        )
+        env.pop("FAKE_MISSING_REQUIREMENT")
+
         env["FAKE_MISSING_ENTITLEMENTS"] = "1"
         missing_entitlements = subprocess.run(
             [str(writer), "write", "--app", str(app), "--output", str(app.parent / "missing-entitlements.json")],

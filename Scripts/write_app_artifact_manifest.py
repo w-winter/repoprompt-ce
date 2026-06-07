@@ -38,7 +38,7 @@ def architectures(path: Path) -> list[str]:
     return sorted(set((result.stdout or "").split()))
 
 
-def signing_details(path: Path) -> dict[str, Any]:
+def signing_details(path: Path, *, allow_adhoc_without_requirement: bool = False) -> dict[str, Any]:
     codesign = os.environ.get("CODESIGN", "codesign")
     details = run([codesign, "-dv", "--verbose=4", str(path)])
     if details.returncode != 0:
@@ -51,7 +51,7 @@ def signing_details(path: Path) -> dict[str, Any]:
             values.setdefault(key.strip(), []).append(value.strip())
 
     requirement_result = run([codesign, "-d", "-r-", str(path)])
-    if requirement_result.returncode != 0:
+    if requirement_result.returncode != 0 and not allow_adhoc_without_requirement:
         fail(f"could not read designated requirement for {path}")
     requirement_text = "\n".join(
         filter(None, [requirement_result.stdout or "", requirement_result.stderr or ""])
@@ -61,9 +61,6 @@ def signing_details(path: Path) -> dict[str, Any]:
         if line.startswith("designated => "):
             designated_requirement = line.removeprefix("designated => ").strip()
             break
-    if not designated_requirement:
-        fail(f"signed path did not expose a designated requirement: {path}")
-
     entitlements_result = run([codesign, "-d", "--entitlements", ":-", str(path)], binary=True)
     entitlement_hash = None
     if entitlements_result.returncode == 0:
@@ -95,6 +92,11 @@ def signing_details(path: Path) -> dict[str, Any]:
     if team in {"", "not set"}:
         team = None
     authorities = values.get("Authority", [])
+    if not designated_requirement:
+        if not allow_adhoc_without_requirement:
+            fail(f"signed path did not expose a designated requirement: {path}")
+        if team is not None or authorities or certificate_sha256 is not None:
+            fail(f"certificate-backed signed path did not expose a designated requirement: {path}")
     return {
         "identifier": (values.get("Identifier") or [None])[0],
         "team_identifier": team,
@@ -105,7 +107,12 @@ def signing_details(path: Path) -> dict[str, Any]:
     }
 
 
-def executable_entry(app: Path, relative: str) -> dict[str, Any]:
+def executable_entry(
+    app: Path,
+    relative: str,
+    *,
+    allow_adhoc_without_requirement: bool = False,
+) -> dict[str, Any]:
     path = app / relative
     if not path.is_file() or path.is_symlink():
         fail(f"manifest executable must be a non-symlink regular file: {path}")
@@ -113,7 +120,10 @@ def executable_entry(app: Path, relative: str) -> dict[str, Any]:
         "path": relative,
         "architectures": architectures(path),
         "sha256": sha256(path),
-        "signing": signing_details(path),
+        "signing": signing_details(
+            path,
+            allow_adhoc_without_requirement=allow_adhoc_without_requirement,
+        ),
     }
 
 
@@ -129,9 +139,19 @@ def collect_manifest(app: Path, expected_architectures: list[str] | None) -> dic
     executable_name = info.get("CFBundleExecutable")
     if not isinstance(executable_name, str) or not executable_name:
         fail("Info.plist is missing CFBundleExecutable")
+    signing_mode = info.get("RepoPromptSigningMode")
+    allow_adhoc_without_requirement = signing_mode == "release-candidate-adhoc"
     entries = [
-        executable_entry(app, f"Contents/MacOS/{executable_name}"),
-        executable_entry(app, "Contents/MacOS/repoprompt-mcp"),
+        executable_entry(
+            app,
+            f"Contents/MacOS/{executable_name}",
+            allow_adhoc_without_requirement=allow_adhoc_without_requirement,
+        ),
+        executable_entry(
+            app,
+            "Contents/MacOS/repoprompt-mcp",
+            allow_adhoc_without_requirement=allow_adhoc_without_requirement,
+        ),
     ]
     architecture_sets = {tuple(entry["architectures"]) for entry in entries}
     if len(architecture_sets) != 1:
@@ -143,8 +163,11 @@ def collect_manifest(app: Path, expected_architectures: list[str] | None) -> dic
             f"expected {expected_architectures}, got {actual_architectures}"
         )
 
-    bundle_signing = signing_details(app)
-    if info.get("RepoPromptSigningMode") == "developer-id" and bundle_signing["entitlements_sha256"] is None:
+    bundle_signing = signing_details(
+        app,
+        allow_adhoc_without_requirement=allow_adhoc_without_requirement,
+    )
+    if signing_mode == "developer-id" and bundle_signing["entitlements_sha256"] is None:
         fail("Developer ID app did not expose parseable signed entitlements")
     return {
         "schema_version": 1,
@@ -152,7 +175,7 @@ def collect_manifest(app: Path, expected_architectures: list[str] | None) -> dic
             "identifier": info.get("CFBundleIdentifier"),
             "marketing_version": info.get("CFBundleShortVersionString"),
             "build_number": info.get("CFBundleVersion"),
-            "signing_mode": info.get("RepoPromptSigningMode"),
+            "signing_mode": signing_mode,
             "architecture_policy": "universal-public"
             if actual_architectures == ["arm64", "x86_64"]
             else "host-native",
