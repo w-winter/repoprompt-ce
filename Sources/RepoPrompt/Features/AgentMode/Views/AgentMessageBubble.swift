@@ -383,8 +383,9 @@ struct AgentMessageBubble: View {
         .padding(.vertical, 3)
         .background(Color.green.opacity(0.15))
         .clipShape(Capsule())
-        .help(tooltip)
+        .hoverTooltip(tooltip)
         .accessibilityLabel(Text(labelText))
+        .accessibilityHint(Text(tooltip))
     }
 
     private func workflowBadge(_ workflow: AgentWorkflowDefinition) -> some View {

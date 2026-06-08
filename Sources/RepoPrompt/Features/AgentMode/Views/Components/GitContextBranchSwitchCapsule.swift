@@ -222,7 +222,7 @@ struct GitContextBranchSwitchCapsule: View {
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                         .foregroundStyle(.orange)
                         .lineLimit(2)
-                        .help(actionErrorMessage)
+                        .hoverTooltip(actionErrorMessage)
                         .accessibilityLabel(actionErrorMessage)
                 }
 
@@ -234,7 +234,7 @@ struct GitContextBranchSwitchCapsule: View {
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                             .foregroundStyle(.secondary)
                             .lineLimit(3)
-                            .help(optionErrorMessage)
+                            .hoverTooltip(optionErrorMessage)
                             .accessibilityLabel(optionErrorMessage)
                         Button("Reload branches") {
                             startUITask { await reloadOptions() }
@@ -363,7 +363,8 @@ struct GitContextBranchSwitchCapsule: View {
             .onHover { hovered in
                 isHovered = hovered
             }
-            .help(helpText)
+            .hoverTooltip(helpText)
+            .accessibilityHint(helpText)
         }
 
         private var iconName: String {
