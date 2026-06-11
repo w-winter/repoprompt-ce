@@ -153,12 +153,19 @@ public enum MCPResponseDeliveryTracer {
         #endif
     }
 
-    public static func emit(_ event: MCPResponseDeliveryTraceEvent) {
+    public static func emit(
+        _ event: MCPResponseDeliveryTraceEvent,
+        to descriptor: Int32 = STDERR_FILENO
+    ) {
         guard event.terminalReason != nil || successTracingEnabled else { return }
         guard let data = "[MCPResponseDelivery] \(event)\n".data(using: .utf8) else { return }
         lock.lock()
-        FileHandle.standardError.write(data)
-        lock.unlock()
+        defer { lock.unlock() }
+        // Terminal events are emitted even with success tracing disabled, so
+        // this path runs during transport failure handling when stderr may
+        // already be closed. Best-effort raw write; never FileHandle.write,
+        // whose ObjC exception on a broken pipe would abort the process.
+        BestEffortStderrWriter.write(data, to: descriptor)
     }
 
     public static func sha256Hex(_ data: Data) -> String {

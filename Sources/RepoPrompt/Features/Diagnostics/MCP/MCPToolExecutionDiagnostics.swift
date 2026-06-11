@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptShared
 
 struct MCPToolExecutionTraceEvent: Equatable, CustomStringConvertible {
     enum Phase: String {
@@ -83,8 +84,10 @@ enum MCPToolExecutionTracer {
         guard event.isAlwaysEmitted || successTracingEnabled else { return }
         guard let data = "[MCPToolExecution] \(event)\n".data(using: .utf8) else { return }
         state.lock.lock()
-        FileHandle.standardError.write(data)
-        state.lock.unlock()
+        defer { state.lock.unlock() }
+        // Best-effort raw write; FileHandle.write raises an uncatchable ObjC
+        // exception if stderr's pipe is already closed.
+        BestEffortStderrWriter.write(data)
     }
 
     #if DEBUG

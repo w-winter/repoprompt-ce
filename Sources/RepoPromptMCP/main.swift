@@ -1042,8 +1042,16 @@ extension BootstrapSocketProxy {
                     faultRule: faultRule
                 ) { framed in
                     // Progress notifications are an intentional stderr-only control surface.
+                    // Delivery is best-effort: if the host closed stderr, drop the progress
+                    // line and keep the stdout transport alive rather than raising an ObjC
+                    // exception that would abort the helper mid-ledger-transaction.
                     if let progressMessage = Self.extractProgressMessage(from: framed) {
-                        FileHandle.standardError.write("[progress] \(progressMessage)\n".data(using: .utf8)!)
+                        let delivered = BestEffortStderrWriter.write(
+                            Data("[progress] \(progressMessage)\n".utf8)
+                        )
+                        if !delivered {
+                            debugLog("BootstrapSocketProxy: dropped progress output, stderr unavailable")
+                        }
                         return
                     }
                     do {
