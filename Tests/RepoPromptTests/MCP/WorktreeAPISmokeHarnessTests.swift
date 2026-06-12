@@ -203,9 +203,11 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             let contextBuilder = try await Self.windowTool(named: MCPWindowToolName.contextBuilder, in: window)
             let readFile = try await Self.windowTool(named: MCPWindowToolName.readFile, in: window)
 
-            let targetTab = try await Self.createBackgroundTab(in: window, name: "Bound Export Target")
+            var targetTab = try await Self.createBackgroundTab(in: window, name: "Bound Export Target")
             let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
             XCTAssertNotEqual(window.workspaceManager.activeWorkspace?.activeComposeTabID, targetTab.id)
+            targetTab.promptText = "Generate the deterministic worktree export."
+            window.workspaceManager.updateComposeTab(targetTab, markDirty: false)
             let sessionID = UUID()
             let session = window.agentModeViewModel.session(for: targetTab.id)
             _ = window.agentModeViewModel.test_installPersistentSessionBinding(
@@ -259,6 +261,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
                 ])
             }
             let exportObject = try XCTUnwrap(exportValue.objectValue)
+            XCTAssertNotNil(exportObject["plan"]?.objectValue, String(describing: exportObject))
             let exportPath = try XCTUnwrap(exportObject["oracle_export_path"]?.stringValue)
             let exportInstruction = try XCTUnwrap(exportObject["oracle_export_instruction"]?.stringValue)
             let standardizedWorktreePath = StandardizedPath.absolute(worktreePath)
