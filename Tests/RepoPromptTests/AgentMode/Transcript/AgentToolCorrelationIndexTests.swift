@@ -70,6 +70,40 @@
             session.testAssertSourceItemDerivedStateIsConsistent()
         }
 
+        func testActiveTurnPrefixRetentionPreservesToolCorrelationBoundary() {
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let firstActiveInvocationID = UUID()
+            let secondActiveInvocationID = UUID()
+            session.setItemsSilently([
+                .user("historical", sequenceIndex: 0),
+                .assistant("historical response", sequenceIndex: 1),
+                .user("active", sequenceIndex: 2),
+                .toolCall(
+                    name: "read_file",
+                    invocationID: firstActiveInvocationID,
+                    argsJSON: #"{"path":"Sources/First.swift"}"#,
+                    sequenceIndex: 3
+                )
+            ], reason: .testOverride)
+            session.runState = .running
+            session.appendItem(.user("steering", sequenceIndex: session.nextSequenceIndex))
+            session.appendItem(.toolCall(
+                name: "file_search",
+                invocationID: secondActiveInvocationID,
+                argsJSON: #"{"pattern":"needle"}"#,
+                sequenceIndex: session.nextSequenceIndex
+            ))
+
+            session.setItemsSilently(Array(session.items.dropFirst(2)), reason: .retentionCompaction)
+
+            XCTAssertEqual(session.indexedToolItemIndices(invocationID: firstActiveInvocationID), [1])
+            XCTAssertEqual(session.indexedToolItemIndices(invocationID: secondActiveInvocationID), [3])
+            let activeCalls = session.activeTurnToolItemIndices { $0.kind == .toolCall }
+            XCTAssertEqual(activeCalls.indices, [1, 3])
+            XCTAssertEqual(activeCalls.scannedItemCount, 3)
+            session.testAssertSourceItemDerivedStateIsConsistent()
+        }
+
         func testClaudeCompletionObserverUsesConstantWorkInvocationIndex() throws {
             let handler = ClaudeAgentToolTrackingHandler()
             let short = makeSession(priorTurnCount: 1)
