@@ -5,6 +5,16 @@ import XCTest
 
 @MainActor
 final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
+    func testPairAgentOwnedConnectionReplacesPriorSessionAffinityAndPersistsCanonicalSelection() async throws {
+        #if DEBUG
+            try await withFixture(agentOwned: true) { fixture in
+                try await runCheckpoint(fixture: fixture, scenario: .agentOwnedCanonicalSelection)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
     func testCodexAgentModeLeaseRetainsOneMCPServerSessionAcrossSerialExactAbsoluteReadFileCalls() async throws {
         #if DEBUG
             try await withFixture { fixture in
@@ -108,10 +118,14 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             case tabCloseDuringPersistence
             case workspaceReorderDuringPersistence
             case rebindDuringPersistence
+            case agentOwnedCanonicalSelection
         }
 
-        func withFixture(_ operation: (Fixture) async throws -> Void) async throws {
-            let fixture = try await Fixture.make()
+        func withFixture(
+            agentOwned: Bool = false,
+            _ operation: (Fixture) async throws -> Void
+        ) async throws {
+            let fixture = try await Fixture.make(agentOwned: agentOwned)
             do {
                 try await operation(fixture)
                 await fixture.cleanup()
@@ -264,7 +278,140 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 try await assertWorkspaceReorderDuringAutoSelectionPersistence(fixture: fixture)
             case .rebindDuringPersistence:
                 try await assertRebindDuringAutoSelectionPersistence(fixture: fixture)
+            case .agentOwnedCanonicalSelection:
+                try await assertAgentOwnedCanonicalSelection(fixture: fixture)
             }
+        }
+
+        func assertAgentOwnedCanonicalSelection(fixture: Fixture) async throws {
+            XCTAssertEqual(fixture.spec.taskLabelKind, .pair)
+            XCTAssertEqual(
+                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.activeAgentSessionID,
+                Fixture.agentSessionID
+            )
+            XCTAssertEqual(
+                fixture.window.promptManager.currentComposeTabs.first(where: { $0.id == Fixture.tabID })?.activeAgentSessionID,
+                Fixture.agentSessionID
+            )
+
+            try await clearSelection(fixture: fixture, id: 6)
+            assertCanonicalSelection(
+                fixture: fixture,
+                selectedPaths: [],
+                slices: [:]
+            )
+
+            let addResponse = try await fixture.socketClient.request(
+                id: 7,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.manageSelection,
+                    "arguments": [
+                        "op": "add",
+                        "paths": [fixture.fileURL.path],
+                        "view": "files"
+                    ]
+                ]
+            )
+            try Self.assertSuccessfulResponse(addResponse, id: 7)
+            let getAfterAdd = try await fixture.socketClient.request(
+                id: 8,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.manageSelection,
+                    "arguments": ["op": "get", "view": "files"]
+                ]
+            )
+            try Self.assertSuccessfulResponse(getAfterAdd, id: 8)
+            XCTAssertTrue(getAfterAdd.contains(fixture.fileURL.lastPathComponent), getAfterAdd)
+            assertCanonicalSelection(
+                fixture: fixture,
+                selectedPaths: [fixture.fileURL.path],
+                slices: [:]
+            )
+
+            try await clearSelection(fixture: fixture, id: 9)
+            let partialRead = try await fixture.socketClient.request(
+                id: 10,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.readFile,
+                    "arguments": [
+                        "path": fixture.fileURL.path,
+                        "start_line": 2,
+                        "limit": 2
+                    ]
+                ]
+            )
+            let partialText = try Self.readFileText(from: partialRead, id: 10)
+            XCTAssertTrue(partialText.contains("persistentAgentModeLineTwo"), partialText)
+            let partialDrain = try await fixture.socketClient.request(
+                id: 11,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.manageSelection,
+                    "arguments": ["op": "get", "view": "files"]
+                ]
+            )
+            try Self.assertSuccessfulResponse(partialDrain, id: 11)
+            assertCanonicalSelection(
+                fixture: fixture,
+                selectedPaths: [fixture.fileURL.path],
+                slices: [fixture.fileURL.path: [LineRange(start: 2, end: 3)]]
+            )
+
+            let fullRead = try await fixture.socketClient.request(
+                id: 12,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.readFile,
+                    "arguments": ["path": fixture.fileURL.path]
+                ]
+            )
+            let fullText = try Self.readFileText(from: fullRead, id: 12)
+            XCTAssertTrue(fullText.contains(Fixture.sentinelContent), fullText)
+            let fullDrain = try await fixture.socketClient.request(
+                id: 13,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.manageSelection,
+                    "arguments": ["op": "get", "view": "files"]
+                ]
+            )
+            try Self.assertSuccessfulResponse(fullDrain, id: 13)
+            assertCanonicalSelection(
+                fixture: fixture,
+                selectedPaths: [fixture.fileURL.path],
+                slices: [:]
+            )
+
+            let committed = await fixture.window.mcpServer.commitAndClearTabContext(
+                connectionID: Fixture.connectionID,
+                expectedRunID: Fixture.runID
+            )
+            XCTAssertTrue(committed)
+            XCTAssertNil(fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID])
+            assertCanonicalSelection(
+                fixture: fixture,
+                selectedPaths: [fixture.fileURL.path],
+                slices: [:]
+            )
+        }
+
+        func assertCanonicalSelection(
+            fixture: Fixture,
+            selectedPaths: [String],
+            slices: [String: [LineRange]]
+        ) {
+            let stored = fixture.window.workspaceManager.composeTab(with: Fixture.tabID)
+            XCTAssertEqual(stored?.selection.selectedPaths, selectedPaths)
+            XCTAssertEqual(stored?.selection.slices, slices)
+            XCTAssertEqual(stored?.activeAgentSessionID, Fixture.agentSessionID)
+
+            let header = fixture.window.promptManager.currentComposeTabs.first { $0.id == Fixture.tabID }
+            XCTAssertEqual(header?.selection.selectedPaths, selectedPaths)
+            XCTAssertEqual(header?.selection.slices, slices)
+            XCTAssertEqual(header?.activeAgentSessionID, Fixture.agentSessionID)
         }
 
         func assertWorkspaceContextDrain(fixture: Fixture) async throws {
@@ -791,8 +938,16 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         static let tabID = UUID(uuidString: "22222222-2222-4222-8222-222222222222")!
         static let gateID = UUID(uuidString: "33333333-3333-4333-8333-333333333333")!
         static let connectionID = UUID(uuidString: "44444444-4444-4444-8444-444444444444")!
+        static let priorRunID = UUID(uuidString: "55555555-5555-4555-8555-555555555555")!
+        static let priorConnectionID = UUID(uuidString: "66666666-6666-4666-8666-666666666666")!
+        static let agentSessionID = UUID(uuidString: "77777777-7777-4777-8777-777777777777")!
         static let sessionToken = "persistent-agent-mode-read-file-checkpoint-session"
-        static let sentinelContent = "let persistentAgentModeCheckpoint = \"retained-session-read\"\n"
+        static let sentinelContent = """
+        let persistentAgentModeCheckpoint = "retained-session-read"
+        let persistentAgentModeLineTwo = 2
+        let persistentAgentModeLineThree = 3
+        let persistentAgentModeLineFour = 4
+        """
 
         let networkManager = ServerNetworkManager.shared
         let rootURL: URL
@@ -808,6 +963,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         let handshakeRecorder = HandshakeRecorder()
         let spec: MCPBootstrapLeaseSpec
         let lease: MCPBootstrapLease
+        let agentOwned: Bool
         private var cleanedUp = false
 
         private init(
@@ -821,7 +977,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             socketClient: SocketPairJSONRPCClient,
             connectionManager: BootstrapSocketConnectionManager,
             spec: MCPBootstrapLeaseSpec,
-            lease: MCPBootstrapLease
+            lease: MCPBootstrapLease,
+            agentOwned: Bool
         ) {
             self.rootURL = rootURL
             self.fileURL = fileURL
@@ -835,9 +992,10 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             self.connectionManager = connectionManager
             self.spec = spec
             self.lease = lease
+            self.agentOwned = agentOwned
         }
 
-        static func make() async throws -> Fixture {
+        static func make(agentOwned: Bool = false) async throws -> Fixture {
             let rootURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("PersistentAgentModeMCPReadFileConnectionTests", isDirectory: true)
                 .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -879,7 +1037,11 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id }
                 )
                 window.workspaceManager.workspaces[workspaceIndex].composeTabs = [
-                    ComposeTabState(id: tabID, name: "Persistent Agent Mode MCP Read")
+                    ComposeTabState(
+                        id: tabID,
+                        name: "Persistent Agent Mode MCP Read",
+                        activeAgentSessionID: agentOwned ? agentSessionID : nil
+                    )
                 ]
                 window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = tabID
                 let configuredWorkspace = window.workspaceManager.workspaces[workspaceIndex]
@@ -938,12 +1100,47 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     clientName: AgentProviderKind.codexMCPClientID,
                     sessionToken: sessionToken
                 )
+                if agentOwned {
+                    await ServerNetworkManager.shared.installClientConnectionPolicy(
+                        for: AgentProviderKind.codexMCPClientID,
+                        windowID: window.windowID,
+                        restrictedTools: AgentModeMCPToolPolicy.restrictedTools,
+                        tabID: nil,
+                        runID: priorRunID,
+                        additionalTools: AgentModeMCPPolicyInstaller.additionalTools(for: .codexExec),
+                        purpose: .agentModeRun,
+                        requiresExpectedAgentPID: true
+                    )
+                    await ServerNetworkManager.shared.registerExpectedAgentPID(
+                        getpid(),
+                        for: AgentProviderKind.codexMCPClientID,
+                        runID: priorRunID
+                    )
+                    let priorApplication = await ServerNetworkManager.shared.debugApplyPendingPolicy(
+                        clientName: AgentProviderKind.codexMCPClientID,
+                        connectionID: priorConnectionID,
+                        clientPid: Int(getpid()),
+                        bootstrapClientName: AgentProviderKind.codexMCPClientID,
+                        sessionKey: sessionToken,
+                        requireRunRouting: false
+                    )
+                    guard priorApplication.outcome == "applied", priorApplication.runID == priorRunID else {
+                        throw ClientFixtureError.priorAffinitySeedFailed(priorApplication.outcome)
+                    }
+                    await ServerNetworkManager.shared.clearExpectedAgentPID(
+                        getpid(),
+                        for: AgentProviderKind.codexMCPClientID,
+                        runID: priorRunID
+                    )
+                }
+
                 let spec = MCPBootstrapLeaseSpec.agentMode(
                     tabID: tabID,
                     runID: runID,
                     gateID: gateID,
                     windowID: window.windowID,
-                    agent: .codexExec
+                    agent: .codexExec,
+                    taskLabelKind: agentOwned ? .pair : nil
                 )
                 let resolvedLease = MCPBootstrapLease(spec: spec)
                 lease = resolvedLease
@@ -967,7 +1164,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     socketClient: resolvedSocketClient,
                     connectionManager: resolvedConnectionManager,
                     spec: spec,
-                    lease: resolvedLease
+                    lease: resolvedLease,
+                    agentOwned: agentOwned
                 )
             } catch {
                 await connectionManager?.stop()
@@ -984,6 +1182,18 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     runID: runID
                 )
                 await ServerNetworkManager.shared.cleanupRunRoutingState(for: runID, windowID: window.windowID)
+                if agentOwned {
+                    await ServerNetworkManager.shared.removeConnection(priorConnectionID)
+                    await ServerNetworkManager.shared.clearClientConnectionPolicy(
+                        for: AgentProviderKind.codexMCPClientID,
+                        windowID: window.windowID,
+                        runID: priorRunID
+                    )
+                    await ServerNetworkManager.shared.cleanupRunRoutingState(
+                        for: priorRunID,
+                        windowID: window.windowID
+                    )
+                }
                 await lease?.cancelAndCleanup()
                 window.mcpServer.removeTabContext(
                     forConnectionID: connectionID,
@@ -1066,6 +1276,15 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 runID: Self.runID
             )
             await networkManager.cleanupRunRoutingState(for: Self.runID, windowID: windowID)
+            if agentOwned {
+                await networkManager.removeConnection(Self.priorConnectionID)
+                await networkManager.clearClientConnectionPolicy(
+                    for: AgentProviderKind.codexMCPClientID,
+                    windowID: windowID,
+                    runID: Self.priorRunID
+                )
+                await networkManager.cleanupRunRoutingState(for: Self.priorRunID, windowID: windowID)
+            }
             await lease.cancelAndCleanup()
             window.mcpServer.removeTabContext(
                 forConnectionID: Self.connectionID,
@@ -1084,6 +1303,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
     private enum ClientFixtureError: Error {
         case exactAbsoluteCatalogMiss
         case leaseAcquisitionFailed
+        case priorAffinitySeedFailed(String)
     }
 
     private struct RetainedConnectionSnapshot: Equatable {

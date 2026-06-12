@@ -8929,6 +8929,17 @@ actor ServerNetworkManager {
         return isExpectedAgentDescendant(clientName: clientName, clientPid: clientPid, runID: policy.runID) == true
     }
 
+    private func canReplaceLiveRunAffinity(with policy: ClientConnectionPolicy) -> Bool {
+        guard policy.oneShot,
+              policy.purpose == .agentModeRun,
+              policy.requiresExpectedAgentPID,
+              policy.tabID != nil
+        else {
+            return false
+        }
+        return policy.taskLabelKind == .engineer || policy.taskLabelKind == .pair
+    }
+
     private func oldestReservedPendingPolicyEntry(
         for clientName: String
     ) -> (key: String, index: Int, policy: ClientConnectionPolicy)? {
@@ -9170,7 +9181,8 @@ actor ServerNetworkManager {
         let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
         if let policyRunID = matchedQueueEntry.policy.runID,
            let affinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey),
-           affinity.runID != policyRunID
+           affinity.runID != policyRunID,
+           !canReplaceLiveRunAffinity(with: matchedQueueEntry.policy)
         {
             #if DEBUG
                 debugRecordRunRoutingEvent(
