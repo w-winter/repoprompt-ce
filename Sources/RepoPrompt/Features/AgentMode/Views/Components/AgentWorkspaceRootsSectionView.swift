@@ -543,24 +543,26 @@ struct AgentWorkspaceRootsSectionView: View {
             copyToPasteboard(row.name)
         }
 
-        if let branch = copyableRootBranch(for: row) {
-            Button("Copy Root Checkout") {
-                copyToPasteboard(branch)
+        if let checkout = AgentWorkspaceRootContextValues.rootCheckout(for: row.gitContext) {
+            Button(checkout.menuTitle) {
+                copyToPasteboard(checkout.value)
             }
         }
 
         if let worktree = row.worktree {
             Divider()
 
-            Button(worktree.isAvailable ? "Copy Active Worktree Path" : "Copy Missing Worktree Path") {
-                copyToPasteboard(worktree.worktreeRootPath)
+            if let path = AgentWorkspaceRootContextValues.worktreePath(for: worktree) {
+                Button(worktree.isAvailable ? "Copy Active Worktree Path" : "Copy Missing Worktree Path") {
+                    copyToPasteboard(path)
+                }
             }
 
             Button("Copy Bound Worktree Name") {
-                copyToPasteboard(copyableWorktreeName(for: worktree))
+                copyToPasteboard(AgentWorkspaceRootContextValues.worktreeName(for: worktree))
             }
 
-            if let branch = copyableActiveWorktreeBranch(for: worktree) {
+            if let branch = AgentWorkspaceRootContextValues.worktreeBranch(for: worktree) {
                 Button("Copy Bound Worktree Branch") {
                     copyToPasteboard(branch)
                 }
@@ -568,7 +570,9 @@ struct AgentWorkspaceRootsSectionView: View {
 
             if worktree.isAvailable {
                 Button("Reveal Active Worktree in Finder") {
-                    revealInFinder(path: worktree.worktreeRootPath)
+                    if let path = AgentWorkspaceRootContextValues.worktreePath(for: worktree) {
+                        revealInFinder(path: path)
+                    }
                 }
             }
         }
@@ -590,33 +594,6 @@ struct AgentWorkspaceRootsSectionView: View {
         Button("Remove from Workspace") {
             rootsStore.removeRoot(rowID: row.id)
         }
-    }
-
-    private func copyableRootBranch(for row: AgentWorkspaceRootRow) -> String? {
-        guard let branch = row.gitContext?.branchDisplayText?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !branch.isEmpty
-        else {
-            return nil
-        }
-        return branch
-    }
-
-    private func copyableWorktreeName(for worktree: AgentWorktreeIndicator) -> String {
-        if let name = worktree.worktreeName?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
-            return name
-        }
-        let lastPathComponent = URL(fileURLWithPath: worktree.worktreeRootPath).lastPathComponent
-        if !lastPathComponent.isEmpty {
-            return lastPathComponent
-        }
-        return worktree.label
-    }
-
-    private func copyableActiveWorktreeBranch(for worktree: AgentWorktreeIndicator) -> String? {
-        guard let branch = worktree.branch?.trimmingCharacters(in: .whitespacesAndNewlines), !branch.isEmpty else {
-            return nil
-        }
-        return branch
     }
 
     private func copyToPasteboard(_ value: String) {
@@ -727,7 +704,7 @@ struct AgentWorkspaceRootsSectionView: View {
                 .truncationMode(.middle)
                 .frame(maxWidth: mergeCapsuleLabelMaxWidth, alignment: .leading)
         }
-        .fixedSize(horizontal: false, vertical: true)
+        .fixedSize(horizontal: true, vertical: true)
         .foregroundColor(tint)
         .padding(.horizontal, fontPreset.scaledClamped(4, max: 6))
         .padding(.vertical, fontPreset.scaledClamped(1, max: 2))
@@ -803,6 +780,71 @@ struct AgentWorkspaceRootsSectionView: View {
             .buttonStyle(CustomButtonStyle(verticalPadding: 0, horizontalPadding: 6, height: 24))
             .hoverTooltip("Agent Mode Settings", .top)
         }
+    }
+}
+
+enum AgentWorkspaceRootCheckoutValue: Equatable {
+    case branch(String)
+    case head(String)
+
+    var menuTitle: String {
+        switch self {
+        case .branch:
+            "Copy Root Branch"
+        case .head:
+            "Copy Root HEAD"
+        }
+    }
+
+    var value: String {
+        switch self {
+        case let .branch(value), let .head(value):
+            value
+        }
+    }
+}
+
+enum AgentWorkspaceRootContextValues {
+    static func rootCheckout(for context: GitWorktreeContextSummary?) -> AgentWorkspaceRootCheckoutValue? {
+        guard let context else { return nil }
+        if let branch = normalized(context.branch) {
+            return .branch(branch)
+        }
+        if let head = normalized(context.head) {
+            return .head(head)
+        }
+        return nil
+    }
+
+    static func worktreePath(for worktree: AgentWorktreeIndicator) -> String? {
+        if worktree.isAvailable {
+            return normalized(worktree.worktreeRootPath)
+        }
+        return worktree.missingWorktreePath
+    }
+
+    static func worktreeName(for worktree: AgentWorktreeIndicator) -> String {
+        if let name = normalized(worktree.worktreeName) {
+            return name
+        }
+        if let path = normalized(worktree.worktreeRootPath) {
+            let lastPathComponent = URL(fileURLWithPath: path).lastPathComponent
+            if !lastPathComponent.isEmpty {
+                return lastPathComponent
+            }
+        }
+        return worktree.label
+    }
+
+    static func worktreeBranch(for worktree: AgentWorktreeIndicator) -> String? {
+        normalized(worktree.branch)
+    }
+
+    private static func normalized(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
+        return value
     }
 }
 

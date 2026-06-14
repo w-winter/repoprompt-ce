@@ -79,6 +79,86 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertTrue(rows[1].gitContext?.isMain == true)
     }
 
+    // MARK: - Root context actions
+
+    func testRootContextActionCopiesRawBranchInsteadOfDisplayText() {
+        let context = makeGitContext(
+            repository: "Repo",
+            worktree: "repo",
+            branch: "feature/full-branch-name",
+            head: "1234567890abcdef1234567890abcdef12345678"
+        )
+
+        XCTAssertEqual(
+            AgentWorkspaceRootContextValues.rootCheckout(for: context),
+            .branch("feature/full-branch-name")
+        )
+    }
+
+    func testRootContextActionCopiesFullRawHeadInsteadOfDecoratedShortHead() {
+        let fullHead = "abcdef1234567890abcdef1234567890abcdef12"
+        let context = makeGitContext(
+            repository: "Repo",
+            worktree: "repo",
+            branch: nil,
+            head: fullHead,
+            isDetached: true
+        )
+
+        XCTAssertEqual(context.branchDisplayText, "detached @ abcdef1")
+        XCTAssertEqual(
+            AgentWorkspaceRootContextValues.rootCheckout(for: context),
+            .head(fullHead)
+        )
+    }
+
+    func testRootContextActionOmitsCheckoutWithoutRawBranchOrHead() {
+        let context = makeGitContext(
+            repository: "Repo",
+            worktree: "repo",
+            branch: nil,
+            head: nil
+        )
+
+        XCTAssertNil(AgentWorkspaceRootContextValues.rootCheckout(for: context))
+    }
+
+    func testWorktreeContextActionsUsePersistedRawValues() {
+        let indicator = AgentWorktreeIndicator.make(
+            summary: makeSummary(
+                worktreeName: "  wt-raw  ",
+                branch: "  feature/raw  ",
+                worktreeRootPath: "  /tmp/Repo-wt  "
+            ),
+            resolvedIdentity: WorktreeVisualIdentity(colorHex: "#123456"),
+            isAvailable: true
+        )
+
+        XCTAssertEqual(AgentWorkspaceRootContextValues.worktreePath(for: indicator), "/tmp/Repo-wt")
+        XCTAssertEqual(AgentWorkspaceRootContextValues.worktreeName(for: indicator), "wt-raw")
+        XCTAssertEqual(AgentWorkspaceRootContextValues.worktreeBranch(for: indicator), "feature/raw")
+    }
+
+    func testUnavailableWorktreeContextActionPreservesTrimmedRecoveryPath() {
+        let indicator = AgentWorktreeIndicator.make(
+            summary: makeSummary(worktreeRootPath: "  /tmp/Repo-missing  \n"),
+            resolvedIdentity: WorktreeVisualIdentity(colorHex: "#123456"),
+            isAvailable: false
+        )
+
+        XCTAssertEqual(AgentWorkspaceRootContextValues.worktreePath(for: indicator), "/tmp/Repo-missing")
+    }
+
+    func testUnavailableWorktreeContextActionOmitsBlankRecoveryPath() {
+        let indicator = AgentWorktreeIndicator.make(
+            summary: makeSummary(worktreeRootPath: "  \n\t  "),
+            resolvedIdentity: WorktreeVisualIdentity(colorHex: "#123456"),
+            isAvailable: false
+        )
+
+        XCTAssertNil(AgentWorkspaceRootContextValues.worktreePath(for: indicator))
+    }
+
     // MARK: - Worktree indicators (Item 10)
 
     func testWithWorktreeAttachesIndicatorWithoutMutatingOtherFields() {
@@ -257,6 +337,8 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         repository: String,
         worktree: String,
         branch: String?,
+        head: String? = "1234567890abcdef",
+        isDetached: Bool = false,
         isMain: Bool = true
     ) -> GitWorktreeContextSummary {
         GitWorktreeContextSummary(
@@ -268,8 +350,8 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
             worktreeName: worktree,
             isMain: isMain,
             branch: branch,
-            head: "1234567890abcdef",
-            isDetached: false
+            head: head,
+            isDetached: isDetached
         )
     }
 
