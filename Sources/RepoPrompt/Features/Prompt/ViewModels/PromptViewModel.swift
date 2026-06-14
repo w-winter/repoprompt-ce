@@ -469,11 +469,17 @@ class PromptViewModel: ObservableObject {
     }
 
     private func resolvedPersistedContextBuilderSelection() -> AgentModelCatalog.NormalizedAgentSelection? {
+        guard let apiSettingsViewModel,
+              apiSettingsViewModel.isContextBuilderProviderValidationComplete
+        else {
+            return nil
+        }
         let persisted = settingsManager.persistedGlobalContextBuilderAgentSelection()
         return AutoRecommendationEngine.resolveContextBuilderSelection(
             persistedAgentRaw: persisted.agentRaw,
             persistedModelRaw: persisted.modelRaw,
-            availability: agentAvailabilityContext
+            availability: apiSettingsViewModel.contextBuilderRestorationAvailabilityContext,
+            enabledRecommendationProviders: settingsManager.globalRecommendationProviderFilter()
         )
     }
 
@@ -3601,10 +3607,14 @@ class PromptViewModel: ObservableObject {
             }
 
         Publishers.MergeMany([
-            apiSettingsViewModel.$isClaudeCodeConnected.dropFirst().map { _ in () },
-            apiSettingsViewModel.$isCodexConnected.dropFirst().map { _ in () },
-            apiSettingsViewModel.$isOpenCodeConnected.dropFirst().map { _ in () },
-            apiSettingsViewModel.$isCursorConnected.dropFirst().map { _ in () }
+            apiSettingsViewModel.$isClaudeCodeConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            apiSettingsViewModel.$isCodexConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            apiSettingsViewModel.$isOpenCodeConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            apiSettingsViewModel.$isCursorConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            apiSettingsViewModel.$isContextBuilderProviderValidationComplete.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            apiSettingsViewModel.$contextBuilderVerifiedCLIProviders.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            apiSettingsViewModel.$availableOpenCodeModelOptions.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            apiSettingsViewModel.$availableCursorModelOptions.dropFirst().map { _ in () }.eraseToAnyPublisher()
         ])
         .receive(on: DispatchQueue.main)
         .sink { [weak self] _ in

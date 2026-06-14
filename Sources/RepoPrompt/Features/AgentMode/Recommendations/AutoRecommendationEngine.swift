@@ -55,12 +55,7 @@ final class AutoRecommendationEngine {
             )
         }
 
-        return ProviderStatusSnapshot(
-            claudeCodeCLI: vm.isClaudeCodeConnected ? .ready : .notConfigured,
-            codexCLI: vm.isCodexConnected ? .ready : .notConfigured,
-            cursorCLI: vm.isCursorConnected ? .ready : .notConfigured,
-            openAI: vm.isOpenAIKeyValid ? .ready : (!vm.openAIApiKey.isEmpty ? .configured : .notConfigured)
-        )
+        return vm.recommendationProviderStatusSnapshot
     }
 
     /// Get provider flags from APISettingsViewModel.
@@ -338,14 +333,15 @@ final class AutoRecommendationEngine {
     static func resolveContextBuilderSelection(
         persistedAgentRaw: String?,
         persistedModelRaw: String?,
-        availability: AgentModelCatalog.AvailabilityContext
+        availability: AgentModelCatalog.AvailabilityContext,
+        enabledRecommendationProviders: Set<RecommendationProviderKind> = Set(RecommendationProviderKind.allCases)
     ) -> AgentModelCatalog.NormalizedAgentSelection? {
         if let agentRaw = persistedAgentRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
            let modelRaw = persistedModelRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
            let agent = AgentProviderKind(rawValue: agentRaw),
            !modelRaw.isEmpty,
            AgentModelCatalog.isAgentAvailable(agent, availability: availability),
-           AgentModelCatalog.isValid(rawModel: modelRaw, for: agent, availability: availability)
+           isValidPersistedContextBuilderModel(modelRaw, for: agent, availability: availability)
         {
             return AgentModelCatalog.normalizeSelection(
                 agentRaw: agent.rawValue,
@@ -359,7 +355,7 @@ final class AutoRecommendationEngine {
             codexCLI: availability.codexAvailable ? .ready : .notConfigured,
             cursorCLI: availability.cursorAvailable ? .ready : .notConfigured,
             openAI: .notConfigured
-        )
+        ).filtered(to: enabledRecommendationProviders)
         if let recommendation = contextBuilderRecommendation(status: status) {
             return AgentModelCatalog.normalizeSelection(
                 agentRaw: recommendation.recommendedAgent.rawValue,
@@ -368,7 +364,18 @@ final class AutoRecommendationEngine {
             )
         }
 
-        guard let availableAgent = AgentModelCatalog.selectableAgents(availability: availability).first else {
+        guard let availableAgent = AgentModelCatalog.selectableAgents(availability: availability).first(where: {
+            switch $0 {
+            case .claudeCode:
+                enabledRecommendationProviders.contains(.claudeCode)
+            case .codexExec:
+                enabledRecommendationProviders.contains(.codex)
+            case .cursor:
+                enabledRecommendationProviders.contains(.cursor)
+            case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+                true
+            }
+        }) else {
             return nil
         }
         return AgentModelCatalog.normalizeSelection(
@@ -376,6 +383,20 @@ final class AutoRecommendationEngine {
             modelRaw: nil,
             availability: availability
         )
+    }
+
+    private static func isValidPersistedContextBuilderModel(
+        _ rawModel: String,
+        for agent: AgentProviderKind,
+        availability: AgentModelCatalog.AvailabilityContext
+    ) -> Bool {
+        if agent == .openCode,
+           rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
+           .caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame
+        {
+            return true
+        }
+        return AgentModelCatalog.isValid(rawModel: rawModel, for: agent, availability: availability)
     }
 
     // MARK: - MCP Preset Exposure Recommendation

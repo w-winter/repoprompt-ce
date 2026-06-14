@@ -904,12 +904,14 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             .store(in: &cancellables)
 
         if let apiSettingsViewModel = promptManager.apiSettingsViewModel {
-            Publishers.MergeMany(
-                apiSettingsViewModel.$isClaudeCodeConnected.dropFirst().map { _ in () },
-                apiSettingsViewModel.$isCodexConnected.dropFirst().map { _ in () },
-                apiSettingsViewModel.$isOpenCodeConnected.dropFirst().map { _ in () },
-                apiSettingsViewModel.$isCursorConnected.dropFirst().map { _ in () }
-            )
+            Publishers.MergeMany([
+                apiSettingsViewModel.$isClaudeCodeConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+                apiSettingsViewModel.$isCodexConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+                apiSettingsViewModel.$isOpenCodeConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+                apiSettingsViewModel.$isCursorConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+                apiSettingsViewModel.$isContextBuilderProviderValidationComplete.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+                apiSettingsViewModel.$contextBuilderVerifiedCLIProviders.dropFirst().map { _ in () }.eraseToAnyPublisher()
+            ])
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.handleAgentProviderAvailabilityChanged()
@@ -951,11 +953,17 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     }
 
     private func resolvedPersistedContextBuilderSelection() -> AgentModelCatalog.NormalizedAgentSelection? {
+        guard let apiSettingsViewModel = promptManager.apiSettingsViewModel,
+              apiSettingsViewModel.isContextBuilderProviderValidationComplete
+        else {
+            return nil
+        }
         let persisted = settingsManager.persistedGlobalContextBuilderAgentSelection()
         return AutoRecommendationEngine.resolveContextBuilderSelection(
             persistedAgentRaw: persisted.agentRaw,
             persistedModelRaw: persisted.modelRaw,
-            availability: agentAvailabilityContext
+            availability: apiSettingsViewModel.contextBuilderRestorationAvailabilityContext,
+            enabledRecommendationProviders: settingsManager.globalRecommendationProviderFilter()
         )
     }
 
@@ -1041,6 +1049,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 await MainActor.run { [weak self] in
                     guard let self else { return }
                     acpDynamicModelRevision &+= 1
+                    handleAgentProviderAvailabilityChanged()
                     syncSelectedACPModelFromRegistryIfNeeded(for: .openCode)
                 }
             }
@@ -1075,6 +1084,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 await MainActor.run { [weak self] in
                     guard let self else { return }
                     acpDynamicModelRevision &+= 1
+                    handleAgentProviderAvailabilityChanged()
                     syncSelectedACPModelFromRegistryIfNeeded(for: .cursor)
                 }
             }
