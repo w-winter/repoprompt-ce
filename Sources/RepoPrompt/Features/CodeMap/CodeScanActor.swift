@@ -1054,12 +1054,22 @@ actor CodeScanActor {
 
     func requestSelfHealingScans(
         _ requests: [ScanRequest],
-        rootFolderPaths: [String] = []
+        rootFolderPaths: [String] = [],
+        existingScanModificationDatesByFileID: [UUID: Date] = [:]
     ) async -> SelfHealingScanRequestResult {
         let requestedFileIDs = Set(requests.map(\.fileID))
-        let alreadyScheduledFileIDs = Set(requestedFileIDs.filter { hasQueuedOrActiveScan(for: $0) })
+        let alreadyScheduledFileIDs = Set(requestedFileIDs.filter { fileID in
+            if hasQueuedOrActiveScan(for: fileID) || resultBatchBuffer.contains(where: { $0.fileID == fileID }) {
+                return true
+            }
+            guard acceptedAPIFileIDs.contains(fileID),
+                  let expectedModificationDate = existingScanModificationDatesByFileID[fileID],
+                  let latestModificationDate = latestFileModDates[fileID]
+            else { return false }
+            return latestModificationDate >= expectedModificationDate
+        })
         let submittedFileIDs = await requestScans(
-            requests,
+            requests.filter { !alreadyScheduledFileIDs.contains($0.fileID) },
             purpose: .selfHealing,
             rootFolderPaths: rootFolderPaths
         )

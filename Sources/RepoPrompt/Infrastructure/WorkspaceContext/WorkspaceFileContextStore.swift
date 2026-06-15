@@ -1118,6 +1118,7 @@ actor WorkspaceFileContextStore {
     )
     private var codemapSnapshotsByFileID: [UUID: WorkspaceCodemapSnapshot] = [:]
     private var codemapFileIDsByRootID: [UUID: Set<UUID>] = [:]
+    private var pendingCodemapRepairFileIDs = Set<UUID>()
     private var initializingSessionWorktreeCodemapRootIDs = Set<UUID>()
     private var initializedSessionWorktreeCodemapRootIDs = Set<UUID>()
     private var cachedCodemapFileAPIAggregate: WorkspaceCodemapFileAPIAggregate?
@@ -3638,6 +3639,7 @@ actor WorkspaceFileContextStore {
 
     func cancelAllCodemapScans() async {
         await codeScanActor.cancelAllScans()
+        pendingCodemapRepairFileIDs.removeAll()
     }
 
     func cancelCodemapScansForCheckoutMutation(rootIDs: [UUID]) async {
@@ -4094,6 +4096,8 @@ actor WorkspaceFileContextStore {
         #endif
 
         let removedRootIDSet = Set(statesToUnload.map(\.rootID))
+        let removedFileIDs = statesToUnload.flatMap(\.state.fileIDsByRelativePath.values)
+        pendingCodemapRepairFileIDs.subtract(removedFileIDs)
         initializingSessionWorktreeCodemapRootIDs.subtract(removedRootIDSet)
         initializedSessionWorktreeCodemapRootIDs.subtract(removedRootIDSet)
         rootLoadOrder.removeAll { removedRootIDSet.contains($0) }
@@ -4312,6 +4316,35 @@ actor WorkspaceFileContextStore {
         let key = StandardizedPath.relative(relativePath)
         guard let folderID = state.folderIDsByRelativePath[key] else { return nil }
         return foldersByID[folderID]
+    }
+
+    func cachedSearchContentSnapshot(
+        for expectedRecord: WorkspaceFileRecord
+    ) async -> FileSearchContentSnapshot {
+        guard let current = file(
+            rootID: expectedRecord.rootID,
+            relativePath: expectedRecord.standardizedRelativePath
+        ), current.id == expectedRecord.id else {
+            return staleSearchContentSnapshot(for: expectedRecord)
+        }
+        let epoch = searchContentInvalidationEpochsByFileID[current.id] ?? 0
+        let cacheKey = WorkspaceSearchContentCacheKey(
+            rootID: current.rootID,
+            fileID: current.id,
+            standardizedRelativePath: current.standardizedRelativePath
+        )
+        guard let cached = await searchDecodedContentCache.cachedSnapshot(
+            for: cacheKey,
+            invalidationEpoch: epoch
+        ), searchContentRecordIsCurrent(current, invalidationEpoch: epoch) else {
+            return staleSearchContentSnapshot(for: current)
+        }
+        return FileSearchContentSnapshot(
+            content: cached.content,
+            contentRevision: cached.revision,
+            modificationDate: cached.modificationDate,
+            isFresh: true
+        )
     }
 
     func searchContentSnapshot(
@@ -4694,6 +4727,81 @@ actor WorkspaceFileContextStore {
             }
         }
         return pendingRootIDs
+    }
+
+    func enqueueMissingCodemapSnapshotRepairs(
+        for files: [WorkspaceFileRecord]
+    ) -> WorkspaceCodemapRepairResult {
+        let snapshots = codemapSnapshotDictionary()
+        var missingFiles: [WorkspaceFileRecord] = []
+        var seenFileIDs = Set<UUID>()
+
+        for file in files {
+            guard seenFileIDs.insert(file.id).inserted,
+                  isDiscoverableFileID(file.id),
+                  filesByID[file.id] != nil,
+                  snapshots[file.id] == nil
+            else { continue }
+            missingFiles.append(file)
+        }
+
+        var newlyQueuedFiles: [WorkspaceFileRecord] = []
+        for file in missingFiles where pendingCodemapRepairFileIDs.insert(file.id).inserted {
+            newlyQueuedFiles.append(file)
+        }
+
+        if !newlyQueuedFiles.isEmpty {
+            Task.detached(priority: .utility) { [store = self, newlyQueuedFiles] in
+                await store.performEnqueuedCodemapSnapshotRepairs(for: newlyQueuedFiles)
+            }
+        }
+
+        return WorkspaceCodemapRepairResult(
+            snapshotsByFileID: snapshots,
+            pendingFileIDs: Set(missingFiles.map(\.id))
+        )
+    }
+
+    private func performEnqueuedCodemapSnapshotRepairs(
+        for files: [WorkspaceFileRecord]
+    ) async {
+        await ensureCodeScanResultTask()
+        let currentFiles = files.filter { file in
+            pendingCodemapRepairFileIDs.contains(file.id)
+                && isDiscoverableFileID(file.id)
+                && filesByID[file.id] != nil
+                && codemapSnapshotsByFileID[file.id] == nil
+        }
+        let currentFileIDs = Set(currentFiles.map(\.id))
+        guard !currentFiles.isEmpty else {
+            pendingCodemapRepairFileIDs.subtract(files.map(\.id))
+            return
+        }
+
+        do {
+            let requests = try await codemapScanRequests(for: currentFiles)
+            guard !requests.isEmpty else {
+                pendingCodemapRepairFileIDs.subtract(currentFileIDs)
+                return
+            }
+            let rootFolderPaths = Array(Set(requests.map(\.rootFolderPath)))
+            let requestResult = await codeScanActor.requestSelfHealingScans(
+                requests,
+                rootFolderPaths: rootFolderPaths,
+                existingScanModificationDatesByFileID: Dictionary(
+                    uniqueKeysWithValues: currentFiles.compactMap { file in
+                        file.modificationDate.map { (file.id, $0) }
+                    }
+                )
+            )
+            let scheduledFileIDs = requestResult.submittedFileIDs.union(requestResult.alreadyScheduledFileIDs)
+            pendingCodemapRepairFileIDs.subtract(currentFileIDs.subtracting(scheduledFileIDs))
+            pendingCodemapRepairFileIDs.subtract(
+                scheduledFileIDs.filter { codemapSnapshotsByFileID[$0] != nil }
+            )
+        } catch {
+            pendingCodemapRepairFileIDs.subtract(currentFileIDs)
+        }
     }
 
     func repairMissingCodemapSnapshots(
@@ -6754,6 +6862,7 @@ actor WorkspaceFileContextStore {
         searchContentInvalidationEpochsByFileID.removeValue(forKey: fileID)
         fileIDsByStandardizedFullPath.removeValue(forKey: file.standardizedFullPath)
         managedOnlyFileIDs.remove(fileID)
+        pendingCodemapRepairFileIDs.remove(fileID)
         if codemapSnapshotsByFileID.removeValue(forKey: fileID) != nil {
             invalidateAllCodemapFileAPIsCache()
         }
@@ -6871,6 +6980,7 @@ actor WorkspaceFileContextStore {
     }
 
     private func applyCodeScanResults(_ results: [CodeScanActor.ScanResult]) {
+        pendingCodemapRepairFileIDs.subtract(results.map(\.fileID))
         var snapshotsByRootID: [UUID: [WorkspaceCodemapSnapshot]] = [:]
         for result in results {
             guard isDiscoverableFileID(result.fileID),

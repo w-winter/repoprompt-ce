@@ -1431,6 +1431,12 @@ final class AgentModeViewModel: ObservableObject {
             guard let self else { return .unavailable }
             return worktreeBindingState(forAgentSessionID: sessionID, tabID: tabID)
         }
+        mcpServer.registerAgentWorktreeBindingsResolver { [weak self] sessionID, tabID in
+            guard let self, let tabID else { return .unavailable }
+            let session = await ensureSessionReady(tabID: tabID)
+            guard session.activeAgentSessionID == sessionID else { return .unavailable }
+            return worktreeBindingState(forAgentSessionID: sessionID, tabID: tabID)
+        }
 
         refreshAvailableAgents()
 
@@ -1613,6 +1619,12 @@ final class AgentModeViewModel: ObservableObject {
             runInteractionStateObserver = codexCoordinator
             testMCPServer?.registerAgentWorktreeBindingsProvider { [weak self] sessionID, tabID in
                 guard let self else { return .unavailable }
+                return worktreeBindingState(forAgentSessionID: sessionID, tabID: tabID)
+            }
+            testMCPServer?.registerAgentWorktreeBindingsResolver { [weak self] sessionID, tabID in
+                guard let self, let tabID else { return .unavailable }
+                let session = await ensureSessionReady(tabID: tabID)
+                guard session.activeAgentSessionID == sessionID else { return .unavailable }
                 return worktreeBindingState(forAgentSessionID: sessionID, tabID: tabID)
             }
             refreshAvailableAgents()

@@ -61,6 +61,11 @@ struct PromptContextAccountingResult {
     let codemapSnapshotsUsed: [UUID: WorkspaceCodemapSnapshot]
 }
 
+enum PromptContextAccountingContentPolicy {
+    case loadContent
+    case cachedOnly
+}
+
 private struct SelectedFileAccountingReadRequest {
     let selectedPathIndex: Int
     let selectedPath: String
@@ -130,7 +135,8 @@ actor PromptContextAccountingService {
             rootScope: request.rootScope,
             profile: request.pathLocateProfile,
             codeMapUsage: request.codeMapUsage,
-            codemapSnapshots: codemapSnapshots
+            codemapSnapshots: codemapSnapshots,
+            contentPolicy: .loadContent
         )
         #if DEBUG
             PromptTokenRecountDiagnostics.event(
@@ -207,7 +213,8 @@ actor PromptContextAccountingService {
         store: WorkspaceFileContextStore,
         rootScope: WorkspaceLookupRootScope = .allLoaded,
         profile: PathLocateProfile = .uiAssisted,
-        codeMapUsage: CodeMapUsage = .auto
+        codeMapUsage: CodeMapUsage = .auto,
+        contentPolicy: PromptContextAccountingContentPolicy = .loadContent
     ) async -> (entries: [ResolvedPromptFileEntry], missingPaths: [String], invalidPaths: [String]) {
         let codemapSnapshots = await store.codemapSnapshotDictionary()
         return await resolveEntries(
@@ -216,7 +223,8 @@ actor PromptContextAccountingService {
             rootScope: rootScope,
             profile: profile,
             codeMapUsage: codeMapUsage,
-            codemapSnapshots: codemapSnapshots
+            codemapSnapshots: codemapSnapshots,
+            contentPolicy: contentPolicy
         )
     }
 
@@ -226,7 +234,8 @@ actor PromptContextAccountingService {
         rootScope: WorkspaceLookupRootScope,
         profile: PathLocateProfile,
         codeMapUsage: CodeMapUsage,
-        codemapSnapshots: [UUID: WorkspaceCodemapSnapshot]
+        codemapSnapshots: [UUID: WorkspaceCodemapSnapshot],
+        contentPolicy: PromptContextAccountingContentPolicy
     ) async -> (entries: [ResolvedPromptFileEntry], missingPaths: [String], invalidPaths: [String]) {
         #if DEBUG
             let resolveStartMS = PromptTokenRecountDiagnostics.start()
@@ -408,12 +417,22 @@ actor PromptContextAccountingService {
                     #endif
                     let content: String?
                     let errorDescription: String?
-                    do {
-                        content = try await store.readContent(rootID: request.file.rootID, relativePath: request.file.standardizedRelativePath)
+                    switch contentPolicy {
+                    case .loadContent:
+                        do {
+                            content = try await store.readContent(
+                                rootID: request.file.rootID,
+                                relativePath: request.file.standardizedRelativePath,
+                                workloadClass: .promptAccounting
+                            )
+                            errorDescription = nil
+                        } catch {
+                            content = nil
+                            errorDescription = String(String(describing: error).prefix(120))
+                        }
+                    case .cachedOnly:
+                        content = await store.cachedSearchContentSnapshot(for: request.file).content
                         errorDescription = nil
-                    } catch {
-                        content = nil
-                        errorDescription = String(String(describing: error).prefix(120))
                     }
                     #if DEBUG
                         selectedPathsDebugState.finishBatchRead(errorDescription: errorDescription)
@@ -539,7 +558,16 @@ actor PromptContextAccountingService {
                             selectedPathsDebugState.beginRead(file: file)
                         #endif
                         do {
-                            content = try await store.readContent(rootID: file.rootID, relativePath: file.standardizedRelativePath)
+                            content = switch contentPolicy {
+                            case .loadContent:
+                                try await store.readContent(
+                                    rootID: file.rootID,
+                                    relativePath: file.standardizedRelativePath,
+                                    workloadClass: .promptAccounting
+                                )
+                            case .cachedOnly:
+                                await store.cachedSearchContentSnapshot(for: file).content
+                            }
                         } catch {
                             content = nil
                             #if DEBUG
@@ -621,7 +649,16 @@ actor PromptContextAccountingService {
             }
             guard !selectedFileIDs.contains(file.id) else { continue }
             selectedFileIDs.insert(file.id)
-            let content = try? await store.readContent(rootID: file.rootID, relativePath: file.standardizedRelativePath)
+            let content: String? = switch contentPolicy {
+            case .loadContent:
+                try? await store.readContent(
+                    rootID: file.rootID,
+                    relativePath: file.standardizedRelativePath,
+                    workloadClass: .promptAccounting
+                )
+            case .cachedOnly:
+                await store.cachedSearchContentSnapshot(for: file).content
+            }
             let entry = ResolvedPromptFileEntry(file: file, lineRanges: ranges, mode: .sliced, loadedContent: content ?? nil, rootFolderPath: result.location.rootPath)
             append(entry, to: &entries, seenIDs: &seenIDs)
         }

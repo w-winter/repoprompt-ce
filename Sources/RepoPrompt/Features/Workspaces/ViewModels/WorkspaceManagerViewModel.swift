@@ -4019,7 +4019,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         beginApplyingTabContext(forTabID: tabID)
         defer { endApplyingTabContext(forTabID: tabID) }
         await fileManager.applyStoredSelection(selection)
-        await promptViewModel.tokenCountingViewModel.forceImmediateRecount()
+        promptViewModel.tokenCountingViewModel.markDirty(.selection)
     }
 
     /// Applies the newest stored selection after deferred `read_file` auto-selection.

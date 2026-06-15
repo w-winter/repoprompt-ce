@@ -2273,6 +2273,9 @@ extension ToolOutputFormatter {
                     out.append("- Git: \(formatTokenCount(git))")
                 }
             }
+            if let accounting = ctx.tokenAccounting {
+                out.append("- Token accounting: \(accounting.status) from \(accounting.source)\(accounting.refreshPending ? "; refresh pending" : "")")
+            }
             if let sel = ctx.selection {
                 if let summary = sel.summary {
                     let totalCount = summary.fullCount + summary.sliceCount + summary.codemapCount
@@ -2716,6 +2719,10 @@ extension ToolOutputFormatter {
             if let total = dto.totalTokens {
                 out.append("- Total tokens: \(total) (Auto view)")
             }
+        }
+
+        if let accounting = dto.tokenAccounting {
+            out.append("- Token accounting: \(accounting.status) from \(accounting.source)\(accounting.refreshPending ? "; refresh pending" : "")")
         }
 
         // Copy preset effect (only if it differs from auto)
