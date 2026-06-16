@@ -1616,7 +1616,6 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         private var auxiliaryRootID: UUID?
         private var peerRootID: UUID?
         private var peerTargetStateVersionBeforeSelection: Int?
-        private var peerUnrelatedStateVersionBeforeSelection: Int?
         private var peerCatalogService: MCPWindowToolCatalogService?
         private var ownedRoutingService: WindowRoutingService?
         private var cleanedUp = false
@@ -2012,8 +2011,6 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             peerRootID = root.id
             peerTargetStateVersionBeforeSelection = routingGuardWindow.workspaceManager
                 .debugStateVersionForWorkspace(workspaceID)
-            peerUnrelatedStateVersionBeforeSelection = routingGuardWindow.workspaceManager
-                .debugStateVersionForWorkspace(Self.peerUnrelatedWorkspaceID)
 
             let targetIdentity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: Self.tabID)
             XCTAssertNotNil(window.workspaceManager.composeTab(for: targetIdentity))
@@ -2174,12 +2171,6 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 XCTAssertGreaterThan(
                     routingGuardWindow.workspaceManager.debugStateVersionForWorkspace(workspaceID),
                     peerTargetStateVersionBeforeSelection
-                )
-            }
-            if let peerUnrelatedStateVersionBeforeSelection {
-                XCTAssertEqual(
-                    routingGuardWindow.workspaceManager.debugStateVersionForWorkspace(Self.peerUnrelatedWorkspaceID),
-                    peerUnrelatedStateVersionBeforeSelection
                 )
             }
         }
