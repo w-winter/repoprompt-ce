@@ -642,14 +642,14 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
 
         self.assert_fds_closed([int(fd) for fd in fds if fd is not None])
 
-    def test_pty_eio_after_child_exit_is_eof(self) -> None:
+    def test_pty_eio_is_eof_without_waiting_for_popen_to_reap_child(self) -> None:
         transport = conductor.ProcessOutputTransport(kind="pty", master_fd=123)
         process = mock.Mock()
-        process.poll.return_value = 0
 
         with mock.patch.object(conductor.os, "read", side_effect=OSError(errno.EIO, "fixture EIO")):
             self.assertEqual(transport.read_chunk(process), b"")
 
+        process.poll.assert_not_called()
         transport.master_fd = None
 
     def test_output_relay_frames_split_multiple_crlf_unterminated_and_sgr_markers(self) -> None:

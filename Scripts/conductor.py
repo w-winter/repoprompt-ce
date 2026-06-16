@@ -241,7 +241,7 @@ class ProcessOutputTransport:
         try:
             return os.read(master_fd, 64 * 1024)
         except OSError as exc:
-            if exc.errno == errno.EIO and process.poll() is not None:
+            if exc.errno == errno.EIO:
                 return b""
             if exc.errno == errno.EBADF:
                 with self.close_lock:
