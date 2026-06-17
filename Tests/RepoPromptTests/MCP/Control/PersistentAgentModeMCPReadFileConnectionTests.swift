@@ -2327,27 +2327,18 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
         func assertReadFileAutoSelectionSettled(fixture: Fixture) async {
             let settled = await waitForReadFileAutoSelectionToSettle(fixture: fixture)
-            XCTAssertTrue(settled, "Read-file auto-selection did not settle")
+            XCTAssertTrue(
+                settled,
+                "Read-file auto-selection mirrored drain did not complete; diagnostics: \(fixture.window.mcpServer.readFileAutoSelectionDiagnosticsSnapshot())"
+            )
         }
 
         func waitForReadFileAutoSelectionToSettle(fixture: Fixture) async -> Bool {
-            let deadline = ContinuousClock.now + .seconds(3)
-            while ContinuousClock.now < deadline {
-                let snapshot = fixture.window.mcpServer.readFileAutoSelectionDiagnosticsSnapshot()
-                if snapshot.canonicalWorkerCount == 0,
-                   snapshot.mirrorWorkerCount == 0,
-                   snapshot.pendingCanonicalBatchCount == 0,
-                   snapshot.pendingMirrorBatchCount == 0
-                {
-                    return true
-                }
-                try? await Task.sleep(for: .milliseconds(10))
-            }
-            let snapshot = fixture.window.mcpServer.readFileAutoSelectionDiagnosticsSnapshot()
-            return snapshot.canonicalWorkerCount == 0
-                && snapshot.mirrorWorkerCount == 0
-                && snapshot.pendingCanonicalBatchCount == 0
-                && snapshot.pendingMirrorBatchCount == 0
+            guard let target = try? fixture.readFileAutoSelectionTarget() else { return false }
+            return await fixture.window.mcpServer.readFileAutoSelectionCoordinator.drain(
+                .mirroredSelectionAndMetrics,
+                for: target.contextKey
+            ) == .completed
         }
 
         func waitForCanonicalWorkerToSettle(fixture: Fixture) async -> Bool {
@@ -2692,6 +2683,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             let window = WindowState()
             let routingGuardWindow = WindowState()
+            await window.workspaceManager.awaitInitialized()
+            await routingGuardWindow.workspaceManager.awaitInitialized()
             if agentOwned {
                 window.mcpServer.registerAgentWorktreeBindingsProvider { sessionID, tabID in
                     guard sessionID == agentSessionID, tabID == Self.tabID else { return .hydrated([]) }
@@ -2749,6 +2742,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 guard exactHit?.standardizedFullPath == fileURL.path else {
                     throw ClientFixtureError.exactAbsoluteCatalogMiss
                 }
+                await settleInitialPresentationLifecycle()
 
                 let resolvedCatalogService = window.mcpServer.windowMCPToolCatalogService
                 catalogService = resolvedCatalogService
@@ -2863,6 +2857,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             } catch {
                 await connectionManager?.stop()
                 socketClient?.close()
+                window.beginClose()
+                routingGuardWindow.beginClose()
                 await ServerNetworkManager.shared.removeConnection(connectionID)
                 await ServerNetworkManager.shared.clearExpectedAgentPID(
                     getpid(),
@@ -2894,6 +2890,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     windowID: window.windowID,
                     runID: runID
                 )
+                await window.tearDown()
+                await routingGuardWindow.tearDown()
                 if let catalogService {
                     ServiceRegistry.unregister(catalogService)
                 }
@@ -2904,6 +2902,17 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 WindowStatesManager.shared.unregisterWindowState(window)
                 try? FileManager.default.removeItem(at: rootURL)
                 throw error
+            }
+        }
+
+        private static func settleInitialPresentationLifecycle() async {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.main.async {
+                    // Drain presentation observers scheduled by the first main-queue delivery.
+                    DispatchQueue.main.async {
+                        continuation.resume()
+                    }
+                }
             }
         }
 
@@ -3566,6 +3575,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
             await connectionManager.stop()
             socketClient.close()
+            window.beginClose()
+            routingGuardWindow.beginClose()
             await networkManager.removeConnection(Self.connectionID)
             let limiterAfterRemoval = await networkManager.connectionLimiterSnapshotForTesting(
                 connectionID: Self.connectionID
@@ -3598,6 +3609,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 windowID: windowID,
                 runID: Self.runID
             )
+            await window.tearDown()
+            await routingGuardWindow.tearDown()
             ServiceRegistry.unregister(catalogService)
             if let peerCatalogService {
                 ServiceRegistry.unregister(peerCatalogService)
