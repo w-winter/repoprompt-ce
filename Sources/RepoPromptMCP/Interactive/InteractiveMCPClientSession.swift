@@ -562,7 +562,7 @@ actor InteractiveMCPClientSession {
                 }
             }
             let outcome = settlement.finish()
-            await settlement.waitForCancellationDelivery()
+            await waitForCancellationDeliveryIfNeeded(settlement: settlement, outcome: outcome)
             return try Self.resolveToolCallSettlement(
                 outcome,
                 result: result,
@@ -571,7 +571,7 @@ actor InteractiveMCPClientSession {
             )
         } catch {
             let outcome = settlement.finish()
-            await settlement.waitForCancellationDelivery()
+            await waitForCancellationDeliveryIfNeeded(settlement: settlement, outcome: outcome)
             switch outcome {
             case .timedOut:
                 throw InteractiveSessionError.toolCallTimeout(
@@ -583,6 +583,20 @@ actor InteractiveMCPClientSession {
             case .pending, .completed:
                 throw error
             }
+        }
+    }
+
+    private func waitForCancellationDeliveryIfNeeded(
+        settlement: ToolCallSettlementState,
+        outcome: ToolCallSettlementState.Outcome
+    ) async {
+        switch outcome {
+        case .pending, .completed:
+            await settlement.waitForCancellationDelivery()
+        case .timedOut:
+            return
+        case .callerCancelled:
+            await settlement.waitForCancellationDelivery()
         }
     }
 
@@ -1043,18 +1057,27 @@ actor InteractiveMCPClientSession {
         var payload = jsonData
         payload.append(UInt8(ascii: "\n"))
 
-        var totalWritten = 0
-        while totalWritten < payload.count {
-            let written = payload.withUnsafeBytes { buf in
-                let ptr = buf.baseAddress!.advanced(by: totalWritten)
-                return Darwin.write(fd, ptr, payload.count - totalWritten)
-            }
-
-            if written < 0 {
-                if errno == EAGAIN || errno == EINTR { continue }
+        do {
+            try NonBlockingFDWriter.writeAll(
+                payload,
+                to: fd,
+                stallTimeout: MCPBootstrapTiming.initialRequestWriteTimeout
+            )
+        } catch let error as NonBlockingFDWriteError {
+            switch error {
+            case .cancelled:
+                throw InteractiveSessionError.cancelled
+            case let .fcntlFailed(errno):
+                throw InteractiveSessionError.descriptorConfigurationFailed(errno: errno)
+            case let .pollFailed(errno):
+                throw InteractiveSessionError.pollFailed(errno: errno)
+            case .localTimeout:
+                throw InteractiveSessionError.writeFailed(errno: ETIMEDOUT)
+            case .brokenPipe:
+                throw InteractiveSessionError.writeFailed(errno: EPIPE)
+            case let .writeFailed(errno, _, _):
                 throw InteractiveSessionError.writeFailed(errno: errno)
             }
-            totalWritten += written
         }
     }
 

@@ -1788,9 +1788,11 @@ actor MCPService: Service {
                     try await self.runTransport()
                 }
 
-                // Wait for first to complete (either kill signal, orphan detection, or transport exit)
+                // Wait for first to complete (either kill signal, orphan detection, or transport exit),
+                // then stop the watcher tasks so a clean transport exit can return promptly.
                 do {
-                    while let _ = try await group.next() {}
+                    _ = try await group.next()
+                    group.cancelAll()
                 } catch {
                     group.cancelAll()
                     throw error
