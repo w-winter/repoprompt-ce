@@ -612,6 +612,9 @@ final class AgentModeViewModel: ObservableObject {
     private var saveInFlightSessionIDs: Set<UUID> = []
     private var saveRequestedWhileInFlightSessionIDs: Set<UUID> = []
     private var workspaceSwitchBackgroundCleanupTasks: [UUID: Task<Void, Never>] = [:]
+    #if DEBUG
+        private var test_workspaceSwitchBackgroundCleanupDrainTasks: [UUID: Task<Void, Never>] = [:]
+    #endif
     var sidebarAutoArchiveTask: Task<Void, Never>?
     var isApplyingSidebarAutoArchive = false
     let sidebarAutoArchivePolicy = AgentModeSidebarAutoArchivePolicy()
@@ -822,6 +825,18 @@ final class AgentModeViewModel: ObservableObject {
         func test_waitForSessionListCacheRefresh() async {
             while let task = sessionListCacheTask {
                 await task.value
+                await Task.yield()
+            }
+        }
+
+        func test_drainWorkspaceSwitchBackgroundCleanup() async {
+            while true {
+                let tasks = Array(test_workspaceSwitchBackgroundCleanupDrainTasks.values)
+                guard !tasks.isEmpty else { return }
+
+                for task in tasks {
+                    await task.value
+                }
                 await Task.yield()
             }
         }
@@ -1730,6 +1745,9 @@ final class AgentModeViewModel: ObservableObject {
             task.cancel()
         }
         workspaceSwitchBackgroundCleanupTasks.removeAll()
+        #if DEBUG
+            test_workspaceSwitchBackgroundCleanupDrainTasks.removeAll()
+        #endif
         sessionListCacheTask?.cancel()
         sidebarAutoArchiveTask?.cancel()
         sessionListCacheGeneration &+= 1
@@ -9487,6 +9505,11 @@ final class AgentModeViewModel: ObservableObject {
         let task = Task(priority: .utility) { @MainActor [weak self] in
             await Task.yield()
             guard let self else { return }
+            #if DEBUG
+                defer {
+                    test_workspaceSwitchBackgroundCleanupDrainTasks.removeValue(forKey: cleanupID)
+                }
+            #endif
             for target in targets {
                 await teardownMCPControl(
                     for: target.session,
@@ -9515,6 +9538,9 @@ final class AgentModeViewModel: ObservableObject {
             }
         }
         workspaceSwitchBackgroundCleanupTasks[cleanupID] = task
+        #if DEBUG
+            test_workspaceSwitchBackgroundCleanupDrainTasks[cleanupID] = task
+        #endif
     }
 
     private static func disposeDetachedWorkspaceSwitchTarget(
