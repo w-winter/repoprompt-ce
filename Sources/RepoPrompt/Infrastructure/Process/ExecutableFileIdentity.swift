@@ -16,8 +16,9 @@ struct ExecutableFileIdentity: Equatable {
             throw ExecutableFileIdentityError.pathMustBeAbsolute(rawPath)
         }
 
-        let canonicalPath = FileSystemService.realpathString(rawPath)
-            ?? (rawPath as NSString).standardizingPath
+        guard let canonicalPath = FileSystemService.realpathString(rawPath) else {
+            throw ExecutableFileIdentityError.unavailable((rawPath as NSString).standardizingPath)
+        }
         var info = stat()
         guard stat(canonicalPath, &info) == 0 else {
             throw ExecutableFileIdentityError.unavailable(canonicalPath)

@@ -157,7 +157,6 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
         let effectiveHints = CLILaunchProfiles.providerSpecificPathsSupplementedWithNativeDefaults(config.additionalPathHints)
         return try firstValidLaunch(
             candidates: launchCandidates(
-                configuredCommand: configuredCommand,
                 additionalPathHints: effectiveHints,
                 environment: environment
             ),
@@ -239,7 +238,6 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
     }
 
     private func launchCandidates(
-        configuredCommand: String,
         additionalPathHints: [String],
         environment: [String: String]
     ) -> [String] {
@@ -269,9 +267,6 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
             additionalPaths: additionalPathHints
         ) {
             append((directory as NSString).appendingPathComponent(CursorACPLaunchCandidate.cursorAgentACP.command))
-        }
-        if configuredCommand.contains("/") {
-            append(configuredCommand)
         }
         return candidates
     }

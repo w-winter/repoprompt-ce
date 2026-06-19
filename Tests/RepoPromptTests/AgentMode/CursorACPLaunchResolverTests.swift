@@ -406,7 +406,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         }
     }
 
-    func testBareCursorAgentFallsBackToAdditionalHintWhenShellCandidateIsUnsafe() async throws {
+    func testBareCursorAgentFallsBackToAdditionalHintWhenPathCandidateIsUnsafe() async throws {
         let unsafeDirectory = try makePrivateTemporaryDirectory()
         let trustedDirectory = try makePrivateTemporaryDirectory()
         _ = try makeExecutable(named: "cursor-agent", in: unsafeDirectory)
@@ -426,6 +426,18 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         XCTAssertEqual(launch.command, try canonicalExecutablePath(trusted))
     }
 
+    func testNoValidLaunchCandidateDiagnosticsPreserveCandidateOrder() {
+        let failures = [
+            "/first/cursor-agent: first failure",
+            "/second/cursor-agent: second failure"
+        ]
+        let error = CursorACPLaunchResolutionError.noValidLaunchCandidate("cursor-agent", failures)
+
+        XCTAssertEqual(
+            error.errorDescription,
+            "Cursor Agent CLI was not found as a valid executable regular file for `cursor-agent`. Tried: \(failures.joined(separator: "; "))"
+        )
+    }
 
     func testAbsoluteConfiguredPathIgnoresDecoyCursorAgentEarlierInPath() throws {
         let trustedDirectory = try makeTemporaryDirectory()
@@ -763,13 +775,14 @@ final class CursorACPLaunchResolverTests: XCTestCase {
     }
 
     private func canonicalExecutablePath(_ url: URL) throws -> String {
-        try ExecutableFileIdentity.capture(atPath: url.path).canonicalPath
+        try XCTUnwrap(FileSystemService.realpathString(url.path))
     }
 
     private func makePrivateTemporaryDirectory() throws -> URL {
         let directory = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
             .appendingPathComponent("CursorACPLaunchResolverTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         addTeardownBlock {
             try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: directory.path)
             try? FileManager.default.removeItem(at: directory)
