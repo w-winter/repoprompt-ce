@@ -184,6 +184,8 @@ import MCP
                 cacheProcessingCount: 0,
                 resultBatchBufferCount: 0,
                 resultBatchBufferFileAPICount: 0,
+                resultDeliveryPendingCount: 0,
+                rootCachePinCount: 0,
                 actorRetainedFileAPILikeEntryCount: 0
             )
         }
@@ -211,6 +213,8 @@ import MCP
                 cacheProcessingCount: lhs.cacheProcessingCount + rhs.cacheProcessingCount,
                 resultBatchBufferCount: lhs.resultBatchBufferCount + rhs.resultBatchBufferCount,
                 resultBatchBufferFileAPICount: lhs.resultBatchBufferFileAPICount + rhs.resultBatchBufferFileAPICount,
+                resultDeliveryPendingCount: lhs.resultDeliveryPendingCount + rhs.resultDeliveryPendingCount,
+                rootCachePinCount: lhs.rootCachePinCount + rhs.rootCachePinCount,
                 actorRetainedFileAPILikeEntryCount: lhs.actorRetainedFileAPILikeEntryCount + rhs.actorRetainedFileAPILikeEntryCount
             )
         }
@@ -235,6 +239,8 @@ import MCP
                 "cache_processing": counters.cacheProcessingCount,
                 "result_batch_buffer": counters.resultBatchBufferCount,
                 "result_batch_buffer_file_apis": counters.resultBatchBufferFileAPICount,
+                "result_delivery_pending": counters.resultDeliveryPendingCount,
+                "root_cache_pins": counters.rootCachePinCount,
                 "actor_retained_file_api_like_entries": counters.actorRetainedFileAPILikeEntryCount
             ]
         }

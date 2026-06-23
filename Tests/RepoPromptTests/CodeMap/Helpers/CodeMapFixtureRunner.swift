@@ -98,6 +98,47 @@ enum CodeMapFixtureRunner {
         )
     }
 
+    static func renderArtifactCodeMap(for fixture: CodeMapFixture, tempRoot: URL) throws -> String {
+        let virtualURL = tempRoot.appendingPathComponent(fixture.relativePath)
+        guard let language = SyntaxManager.shared.language(forFileExtension: fixture.fileExtension) else {
+            throw CodeMapFixtureError.unsupportedExtension(fixture.fileExtension)
+        }
+
+        let source = makeSourceSnapshot(content: fixture.content)
+        guard case let .ready(artifact) = try CodeMapSyntaxArtifactBuilder.build(
+            source: source,
+            language: language
+        ) else {
+            throw CodeMapFixtureError.noArtifact(fixture.relativePath)
+        }
+
+        let rendered = CodeMapAPIContentFormatter.pathAndImportsBlock(
+            displayPath: virtualURL.path,
+            imports: artifact.imports
+        ) + artifact.apiDescription
+        return normalize(rendered, tempRoot: tempRoot)
+    }
+
+    static func makeSourceSnapshot(content: String, fingerprintSeed: UInt64 = 1) -> CodeMapSourceSnapshot {
+        let data = Data(content.utf8)
+        let fingerprint = FileContentFingerprint(
+            deviceID: fingerprintSeed,
+            fileNumber: fingerprintSeed + 1,
+            byteSize: Int64(data.count),
+            modificationSeconds: Int64(fingerprintSeed + 2),
+            modificationNanoseconds: 0,
+            statusChangeSeconds: Int64(fingerprintSeed + 3),
+            statusChangeNanoseconds: 0
+        )
+        return CodeMapSourceSnapshot(
+            validatedContent: ValidatedRawFileContentSnapshot(
+                data: data,
+                modificationDate: fingerprint.modificationDate,
+                fingerprint: fingerprint
+            )
+        )
+    }
+
     static func expectedFileTree() throws -> String {
         let url = try resourceURL(
             baseName: "fixture-tree",
@@ -194,6 +235,8 @@ enum CodeMapFixtureError: Error, CustomStringConvertible {
     case missingResource(String)
     case noCaptures(String)
     case noFileAPI(String)
+    case noArtifact(String)
+    case unsupportedExtension(String)
 
     var description: String {
         switch self {
@@ -203,6 +246,10 @@ enum CodeMapFixtureError: Error, CustomStringConvertible {
             "No Tree-sitter captures for \(path)"
         case let .noFileAPI(path):
             "No FileAPI generated for \(path)"
+        case let .noArtifact(path):
+            "No CodeMapSyntaxArtifact generated for \(path)"
+        case let .unsupportedExtension(fileExtension):
+            "Unsupported fixture extension: \(fileExtension)"
         }
     }
 }

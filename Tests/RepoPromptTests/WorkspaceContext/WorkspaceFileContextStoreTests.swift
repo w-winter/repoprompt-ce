@@ -6981,6 +6981,116 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(reloadedCounters.trackedFileIDCount, 1)
         }
 
+        func testLegacyCodemapTelemetryClassifiesFreshDiskAndPinnedMemoryPathsAndQuiesces() async throws {
+            let root = try makeTemporaryRoot(name: "LegacyCodemapTelemetry")
+            try write("struct TelemetryType { func measured() {} }\n", to: root.appendingPathComponent("A.swift"))
+            let collector = LegacyCodeMapTelemetryCollector()
+            let sampleID = UUID()
+            let firstStoreID = UUID()
+            let secondStoreID = UUID()
+            let firstStore = WorkspaceFileContextStore()
+            let secondStore = WorkspaceFileContextStore()
+            addTeardownBlock {
+                await firstStore.cancelAllCodemapScans()
+                await secondStore.cancelAllCodemapScans()
+                await secondStore.clearAllCodemapCaches(rootFolders: [root.path])
+            }
+
+            let firstRoot = try await firstStore.loadRoot(path: root.path)
+            let loadedFirstFile = await firstStore.file(rootID: firstRoot.id, relativePath: "A.swift")
+            let firstFile = try XCTUnwrap(loadedFirstFile)
+            let freshContext = LegacyCodeMapTelemetryContext(
+                collector: collector,
+                sampleID: sampleID,
+                cohort: .canonicalExplicitMiss,
+                storeID: firstStoreID,
+                rootRole: .canonical
+            )
+            let freshRepair = try await LegacyCodeMapTelemetryContext.$current.withValue(freshContext) {
+                try await firstStore.repairMissingCodemapSnapshots(for: [firstFile])
+            }
+            XCTAssertTrue(freshRepair.pendingFileIDs.isEmpty)
+            let firstQuiescence = await waitForCodemapQuiescence(store: firstStore)
+            XCTAssertTrue(firstQuiescence.isQuiescent)
+
+            let secondRoot = try await secondStore.loadRoot(path: root.path)
+            let loadedSecondFile = await secondStore.file(rootID: secondRoot.id, relativePath: "A.swift")
+            let secondFile = try XCTUnwrap(loadedSecondFile)
+            let diskContext = LegacyCodeMapTelemetryContext(
+                collector: collector,
+                sampleID: sampleID,
+                cohort: .sameRootSecondStore,
+                storeID: secondStoreID,
+                rootRole: .canonical
+            )
+            let diskRepair = try await LegacyCodeMapTelemetryContext.$current.withValue(diskContext) {
+                try await secondStore.repairMissingCodemapSnapshots(for: [secondFile])
+            }
+            XCTAssertTrue(diskRepair.pendingFileIDs.isEmpty)
+            let secondQuiescence = await waitForCodemapQuiescence(store: secondStore)
+            XCTAssertTrue(secondQuiescence.isQuiescent)
+
+            let setupContext = LegacyCodeMapTelemetryContext(
+                collector: collector,
+                sampleID: sampleID,
+                cohort: .setup,
+                storeID: secondStoreID,
+                rootRole: .canonical
+            )
+            let pin = try await LegacyCodeMapTelemetryContext.$current.withValue(setupContext) {
+                try await secondStore.pinCodemapRootCacheForTesting(rootID: secondRoot.id)
+            }
+            let pinned = await secondStore.codemapQuiescenceSnapshotForTesting()
+            XCTAssertEqual(pinned.pendingRepairFileCount, 0)
+            XCTAssertEqual(pinned.counters.rootCachePinCount, 1)
+            XCTAssertFalse(pinned.isQuiescent)
+
+            let memoryContext = LegacyCodeMapTelemetryContext(
+                collector: collector,
+                sampleID: sampleID,
+                cohort: .forcedResidentMemoryHit,
+                storeID: secondStoreID,
+                rootRole: .canonical
+            )
+            try await LegacyCodeMapTelemetryContext.$current.withValue(memoryContext) {
+                try await secondStore.requestCodemapCacheClassificationForTesting(fileID: secondFile.id)
+            }
+            let memoryPublished = await waitForAsyncCondition {
+                collector.snapshot().metrics(
+                    for: .forcedResidentMemoryHit,
+                    storeID: secondStoreID
+                )?.acceptedReadyPublicationCount == 1
+            }
+            XCTAssertTrue(memoryPublished)
+            await secondStore.releaseCodemapRootCachePinForTesting(pin)
+            let finalQuiescence = await waitForCodemapQuiescence(store: secondStore)
+            XCTAssertEqual(finalQuiescence.pendingRepairFileCount, 0)
+            XCTAssertTrue(finalQuiescence.isQuiescent)
+
+            let snapshot = collector.snapshot()
+            let fresh = try XCTUnwrap(snapshot.metrics(for: .canonicalExplicitMiss, storeID: firstStoreID))
+            XCTAssertEqual(fresh.cacheResults[.absentMiss], 1)
+            XCTAssertEqual(fresh.parseAttemptCount, 1)
+            XCTAssertEqual(fresh.parseTerminalOutcomes[.completed], 1)
+            XCTAssertEqual(fresh.lookupHashOperationCount, 1)
+            XCTAssertEqual(fresh.persistenceHashOperationCount, 1)
+            XCTAssertEqual(fresh.rootCacheSaveSuccessCount, 1)
+            XCTAssertEqual(fresh.acceptedReadyPublicationCount, 1)
+
+            let disk = try XCTUnwrap(snapshot.metrics(for: .sameRootSecondStore, storeID: secondStoreID))
+            XCTAssertEqual(disk.cacheResults[.diskHit], 1)
+            XCTAssertEqual(disk.parseAttemptCount, 0)
+            XCTAssertEqual(disk.rootCacheLoadOutcomes[.loaded], 1)
+            XCTAssertEqual(disk.acceptedReadyPublicationCount, 1)
+
+            let memory = try XCTUnwrap(snapshot.metrics(for: .forcedResidentMemoryHit, storeID: secondStoreID))
+            XCTAssertEqual(memory.cacheResults[.memoryHit], 1)
+            XCTAssertEqual(memory.parseAttemptCount, 0)
+            XCTAssertEqual(memory.rootCacheLoadAttemptCount, 0)
+            XCTAssertEqual(memory.acceptedReadyPublicationCount, 1)
+            XCTAssertTrue(snapshot.conservation(requireReadyPublications: true).isValid)
+        }
+
         func testSessionWorktreeCodemapInitializationFinalReleaseCancelsWithoutLateSubmissionAndIsolatesReplacementLifetime() async throws {
             let root = try makeTemporaryRoot(name: "SessionWorktreeCodemapLifetimeCancellation")
             try write("struct OldLifetimeType {}\n", to: root.appendingPathComponent("A.swift"))
@@ -7530,6 +7640,23 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let finalCounters = await store.codemapMemoryCounters()
             XCTFail("Timed out waiting for codemap counters: \(finalCounters)", file: file, line: line)
             return finalCounters
+        }
+
+        private func waitForCodemapQuiescence(
+            store: WorkspaceFileContextStore,
+            timeout: TimeInterval = 5,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async -> WorkspaceFileContextStore.CodemapQuiescenceSnapshot {
+            let deadline = Date().addingTimeInterval(timeout)
+            while Date() < deadline {
+                let snapshot = await store.codemapQuiescenceSnapshotForTesting()
+                if snapshot.isQuiescent { return snapshot }
+                try? await Task.sleep(nanoseconds: 25_000_000)
+            }
+            let finalSnapshot = await store.codemapQuiescenceSnapshotForTesting()
+            XCTFail("Timed out waiting for codemap quiescence: \(finalSnapshot)", file: file, line: line)
+            return finalSnapshot
         }
 
         private var createdFileFlags: FSEventStreamEventFlags {

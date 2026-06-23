@@ -5621,6 +5621,69 @@ actor WorkspaceFileContextStore {
             await codeScanActor.codemapMemoryCounters()
         }
 
+        struct CodemapQuiescenceSnapshot {
+            let sessionInitializationTaskCount: Int
+            let pendingRepairFileCount: Int
+            let counters: CodeScanActor.CodemapMemoryCounters
+
+            var isQuiescent: Bool {
+                sessionInitializationTaskCount == 0
+                    && pendingRepairFileCount == 0
+                    && counters.queuedCount == 0
+                    && counters.activeScanCount == 0
+                    && counters.outstandingScanCount == 0
+                    && counters.cacheProcessingCount == 0
+                    && counters.resultBatchBufferCount == 0
+                    && counters.resultDeliveryPendingCount == 0
+                    && counters.rootCacheLoadTaskCount == 0
+                    && counters.dirtyRootCount == 0
+                    && counters.rootCachePinCount == 0
+            }
+        }
+
+        func pinCodemapRootCacheForTesting(
+            rootID: UUID
+        ) async throws -> CodeScanActor.RootCachePinToken {
+            guard let state = rootStatesByID[rootID] else {
+                throw WorkspaceFileContextStoreError.rootNotLoaded(rootID)
+            }
+            return await codeScanActor.pinRootCacheForTesting(
+                rootFolderPath: state.root.standardizedFullPath
+            )
+        }
+
+        func releaseCodemapRootCachePinForTesting(
+            _ token: CodeScanActor.RootCachePinToken
+        ) async {
+            await codeScanActor.releaseRootCachePinForTesting(token)
+        }
+
+        func requestCodemapCacheClassificationForTesting(fileID: UUID) async throws {
+            guard let file = filesByID[fileID],
+                  let state = rootStatesByID[file.rootID]
+            else {
+                throw WorkspaceFileContextStoreError.catalogMaterializationFailed(
+                    "Codemap classification file is not loaded."
+                )
+            }
+            await ensureCodeScanResultTask()
+            let requests = try await codemapScanRequests(for: [file])
+            guard !requests.isEmpty else { return }
+            await codeScanActor.requestScans(
+                requests,
+                purpose: .initialRootLoad,
+                rootFolderPaths: [state.root.standardizedFullPath]
+            )
+        }
+
+        func codemapQuiescenceSnapshotForTesting() async -> CodemapQuiescenceSnapshot {
+            await CodemapQuiescenceSnapshot(
+                sessionInitializationTaskCount: sessionWorktreeCodemapInitializationTasksByLifetime.count,
+                pendingRepairFileCount: pendingCodemapRepairFileIDs.count,
+                counters: codeScanActor.codemapMemoryCounters()
+            )
+        }
+
         func setCodemapScanWillStartHandlerForTesting(
             _ handler: (@Sendable (UUID) async -> Void)?
         ) async {
@@ -6945,10 +7008,17 @@ actor WorkspaceFileContextStore {
         initializingSessionWorktreeCodemapLifetimes.formUnion(pendingContexts.map(\.lifetimeKey))
         #if DEBUG
             let coldStartCollector = WorkspaceFileSearchDebugContext.coldStartCollector
+            let legacyTelemetryContext = LegacyCodeMapTelemetryContext.current
+            let legacyTelemetryOperation = LegacyCodeMapTelemetryContext.currentOperation
             for context in pendingContexts {
-                let task = Task(priority: .utility) { [store = self, context, coldStartCollector] in
+                let task = Task(priority: .utility) {
+                    [store = self, context, coldStartCollector, legacyTelemetryContext, legacyTelemetryOperation] in
                     await WorkspaceFileSearchDebugContext.$coldStartCollector.withValue(coldStartCollector) {
-                        await store.runSessionWorktreeCodemapInitialization(context)
+                        await LegacyCodeMapTelemetryContext.$current.withValue(legacyTelemetryContext) {
+                            await LegacyCodeMapTelemetryContext.$currentOperation.withValue(legacyTelemetryOperation) {
+                                await store.runSessionWorktreeCodemapInitialization(context)
+                            }
+                        }
                     }
                 }
                 sessionWorktreeCodemapInitializationTasksByLifetime[context.lifetimeKey] =
@@ -6956,9 +7026,22 @@ actor WorkspaceFileContextStore {
             }
         #else
             for context in pendingContexts {
-                let task = Task(priority: .utility) { [store = self, context] in
-                    await store.runSessionWorktreeCodemapInitialization(context)
-                }
+                #if CODEMAP_PERF
+                    let legacyTelemetryContext = LegacyCodeMapTelemetryContext.current
+                    let legacyTelemetryOperation = LegacyCodeMapTelemetryContext.currentOperation
+                    let task = Task(priority: .utility) {
+                        [store = self, context, legacyTelemetryContext, legacyTelemetryOperation] in
+                        await LegacyCodeMapTelemetryContext.$current.withValue(legacyTelemetryContext) {
+                            await LegacyCodeMapTelemetryContext.$currentOperation.withValue(legacyTelemetryOperation) {
+                                await store.runSessionWorktreeCodemapInitialization(context)
+                            }
+                        }
+                    }
+                #else
+                    let task = Task(priority: .utility) { [store = self, context] in
+                        await store.runSessionWorktreeCodemapInitialization(context)
+                    }
+                #endif
                 sessionWorktreeCodemapInitializationTasksByLifetime[context.lifetimeKey] =
                     SessionWorktreeCodemapInitializationTask(taskID: context.taskID, task: task)
             }
@@ -6988,9 +7071,22 @@ actor WorkspaceFileContextStore {
         }
 
         if !newlyQueuedFiles.isEmpty {
-            Task.detached(priority: .utility) { [store = self, newlyQueuedFiles] in
-                await store.performEnqueuedCodemapSnapshotRepairs(for: newlyQueuedFiles)
-            }
+            #if DEBUG || CODEMAP_PERF
+                let legacyTelemetryContext = LegacyCodeMapTelemetryContext.current
+                let legacyTelemetryOperation = LegacyCodeMapTelemetryContext.currentOperation
+                Task.detached(priority: .utility) {
+                    [store = self, newlyQueuedFiles, legacyTelemetryContext, legacyTelemetryOperation] in
+                    await LegacyCodeMapTelemetryContext.$current.withValue(legacyTelemetryContext) {
+                        await LegacyCodeMapTelemetryContext.$currentOperation.withValue(legacyTelemetryOperation) {
+                            await store.performEnqueuedCodemapSnapshotRepairs(for: newlyQueuedFiles)
+                        }
+                    }
+                }
+            #else
+                Task.detached(priority: .utility) { [store = self, newlyQueuedFiles] in
+                    await store.performEnqueuedCodemapSnapshotRepairs(for: newlyQueuedFiles)
+                }
+            #endif
         }
 
         return WorkspaceCodemapRepairResult(
@@ -7338,23 +7434,51 @@ actor WorkspaceFileContextStore {
             }
             guard isDiscoverableFileID(file.id), let state = rootStatesByID[file.rootID] else { continue }
             do {
-                let loaded = try await state.service.loadContentWithDate(
-                    ofRelativePath: file.standardizedRelativePath,
-                    workloadClass: .codemap
-                )
+                #if DEBUG || CODEMAP_PERF
+                    let legacyTelemetryOperation = LegacyCodeMapTelemetryContext.current?.operation(fileID: file.id)
+                    legacyTelemetryOperation?.recordRequested(
+                        supported: SyntaxManager.isSupportedFileExtension((file.name as NSString).pathExtension)
+                    )
+                    let loaded = try await LegacyCodeMapTelemetryContext.$currentOperation.withValue(
+                        legacyTelemetryOperation
+                    ) {
+                        try await state.service.loadContentWithDate(
+                            ofRelativePath: file.standardizedRelativePath,
+                            workloadClass: .codemap
+                        )
+                    }
+                #else
+                    let loaded = try await state.service.loadContentWithDate(
+                        ofRelativePath: file.standardizedRelativePath,
+                        workloadClass: .codemap
+                    )
+                #endif
                 if let initializationContext {
                     try validateSessionWorktreeCodemapInitialization(initializationContext)
                 }
                 guard let content = loaded.content else { continue }
-                requests.append(CodeScanActor.ScanRequest(
-                    fileID: file.id,
-                    modificationDate: loaded.modificationDate,
-                    content: content,
-                    fileExtension: (file.name as NSString).pathExtension,
-                    relativePath: file.standardizedRelativePath,
-                    fullPath: file.standardizedFullPath,
-                    rootFolderPath: state.root.standardizedFullPath
-                ))
+                #if DEBUG || CODEMAP_PERF
+                    requests.append(CodeScanActor.ScanRequest(
+                        fileID: file.id,
+                        modificationDate: loaded.modificationDate,
+                        content: content,
+                        fileExtension: (file.name as NSString).pathExtension,
+                        relativePath: file.standardizedRelativePath,
+                        fullPath: file.standardizedFullPath,
+                        rootFolderPath: state.root.standardizedFullPath,
+                        legacyTelemetryOperation: legacyTelemetryOperation
+                    ))
+                #else
+                    requests.append(CodeScanActor.ScanRequest(
+                        fileID: file.id,
+                        modificationDate: loaded.modificationDate,
+                        content: content,
+                        fileExtension: (file.name as NSString).pathExtension,
+                        relativePath: file.standardizedRelativePath,
+                        fullPath: file.standardizedFullPath,
+                        rootFolderPath: state.root.standardizedFullPath
+                    ))
+                #endif
                 #if DEBUG
                     WorkspaceFileSearchDebugContext.coldStartCollector?.recordCodemapRequestPrepared()
                 #endif
@@ -10065,11 +10189,23 @@ actor WorkspaceFileContextStore {
         pendingCodemapRepairFileIDs.subtract(results.map(\.fileID))
         var snapshotsByRootID: [UUID: [WorkspaceCodemapSnapshot]] = [:]
         for result in results {
+            #if DEBUG || CODEMAP_PERF
+                let legacyTelemetryOperation = result.legacyTelemetryOperation
+            #endif
             guard isDiscoverableFileID(result.fileID),
                   let file = filesByID[result.fileID],
                   let state = rootStatesByID[file.rootID],
                   state.root.standardizedFullPath == (result.rootFolderPath as NSString).standardizingPath
-            else { continue }
+            else {
+                #if DEBUG || CODEMAP_PERF
+                    legacyTelemetryOperation?.recordPublication(accepted: false)
+                #endif
+                continue
+            }
+
+            #if DEBUG || CODEMAP_PERF
+                legacyTelemetryOperation?.recordPublication(accepted: true)
+            #endif
 
             let snapshot = WorkspaceCodemapSnapshot(
                 fileID: result.fileID,

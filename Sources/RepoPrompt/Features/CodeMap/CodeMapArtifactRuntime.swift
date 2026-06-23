@@ -1,0 +1,107 @@
+import Foundation
+import RepoPromptShared
+
+/// Process-lifetime ownership for content-addressed codemap artifact infrastructure.
+///
+/// Production access is intentionally lazy and inert until Phase 6 wires a consumer. Tests and
+/// benchmarks should construct isolated runtimes with explicit temporary roots instead.
+final class CodeMapArtifactRuntime: @unchecked Sendable {
+    let artifactStore: CodeMapArtifactStore
+    let locatorStore: GitBlobCodeMapLocatorStore
+    let coordinator: CodeMapArtifactBuildCoordinator
+
+    init(
+        rootURL: URL,
+        artifactStorePolicy: CodeMapArtifactStorePolicy = .default,
+        artifactStoreClock: CodeMapArtifactStoreClock = .system,
+        artifactStoreRemovalHooks: CodeMapSecureFileRemovalHooks? = nil,
+        locatorStorePolicy: GitBlobCodeMapLocatorStorePolicy = .default,
+        locatorStoreHooks: GitBlobCodeMapLocatorStoreHooks = .none,
+        builder: CodeMapArtifactBuilderClient = CodeMapArtifactBuilderClient(),
+        coordinatorPolicy: CodeMapArtifactBuildCoordinatorPolicy = .default,
+        coordinatorClock: CodeMapArtifactBuildCoordinatorClock = .continuous,
+        coordinatorHooks: CodeMapArtifactBuildCoordinatorHooks = .none
+    ) throws {
+        let artifactStore = try CodeMapArtifactStore(
+            rootURL: rootURL,
+            policy: artifactStorePolicy,
+            clock: artifactStoreClock,
+            removalHooks: artifactStoreRemovalHooks
+        )
+        let locatorStore = try GitBlobCodeMapLocatorStore(
+            rootURL: rootURL,
+            policy: locatorStorePolicy,
+            hooks: locatorStoreHooks
+        )
+        let coordinator = CodeMapArtifactBuildCoordinator(
+            artifactStore: CodeMapArtifactStoreClient(store: artifactStore),
+            locatorStore: GitBlobCodeMapLocatorStoreClient(store: locatorStore),
+            builder: builder,
+            policy: coordinatorPolicy,
+            clock: coordinatorClock,
+            hooks: coordinatorHooks
+        )
+
+        self.artifactStore = artifactStore
+        self.locatorStore = locatorStore
+        self.coordinator = coordinator
+    }
+
+    static func processWide() throws -> CodeMapArtifactRuntime {
+        try processWideProvider.runtime()
+    }
+
+    static func processWideRootURL(
+        applicationSupportRootURL: URL,
+        buildFlavor: MCPFilesystemIdentity.BuildFlavor
+    ) -> URL {
+        applicationSupportRootURL.appendingPathComponent(
+            "CodeMapArtifactRuntime-\(buildFlavor.rawValue)",
+            isDirectory: true
+        )
+    }
+
+    private static let processWideProvider = CodeMapArtifactRuntimeProvider {
+        let identity = MCPFilesystemConstants.identity
+        let rootURL = processWideRootURL(
+            applicationSupportRootURL: identity.applicationSupportRootURL(),
+            buildFlavor: identity.buildFlavor
+        )
+        try FileManager.default.createDirectory(
+            at: rootURL,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        return try CodeMapArtifactRuntime(rootURL: rootURL)
+    }
+}
+
+final class CodeMapArtifactRuntimeProvider: @unchecked Sendable {
+    typealias Factory = @Sendable () throws -> CodeMapArtifactRuntime
+
+    private let lock = NSLock()
+    private let factory: Factory
+    private var cachedResult: Result<CodeMapArtifactRuntime, Error>?
+
+    init(factory: @escaping Factory) {
+        self.factory = factory
+    }
+
+    func runtime() throws -> CodeMapArtifactRuntime {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if let cachedResult {
+            return try cachedResult.get()
+        }
+
+        let result: Result<CodeMapArtifactRuntime, Error>
+        do {
+            result = try .success(factory())
+        } catch {
+            result = .failure(error)
+        }
+        cachedResult = result
+        return try result.get()
+    }
+}

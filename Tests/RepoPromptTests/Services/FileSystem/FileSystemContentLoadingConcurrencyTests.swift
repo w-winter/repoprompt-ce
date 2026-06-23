@@ -87,6 +87,249 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         }
     }
 
+    func testValidatedRawContentReadsExactBytesWithoutProbeOrReread() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "ValidatedRawContentExactBytes")
+        let service = try await makeService(root: root)
+        let relativePath = "Source.swift"
+        let data = Data(repeating: 0x61, count: 12000)
+        try data.write(to: root.appendingPathComponent(relativePath))
+        let expectedFingerprint = try await service.contentFingerprint(ofRelativePath: relativePath)
+
+        #if DEBUG
+            let collector = LegacyCodeMapTelemetryCollector()
+            let context = LegacyCodeMapTelemetryContext(
+                collector: collector,
+                sampleID: UUID(),
+                cohort: .canonicalExplicitMiss,
+                storeID: UUID(),
+                rootRole: .canonical
+            )
+            let operation = context.operation(fileID: UUID())
+            let snapshot = try await LegacyCodeMapTelemetryContext.$currentOperation.withValue(operation) {
+                try await service.loadValidatedRawContent(
+                    ofRelativePath: relativePath,
+                    expectedFingerprint: expectedFingerprint
+                )
+            }
+            let metrics = try XCTUnwrap(
+                collector.snapshot().metrics(for: .canonicalExplicitMiss)
+            )
+            XCTAssertEqual(metrics.sourceRequestCount, 1)
+            XCTAssertEqual(metrics.successfulOpenCount, 1)
+            XCTAssertEqual(metrics.actualReadByteCount, UInt64(data.count))
+            XCTAssertEqual(metrics.decodedFileCount, 0)
+            XCTAssertEqual(metrics.sourceTerminalOutcomes[.loaded], 1)
+        #else
+            let snapshot = try await service.loadValidatedRawContent(
+                ofRelativePath: relativePath,
+                expectedFingerprint: expectedFingerprint
+            )
+        #endif
+
+        XCTAssertEqual(snapshot.data, data)
+        XCTAssertEqual(snapshot.fingerprint, expectedFingerprint)
+        XCTAssertEqual(snapshot.modificationDate, expectedFingerprint.modificationDate)
+
+        try FileSystemTestSupport.write("other", to: root.appendingPathComponent("Other.swift"))
+        let otherFingerprint = try await service.contentFingerprint(ofRelativePath: "Other.swift")
+        do {
+            _ = try await service.loadValidatedRawContent(
+                ofRelativePath: relativePath,
+                expectedFingerprint: otherFingerprint
+            )
+            XCTFail("Expected the caller fingerprint mismatch to fail closed.")
+        } catch FileContentValidationError.fingerprintChanged {
+            // Expected.
+        }
+    }
+
+    func testValidatedRawContentRejectsUnsafeMissingAndOversizedInputs() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "ValidatedRawContentSafety")
+        let outside = try temporaryRoots.makeRoot(suiteName: "ValidatedRawContentOutside")
+        let insideURL = root.appendingPathComponent("Inside.swift")
+        let outsideURL = outside.appendingPathComponent("Outside.swift")
+        let insideLinkURL = root.appendingPathComponent("InsideLink.swift")
+        let outsideLinkURL = root.appendingPathComponent("OutsideLink.swift")
+        try FileSystemTestSupport.write("inside", to: insideURL)
+        try FileSystemTestSupport.write("outside", to: outsideURL)
+        try createSymlinkOrSkip(at: insideLinkURL, destination: insideURL)
+        try createSymlinkOrSkip(at: outsideLinkURL, destination: outsideURL)
+
+        let service = try await makeService(root: root, skipSymlinks: false)
+        await assertInvalidRelativePath {
+            _ = try await service.loadValidatedRawContent(
+                ofRelativePath: "../\(outside.lastPathComponent)/Outside.swift"
+            )
+        }
+        await assertInvalidRelativePath {
+            _ = try await service.loadValidatedRawContent(ofRelativePath: "InsideLink.swift")
+        }
+        await assertInvalidRelativePath {
+            _ = try await service.loadValidatedRawContent(ofRelativePath: "OutsideLink.swift")
+        }
+
+        do {
+            _ = try await service.loadValidatedRawContent(ofRelativePath: "Missing.swift")
+            XCTFail("Expected a missing raw source to fail closed.")
+        } catch FileSystemError.fileNotFound {
+            // Expected.
+        }
+
+        do {
+            _ = try await service.loadValidatedRawContent(
+                ofRelativePath: "Inside.swift",
+                maximumBytes: 2
+            )
+            XCTFail("Expected an oversized raw source to fail closed.")
+        } catch FileSystemError.fileTooLarge {
+            // Expected.
+        }
+    }
+
+    func testValidatedRawContentRejectsCancellationBeforeBufferedRead() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "ValidatedRawContentCancellation")
+        let service = try await makeService(root: root)
+        let relativePath = "Slow.swift"
+        try Data(repeating: 0x61, count: 1_500_000)
+            .write(to: root.appendingPathComponent(relativePath))
+        let gate = AsyncGate()
+
+        await service.setContentReadChunkHandlerForTesting { path in
+            guard path == relativePath else { return }
+            await gate.markStartedAndWaitForRelease()
+        }
+        let readTask = Task {
+            try await service.loadValidatedRawContent(
+                ofRelativePath: relativePath,
+                maximumBytes: 2_000_000
+            )
+        }
+        await gate.waitUntilStarted()
+        readTask.cancel()
+        await gate.release()
+
+        do {
+            _ = try await readTask.value
+            XCTFail("Expected cancellation.")
+        } catch is CancellationError {
+            // Expected.
+        }
+        await service.setContentReadChunkHandlerForTesting(nil)
+    }
+
+    func testValidatedRawContentRejectsMidReadMutation() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "ValidatedRawContentMutation")
+        let service = try await makeService(root: root)
+        let relativePath = "Changing.swift"
+        let sourceURL = root.appendingPathComponent(relativePath)
+        try Data(repeating: 0x61, count: 1_500_000).write(to: sourceURL)
+        let secondChunkGate = AsyncGate()
+        let chunkCounter = AsyncCounter()
+
+        await service.setContentReadChunkHandlerForTesting { path in
+            guard path == relativePath else { return }
+            if await chunkCounter.incrementAndValue() == 2 {
+                await secondChunkGate.markStartedAndWaitForRelease()
+            }
+        }
+        let readTask = Task {
+            try await service.loadValidatedRawContent(
+                ofRelativePath: relativePath,
+                maximumBytes: 2_000_000
+            )
+        }
+        await secondChunkGate.waitUntilStarted()
+        try Data("replacement".utf8).write(to: sourceURL, options: .atomic)
+        await secondChunkGate.release()
+
+        do {
+            _ = try await readTask.value
+            XCTFail("Expected a mid-read replacement to fail closed.")
+        } catch FileContentValidationError.fingerprintChanged {
+            // Expected.
+        }
+        await service.setContentReadChunkHandlerForTesting(nil)
+    }
+
+    func testValidatedRawContentRejectsSymlinkRetargetDuringRead() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "ValidatedRawContentRetarget")
+        let outside = try temporaryRoots.makeRoot(suiteName: "ValidatedRawContentRetargetOutside")
+        let service = try await makeService(root: root, skipSymlinks: false)
+        let relativePath = "Retargeted.swift"
+        let sourceURL = root.appendingPathComponent(relativePath)
+        let movedURL = root.appendingPathComponent("Original.swift")
+        let targetURL = root.appendingPathComponent("Target.swift")
+        try Data(repeating: 0x61, count: 1_500_000).write(to: sourceURL)
+        try FileSystemTestSupport.write("target", to: targetURL)
+        let secondChunkGate = AsyncGate()
+        let chunkCounter = AsyncCounter()
+
+        await service.setContentReadChunkHandlerForTesting { path in
+            guard path == relativePath else { return }
+            if await chunkCounter.incrementAndValue() == 2 {
+                await secondChunkGate.markStartedAndWaitForRelease()
+            }
+        }
+        let readTask = Task {
+            try await service.loadValidatedRawContent(
+                ofRelativePath: relativePath,
+                maximumBytes: 2_000_000
+            )
+        }
+        await secondChunkGate.waitUntilStarted()
+        try FileManager.default.moveItem(at: sourceURL, to: movedURL)
+        try createSymlinkOrSkip(at: sourceURL, destination: targetURL)
+        await secondChunkGate.release()
+
+        do {
+            _ = try await readTask.value
+            XCTFail("Expected a symlink retarget to fail closed.")
+        } catch FileContentValidationError.fingerprintChanged {
+            // Descriptor identity changed when the original path moved.
+        } catch FileSystemError.invalidRelativePath {
+            // Pathname validation observed the symlink replacement.
+        }
+        await service.setContentReadChunkHandlerForTesting(nil)
+
+        let nestedRelativePath = "Nested/Intermediate.swift"
+        let nestedDirectoryURL = root.appendingPathComponent("Nested")
+        let movedDirectoryURL = outside.appendingPathComponent("MovedNested")
+        try FileManager.default.createDirectory(
+            at: nestedDirectoryURL,
+            withIntermediateDirectories: true
+        )
+        try Data(repeating: 0x62, count: 1_500_000)
+            .write(to: root.appendingPathComponent(nestedRelativePath))
+        let intermediateGate = AsyncGate()
+        let intermediateCounter = AsyncCounter()
+        await service.setContentReadChunkHandlerForTesting { path in
+            guard path == nestedRelativePath else { return }
+            if await intermediateCounter.incrementAndValue() == 2 {
+                await intermediateGate.markStartedAndWaitForRelease()
+            }
+        }
+        let intermediateTask = Task {
+            try await service.loadValidatedRawContent(
+                ofRelativePath: nestedRelativePath,
+                maximumBytes: 2_000_000
+            )
+        }
+        await intermediateGate.waitUntilStarted()
+        try FileManager.default.moveItem(at: nestedDirectoryURL, to: movedDirectoryURL)
+        try createSymlinkOrSkip(at: nestedDirectoryURL, destination: movedDirectoryURL)
+        await intermediateGate.release()
+
+        do {
+            _ = try await intermediateTask.value
+            XCTFail("Expected an intermediate-directory retarget outside the root to fail closed.")
+        } catch FileContentValidationError.fingerprintChanged {
+            // Descriptor identity changed when the original directory moved.
+        } catch FileSystemError.invalidRelativePath {
+            // Canonical containment observed the outside-root directory symlink.
+        }
+        await service.setContentReadChunkHandlerForTesting(nil)
+    }
+
     func testCancellationDuringChunkedReadDoesNotCommitEncodingCache() async throws {
         let root = try temporaryRoots.makeRoot(suiteName: "FileSystemContentLoadingCancellation")
         let service = try await makeService(root: root)
@@ -115,6 +358,117 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         XCTAssertNil(cachedEncoding)
         await service.setContentReadChunkHandlerForTesting(nil)
     }
+
+    #if DEBUG
+        func testLegacyCodemapTelemetryAttributesActualReadsDecodeAndCancellationTerminals() async throws {
+            let root = try temporaryRoots.makeRoot(suiteName: "LegacyCodemapContentTelemetry")
+            let service = try await makeService(root: root)
+            let relativePath = "Telemetry.source"
+            let bytes = Data(repeating: 0x61, count: 12000)
+            try bytes.write(to: root.appendingPathComponent(relativePath))
+            let sampleID = UUID()
+
+            let loadedCollector = LegacyCodeMapTelemetryCollector()
+            let loadedContext = LegacyCodeMapTelemetryContext(
+                collector: loadedCollector,
+                sampleID: sampleID,
+                cohort: .canonicalExplicitMiss,
+                storeID: UUID(),
+                rootRole: .canonical
+            )
+            let loadedOperation = loadedContext.operation(fileID: UUID())
+            let content = try await LegacyCodeMapTelemetryContext.$currentOperation.withValue(
+                loadedOperation
+            ) {
+                try await service.loadContent(
+                    ofRelativePath: relativePath,
+                    workloadClass: .codemap
+                )
+            }
+            XCTAssertEqual(content?.utf8.count, bytes.count)
+            let loaded = try XCTUnwrap(
+                loadedCollector.snapshot().metrics(for: .canonicalExplicitMiss)
+            )
+            XCTAssertEqual(loaded.sourceRequestCount, 1)
+            XCTAssertEqual(loaded.sourceTerminalOutcomes[.loaded], 1)
+            XCTAssertEqual(loaded.successfulOpenCount, 1)
+            XCTAssertEqual(loaded.nominalOpenedByteCount, UInt64(bytes.count))
+            XCTAssertEqual(loaded.actualReadByteCount, UInt64(bytes.count + 8192))
+            XCTAssertEqual(loaded.decodedFileCount, 1)
+            XCTAssertEqual(loaded.decodedUTF8ByteCount, UInt64(bytes.count))
+
+            let cancellationRelativePath = "Cancellation.source"
+            try bytes.write(to: root.appendingPathComponent(cancellationRelativePath))
+            let cancellationGate = AsyncGate()
+            await service.setContentReadChunkHandlerForTesting { path in
+                guard path == cancellationRelativePath else { return }
+                await cancellationGate.markStartedAndWaitForRelease()
+            }
+            let cancelledCollector = LegacyCodeMapTelemetryCollector()
+            let cancelledContext = LegacyCodeMapTelemetryContext(
+                collector: cancelledCollector,
+                sampleID: sampleID,
+                cohort: .setup,
+                storeID: UUID(),
+                rootRole: .canonical
+            )
+            let cancelledOperation = cancelledContext.operation(fileID: UUID())
+            let cancelledTask = LegacyCodeMapTelemetryContext.$currentOperation.withValue(
+                cancelledOperation
+            ) {
+                Task {
+                    try await service.loadContent(
+                        ofRelativePath: cancellationRelativePath,
+                        workloadClass: .codemap
+                    )
+                }
+            }
+            await cancellationGate.waitUntilStarted()
+            cancelledTask.cancel()
+            await cancellationGate.release()
+            do {
+                _ = try await cancelledTask.value
+                XCTFail("Expected cancellation")
+            } catch is CancellationError {
+                // Expected.
+            }
+            await service.setContentReadChunkHandlerForTesting(nil)
+
+            let cancelled = try XCTUnwrap(
+                cancelledCollector.snapshot().metrics(for: .setup)
+            )
+            XCTAssertEqual(cancelled.sourceRequestCount, 1)
+            XCTAssertEqual(cancelled.sourceTerminalOutcomes[.cancelled], 1)
+            XCTAssertEqual(cancelled.successfulOpenCount, 1)
+            XCTAssertEqual(cancelled.actualReadByteCount, 0)
+            XCTAssertTrue(cancelledCollector.snapshot().conservation().isValid)
+
+            let invalidCollector = LegacyCodeMapTelemetryCollector()
+            let invalidContext = LegacyCodeMapTelemetryContext(
+                collector: invalidCollector,
+                sampleID: sampleID,
+                cohort: .untracked,
+                storeID: UUID(),
+                rootRole: .canonical
+            )
+            let invalidOperation = invalidContext.operation(fileID: UUID())
+            let fingerprint = CodeMapContentFingerprint(content: "struct Invalid {}")
+            invalidOperation.recordRequested(supported: true)
+            invalidOperation.recordHash(kind: .lookup, fingerprint: fingerprint)
+            invalidOperation.recordCacheResult(.absentMiss)
+            invalidOperation.recordParseAttempt(fingerprint: fingerprint)
+            invalidOperation.recordParseTerminal(.completed)
+            invalidOperation.recordPublication(accepted: true)
+            let invalidConservation = invalidCollector.snapshot().conservation(
+                requireReadyPublications: true,
+                expectedFreshMisses: 2
+            )
+            XCTAssertFalse(invalidConservation.isValid)
+            XCTAssertTrue(invalidConservation.issues.contains {
+                $0.contains("fresh miss count does not match expectation")
+            })
+        }
+    #endif
 
     func testSlowSameRootContentReadDoesNotDelayAcceptedWatcherFlush() async throws {
         let root = try temporaryRoots.makeRoot(suiteName: "FileSystemContentLoadingSameRoot")

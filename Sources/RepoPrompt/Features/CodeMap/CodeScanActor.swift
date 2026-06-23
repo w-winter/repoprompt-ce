@@ -219,6 +219,16 @@ actor CodeScanActor {
     /// Single-flight disk loads for actor-owned root caches.
     private var rootCacheLoadTasks: [String: RootCacheLoadTask] = [:]
 
+    #if DEBUG || CODEMAP_PERF
+        private var diagnosticLookupFingerprintsByFileID: [UUID: CodeMapContentFingerprint] = [:]
+        private var rootCacheLoadTelemetryOperations: [String: LegacyCodeMapTelemetryOperation] = [:]
+        private var rootCacheSaveTelemetryOperations: [String: LegacyCodeMapTelemetryOperation] = [:]
+    #endif
+
+    #if DEBUG
+        private var rootCachePinsByID: [UUID: String] = [:]
+    #endif
+
     #if DEBUG
         private var rootCacheDiskLoadCount = 0
         private var rootCacheDiskLoadDuration: TimeInterval = 0
@@ -262,6 +272,9 @@ actor CodeScanActor {
         let relativePath: String
         let fullPath: String
         let rootFolderPath: String
+        #if DEBUG || CODEMAP_PERF
+            let legacyTelemetryOperation: LegacyCodeMapTelemetryOperation?
+        #endif
     }
 
     struct ScanResult: @unchecked Sendable {
@@ -273,6 +286,9 @@ actor CodeScanActor {
         let fullPath: String
         let rootFolderPath: String
         let fileAPI: FileAPI?
+        #if DEBUG || CODEMAP_PERF
+            let legacyTelemetryOperation: LegacyCodeMapTelemetryOperation?
+        #endif
 
         init(request: ScanRequest, fileAPI: FileAPI?) {
             fileID = request.fileID
@@ -282,6 +298,9 @@ actor CodeScanActor {
             fullPath = request.fullPath
             rootFolderPath = request.rootFolderPath
             self.fileAPI = fileAPI
+            #if DEBUG || CODEMAP_PERF
+                legacyTelemetryOperation = request.legacyTelemetryOperation
+            #endif
         }
     }
 
@@ -309,8 +328,15 @@ actor CodeScanActor {
 
             let resultBatchBufferCount: Int
             let resultBatchBufferFileAPICount: Int
+            let resultDeliveryPendingCount: Int
+            let rootCachePinCount: Int
 
             let actorRetainedFileAPILikeEntryCount: Int
+        }
+
+        struct RootCachePinToken: Hashable {
+            fileprivate let id: UUID
+            fileprivate let rootKey: String
         }
     #endif
 
@@ -334,30 +360,53 @@ actor CodeScanActor {
         case staleRoot
     }
 
+    private enum CacheHitProvenance {
+        case memory
+        case disk
+    }
+
+    private struct InitialRootLookup {
+        let files: [String: CodeMapCacheFileEntry]
+        let hitProvenance: CacheHitProvenance
+    }
+
+    private enum CacheEntryUsability {
+        case usable
+        case unusable(CacheEntryUnusableReason)
+    }
+
+    private enum CacheEntryUnusableReason {
+        case modificationDate
+        case fingerprint
+        case containment
+        case relativePathOwnership
+        case cachedAPIPath
+    }
+
     private func isUsableCacheEntry(
         _ entry: CodeMapCacheFileEntry,
         for request: ScanRequest,
         rootKey: String,
         contentFingerprint: CodeMapContentFingerprint
-    ) -> Bool {
-        guard entry.modificationDate >= request.modificationDate else { return false }
-        guard entry.contentFingerprint == contentFingerprint else { return false }
+    ) -> CacheEntryUsability {
+        guard entry.modificationDate >= request.modificationDate else { return .unusable(.modificationDate) }
+        guard entry.contentFingerprint == contentFingerprint else { return .unusable(.fingerprint) }
 
         let standardizedRoot = StandardizedPath.absolute(rootKey)
         let standardizedFullPath = StandardizedPath.absolute(request.fullPath)
-        guard StandardizedPath.isDescendant(standardizedFullPath, of: standardizedRoot) else { return false }
+        guard StandardizedPath.isDescendant(standardizedFullPath, of: standardizedRoot) else { return .unusable(.containment) }
 
         let standardizedRelativePath = StandardizedPath.relative(request.relativePath)
         let expectedFullPath = StandardizedPath.join(
             standardizedRoot: standardizedRoot,
             standardizedRelativePath: standardizedRelativePath
         )
-        guard standardizedFullPath == expectedFullPath else { return false }
+        guard standardizedFullPath == expectedFullPath else { return .unusable(.relativePathOwnership) }
 
         let cachedAPIPath = StandardizedPath.absolute(entry.fileAPI.filePath)
-        guard cachedAPIPath == standardizedFullPath else { return false }
+        guard cachedAPIPath == standardizedFullPath else { return .unusable(.cachedAPIPath) }
 
-        return true
+        return .usable
     }
 
     // -------------------------------------------------------
@@ -438,9 +487,21 @@ actor CodeScanActor {
         #if DEBUG
             let rootCacheDiskLoadStart = CFAbsoluteTimeGetCurrent()
         #endif
-        let loadTask = Task<CodeMapCacheRootFolder?, Never> { [cacheManager] in
-            await cacheManager.loadRootFolderCacheAsync(rootFolderPath: rootKey)
-        }
+        #if DEBUG || CODEMAP_PERF
+            let telemetryOperation = rootCacheLoadTelemetryOperations[rootKey]
+            let loadTask = Task<CodeMapCacheRootFolder?, Never> { [cacheManager, telemetryOperation] in
+                guard let telemetryOperation else {
+                    return await cacheManager.loadRootFolderCacheAsync(rootFolderPath: rootKey)
+                }
+                let result = await cacheManager.loadRootFolderCacheWithDiagnosticsAsync(rootFolderPath: rootKey)
+                telemetryOperation.recordRootCacheLoad(result)
+                return result.rootFolder
+            }
+        #else
+            let loadTask = Task<CodeMapCacheRootFolder?, Never> { [cacheManager] in
+                await cacheManager.loadRootFolderCacheAsync(rootFolderPath: rootKey)
+            }
+        #endif
         rootCacheLoadTasks[rootKey] = RootCacheLoadTask(id: loadID, task: loadTask)
 
         let loaded = await loadTask.value
@@ -462,6 +523,23 @@ actor CodeScanActor {
         return rootCaches[rootKey]
     }
 
+    #if DEBUG || CODEMAP_PERF
+        private func ensureRootCacheLoaded(
+            forRootKey rootKey: String,
+            telemetryOperation: LegacyCodeMapTelemetryOperation?
+        ) async -> CodeMapCacheRootFolder? {
+            if rootCacheLoadTelemetryOperations[rootKey] == nil {
+                rootCacheLoadTelemetryOperations[rootKey] = telemetryOperation
+            }
+            defer {
+                if rootCacheLoadTasks[rootKey] == nil {
+                    rootCacheLoadTelemetryOperations.removeValue(forKey: rootKey)
+                }
+            }
+            return await ensureRootCacheLoaded(forRootKey: rootKey)
+        }
+    #endif
+
     private func installLoadedRootCache(_ loaded: CodeMapCacheRootFolder, forRootKey rootKey: String) -> CodeMapCacheRootFolder {
         if let current = rootCaches[rootKey] {
             var merged = loaded
@@ -476,12 +554,31 @@ actor CodeScanActor {
         return loaded
     }
 
-    private func prefetchRootCachesIfNeeded(forRootKeys rootKeys: Set<String>) async {
-        guard !rootKeys.isEmpty else { return }
+    private func prefetchRootCachesIfNeeded(
+        forRootKeys rootKeys: Set<String>,
+        requests: [ScanRequest]
+    ) async -> [String: CacheHitProvenance] {
+        guard !rootKeys.isEmpty else { return [:] }
+        var provenanceByRoot: [String: CacheHitProvenance] = [:]
         for rootKey in rootKeys.sorted() {
-            guard rootCaches[rootKey] == nil, rebuildLookupByRoot[rootKey] == nil else { continue }
-            _ = await ensureRootCacheLoaded(forRootKey: rootKey)
+            if rootCaches[rootKey] != nil || rebuildLookupByRoot[rootKey] != nil {
+                provenanceByRoot[rootKey] = .memory
+                continue
+            }
+            #if DEBUG || CODEMAP_PERF
+                let operation = requests.first {
+                    canonicalRoot($0.rootFolderPath) == rootKey
+                }?.legacyTelemetryOperation
+                let loaded = await ensureRootCacheLoaded(
+                    forRootKey: rootKey,
+                    telemetryOperation: operation
+                )
+            #else
+                let loaded = await ensureRootCacheLoaded(forRootKey: rootKey)
+            #endif
+            if loaded != nil { provenanceByRoot[rootKey] = .disk }
         }
+        return provenanceByRoot
     }
 
     private func rootHasQueuedOrActiveWork(forRootKey rootKey: String) -> Bool {
@@ -501,6 +598,7 @@ actor CodeScanActor {
             guard !dirtyRootFoldersForDisk.contains(rootKey),
                   rebuildLookupByRoot[rootKey] == nil,
                   rootCacheLoadTasks[rootKey] == nil,
+                  !isRootCachePinnedForTesting(rootKey),
                   !rootHasQueuedOrActiveWork(forRootKey: rootKey)
             else {
                 continue
@@ -512,6 +610,9 @@ actor CodeScanActor {
 
     private func cancelRootCacheLoad(forRootKey rootKey: String) {
         rootCacheLoadTasks.removeValue(forKey: rootKey)?.task.cancel()
+        #if DEBUG || CODEMAP_PERF
+            rootCacheLoadTelemetryOperations.removeValue(forKey: rootKey)
+        #endif
     }
 
     private func cancelRootCacheLoads(forRootKeys rootKeys: some Sequence<String>) {
@@ -525,6 +626,17 @@ actor CodeScanActor {
             load.task.cancel()
         }
         rootCacheLoadTasks.removeAll()
+        #if DEBUG || CODEMAP_PERF
+            rootCacheLoadTelemetryOperations.removeAll()
+        #endif
+    }
+
+    private func isRootCachePinnedForTesting(_ rootKey: String) -> Bool {
+        #if DEBUG
+            return rootCachePinsByID.values.contains(rootKey)
+        #else
+            return false
+        #endif
     }
 
     private func rootGeneration(forRootKey rootKey: String) -> UInt64 {
@@ -546,6 +658,9 @@ actor CodeScanActor {
         guard latestFileModDates[request.fileID] == request.modificationDate else { return }
         let rootKey = canonicalRoot(request.rootFolderPath)
         latestFileModDates.removeValue(forKey: request.fileID)
+        #if DEBUG || CODEMAP_PERF
+            diagnosticLookupFingerprintsByFileID.removeValue(forKey: request.fileID)
+        #endif
         if rootKeyByFileID[request.fileID] == rootKey {
             rootKeyByFileID.removeValue(forKey: request.fileID)
             fileIDsByRoot[rootKey]?.remove(request.fileID)
@@ -619,6 +734,12 @@ actor CodeScanActor {
         rootCaches.removeValue(forKey: rootKey)
         dirtyRootFoldersForDisk.remove(rootKey)
         rebuildLookupByRoot.removeValue(forKey: rootKey)
+        #if DEBUG || CODEMAP_PERF
+            rootCacheSaveTelemetryOperations.removeValue(forKey: rootKey)
+        #endif
+        #if DEBUG
+            rootCachePinsByID = rootCachePinsByID.filter { $0.value != rootKey }
+        #endif
         removeTrackedFiles(forRootKeys: [rootKey])
 
         // Adjust outstandingScans
@@ -661,7 +782,13 @@ actor CodeScanActor {
             rootCaches.removeValue(forKey: rootKey)
             dirtyRootFoldersForDisk.remove(rootKey)
             rebuildLookupByRoot.removeValue(forKey: rootKey)
+            #if DEBUG || CODEMAP_PERF
+                rootCacheSaveTelemetryOperations.removeValue(forKey: rootKey)
+            #endif
         }
+        #if DEBUG
+            rootCachePinsByID = rootCachePinsByID.filter { !rootKeys.contains($0.value) }
+        #endif
         removeTrackedFiles(forRootKeys: rootKeys)
 
         let totalRemoved = tasksToCancel.count + queuedToRemove
@@ -679,7 +806,8 @@ actor CodeScanActor {
     private func checkCacheAndHandleResult(
         for request: ScanRequest,
         expectedRootGeneration: UInt64? = nil,
-        initialRootLookupFiles: [String: CodeMapCacheFileEntry]? = nil,
+        initialRootLookup: InitialRootLookup? = nil,
+        prefetchedHitProvenance: CacheHitProvenance? = nil,
         removeStaleCacheEntryOnMiss: Bool = false
     ) async -> CacheCheckResult {
         let cacheCheckStart = CodeMapPerfRuntime.sharedPipelineStats.map { _ in CodeMapPerfRuntime.currentTime() }
@@ -700,22 +828,50 @@ actor CodeScanActor {
         guard rootGenerationMatches(rootKey: rootKey, expected: expectedRootGeneration) else {
             return .staleRoot
         }
-        let rootCache: CodeMapCacheRootFolder? = if initialRootLookupFiles != nil {
+        let rootWasResidentBeforeCachePhase = rootCaches[rootKey] != nil
+        let rootCache: CodeMapCacheRootFolder? = if initialRootLookup != nil {
             rootCaches[rootKey]
         } else {
-            await ensureRootCacheLoaded(forRootKey: rootKey)
+            #if DEBUG || CODEMAP_PERF
+                await ensureRootCacheLoaded(
+                    forRootKey: rootKey,
+                    telemetryOperation: request.legacyTelemetryOperation
+                )
+            #else
+                await ensureRootCacheLoaded(forRootKey: rootKey)
+            #endif
         }
         guard rootGenerationMatches(rootKey: rootKey, expected: expectedRootGeneration) else {
             return .staleRoot
         }
 
         // 2) If we have a fresh, content-identical, path-owned entry for this file, use it.
-        let lookupFiles = initialRootLookupFiles ?? rootCaches[rootKey]?.files ?? rootCache?.files
+        let lookupFiles = initialRootLookup?.files ?? rootCaches[rootKey]?.files ?? rootCache?.files
         let contentFingerprint = CodeMapContentFingerprint(content: request.content)
+        #if DEBUG || CODEMAP_PERF
+            if let operation = request.legacyTelemetryOperation {
+                operation.recordHash(kind: .lookup, fingerprint: contentFingerprint)
+                diagnosticLookupFingerprintsByFileID[request.fileID] = contentFingerprint
+            }
+        #endif
         if let entry = lookupFiles?[request.relativePath] {
-            if isUsableCacheEntry(entry, for: request, rootKey: rootKey, contentFingerprint: contentFingerprint) {
+            switch isUsableCacheEntry(entry, for: request, rootKey: rootKey, contentFingerprint: contentFingerprint) {
+            case .usable:
                 let cachedAPI = entry.fileAPI
                 acceptedAPIFileIDs.insert(request.fileID)
+
+                #if DEBUG || CODEMAP_PERF
+                    let hitProvenance = initialRootLookup?.hitProvenance
+                        ?? prefetchedHitProvenance
+                        ?? (rootWasResidentBeforeCachePhase ? .memory : .disk)
+                    switch hitProvenance {
+                    case .memory:
+                        request.legacyTelemetryOperation?.recordCacheResult(.memoryHit)
+                    case .disk:
+                        request.legacyTelemetryOperation?.recordCacheResult(.diskHit)
+                    }
+                    diagnosticLookupFingerprintsByFileID.removeValue(forKey: request.fileID)
+                #endif
 
                 resultBatchBuffer.append(ScanResult(request: request, fileAPI: cachedAPI))
                 maybeFlushResultsIfNeeded()
@@ -724,17 +880,42 @@ actor CodeScanActor {
                 CodeMapPerfRuntime.sharedPipelineStats?.increment(\.cacheHits)
                 pushProgressUpdate()
                 return .hit
-            }
+            case let .unusable(reason):
+                #if DEBUG || CODEMAP_PERF
+                    request.legacyTelemetryOperation?.recordCacheResult(
+                        .unusableMiss,
+                        unusableReason: legacyTelemetryReason(reason)
+                    )
+                #endif
 
-            if removeStaleCacheEntryOnMiss {
-                removeCacheEntry(relativePath: request.relativePath, rootKey: rootKey)
+                if removeStaleCacheEntryOnMiss {
+                    removeCacheEntry(relativePath: request.relativePath, rootKey: rootKey)
+                }
             }
+        } else {
+            #if DEBUG || CODEMAP_PERF
+                request.legacyTelemetryOperation?.recordCacheResult(.absentMiss)
+            #endif
         }
 
         // Cache miss or stale
         CodeMapPerfRuntime.sharedPipelineStats?.increment(\.cacheMisses)
         return .miss
     }
+
+    #if DEBUG || CODEMAP_PERF
+        private func legacyTelemetryReason(
+            _ reason: CacheEntryUnusableReason
+        ) -> LegacyCodeMapCacheUnusableReason {
+            switch reason {
+            case .modificationDate: .modificationDate
+            case .fingerprint: .fingerprint
+            case .containment: .containment
+            case .relativePathOwnership: .relativePathOwnership
+            case .cachedAPIPath: .cachedAPIPath
+            }
+        }
+    #endif
 
     private func removeCacheEntry(relativePath: String, rootKey: String) {
         guard var rootEntry = rootCaches[rootKey],
@@ -771,6 +952,9 @@ actor CodeScanActor {
             activeScans = max(activeScans - 1, 0)
             outstandingScans = max(outstandingScans - 1, 0)
             canceledActive += 1
+            #if DEBUG || CODEMAP_PERF
+                diagnosticLookupFingerprintsByFileID.removeValue(forKey: task.request.fileID)
+            #endif
         }
         if canceledActive > 0 {
             scheduleNextScan()
@@ -862,12 +1046,15 @@ actor CodeScanActor {
         let expectedRootGenerations = rootGenerations(forRootKeys: rootsForRebuild)
         let initialRootRelativePathsByRoot = initialRootRelativePathSets(for: requests)
 
-        let initialRootLookupByRoot: [String: [String: CodeMapCacheFileEntry]]
+        let initialRootLookupByRoot: [String: InitialRootLookup]
         if purpose == .initialRootLoad {
             #if DEBUG
                 let cacheRebuildStartMS = CodeMapInitialRootLoadDiagnostics.start()
             #endif
-            initialRootLookupByRoot = await prepareCacheRebuild(forRoots: rootsForRebuild)
+            initialRootLookupByRoot = await prepareCacheRebuild(
+                forRoots: rootsForRebuild,
+                requests: requests
+            )
             #if DEBUG
                 CodeMapInitialRootLoadDiagnostics.cacheRebuild(
                     rootCount: rootsForRebuild.count,
@@ -949,8 +1136,13 @@ actor CodeScanActor {
         CodeMapPerfRuntime.sharedPipelineStats?.increment(\.requestsEnqueued, by: requestsToQueue.count)
         pushProgressUpdate()
 
-        if purpose != .initialRootLoad {
-            await prefetchRootCachesIfNeeded(forRootKeys: rootsForRebuild)
+        let prefetchedHitProvenanceByRoot: [String: CacheHitProvenance] = if purpose != .initialRootLoad {
+            await prefetchRootCachesIfNeeded(
+                forRootKeys: rootsForRebuild,
+                requests: requestsToQueue
+            )
+        } else {
+            [:]
         }
 
         var finalQueue = [ScanRequest]()
@@ -972,7 +1164,8 @@ actor CodeScanActor {
             switch await checkCacheAndHandleResult(
                 for: request,
                 expectedRootGeneration: expectedGeneration,
-                initialRootLookupFiles: initialRootLookupByRoot[rootKey],
+                initialRootLookup: initialRootLookupByRoot[rootKey],
+                prefetchedHitProvenance: prefetchedHitProvenanceByRoot[rootKey],
                 removeStaleCacheEntryOnMiss: purpose == .initialRootLoad
             ) {
             case .hit:
@@ -1132,11 +1325,18 @@ actor CodeScanActor {
 
             let uniqueTaskID = UUID()
             let treeSitterParseLimiter = treeSitterParseLimiter
+            #if DEBUG || CODEMAP_PERF
+                let diagnosticLookupFingerprint = request.legacyTelemetryOperation.flatMap {
+                    _ in diagnosticLookupFingerprintsByFileID[request.fileID]
+                }
+            #else
+                let diagnosticLookupFingerprint: CodeMapContentFingerprint? = nil
+            #endif
             #if DEBUG
                 let scanWillStartHandlerForTesting = scanWillStartHandlerForTesting
                 let coldStartCollector = WorkspaceFileSearchDebugContext.coldStartCollector
             #endif
-            let scanTask = Task<Void, Never> { [request, treeSitterParseLimiter] in
+            let scanTask = Task<Void, Never> { [request, treeSitterParseLimiter, diagnosticLookupFingerprint] in
                 var fileAPI: FileAPI?
                 #if DEBUG
                     let scanStart = WorkspaceFileSearchDebugTiming.now()
@@ -1150,10 +1350,28 @@ actor CodeScanActor {
                     let parseStart = CodeMapPerfRuntime.sharedPipelineStats.map { _ in CodeMapPerfRuntime.currentTime() }
                     let namedRanges = try await treeSitterParseLimiter.withPermit {
                         try Task.checkCancellation()
-                        return try? SyntaxManager.shared.codeMap(
+                        #if DEBUG || CODEMAP_PERF
+                            let legacyOperation = request.legacyTelemetryOperation
+                            legacyOperation?.recordParseAttempt(fingerprint: diagnosticLookupFingerprint)
+                            let legacyParseStart = legacyOperation.map { _ in
+                                LegacyCodeMapTelemetryTiming.start()
+                            }
+                        #endif
+                        let ranges = try? SyntaxManager.shared.codeMap(
                             content: request.content,
                             fileExtension: request.fileExtension
                         )
+                        #if DEBUG || CODEMAP_PERF
+                            if let legacyParseStart {
+                                legacyOperation?.recordParseTiming(
+                                    LegacyCodeMapTelemetryTiming.elapsed(since: legacyParseStart)
+                                )
+                                legacyOperation?.recordParseTerminal(
+                                    ranges == nil ? .nilResult : .completed
+                                )
+                            }
+                        #endif
+                        return ranges
                     }
                     if let parseStart {
                         CodeMapPerfRuntime.sharedPipelineStats?.addDuration(\.parseAndQueryDuration, CodeMapPerfRuntime.durationSince(parseStart))
@@ -1164,6 +1382,12 @@ actor CodeScanActor {
                     try Task.checkCancellation()
                     let generatorStart = CodeMapPerfRuntime.sharedPipelineStats.map { _ in CodeMapPerfRuntime.currentTime() }
                     let generatorStats = CodeMapPerfRuntime.makeGeneratorStats()
+                    #if DEBUG || CODEMAP_PERF
+                        let legacyOperation = request.legacyTelemetryOperation
+                        let legacyGeneratorStart = legacyOperation.map { _ in
+                            LegacyCodeMapTelemetryTiming.start()
+                        }
+                    #endif
                     fileAPI = CodeMapGenerator.generateCodeMap(
                         from: namedRanges ?? [],
                         content: request.content,
@@ -1171,6 +1395,13 @@ actor CodeScanActor {
                         perfOptions: CodeMapPerfRuntime.makeGeneratorOptions(),
                         perfStats: generatorStats
                     )
+                    #if DEBUG || CODEMAP_PERF
+                        if let legacyGeneratorStart {
+                            legacyOperation?.recordGeneratorTiming(
+                                LegacyCodeMapTelemetryTiming.elapsed(since: legacyGeneratorStart)
+                            )
+                        }
+                    #endif
                     if let generatorStats {
                         CodeMapPerfRuntime.sharedPipelineStats?.mergeGeneratorStats(generatorStats)
                     }
@@ -1223,6 +1454,9 @@ actor CodeScanActor {
         }
         outstandingScans = max(outstandingScans - 1, 0)
         resultBatchBuffer.append(ScanResult(request: request, fileAPI: nil))
+        #if DEBUG || CODEMAP_PERF
+            diagnosticLookupFingerprintsByFileID.removeValue(forKey: request.fileID)
+        #endif
         maybeFlushResultsIfNeeded()
         pushProgressUpdate()
     }
@@ -1244,9 +1478,19 @@ actor CodeScanActor {
             // Update the in-memory root cache
             let rootKey = canonicalRoot(request.rootFolderPath)
             var rootEntry = rootCaches[rootKey] ?? CodeMapCacheRootFolder(files: [:])
+            let persistenceFingerprint = CodeMapContentFingerprint(content: request.content)
+            #if DEBUG || CODEMAP_PERF
+                request.legacyTelemetryOperation?.recordHash(
+                    kind: .persistence,
+                    fingerprint: persistenceFingerprint
+                )
+                if rootCacheSaveTelemetryOperations[rootKey] == nil {
+                    rootCacheSaveTelemetryOperations[rootKey] = request.legacyTelemetryOperation
+                }
+            #endif
             rootEntry.files[request.relativePath] = CodeMapCacheFileEntry(
                 modificationDate: request.modificationDate,
-                contentFingerprint: CodeMapContentFingerprint(content: request.content),
+                contentFingerprint: persistenceFingerprint,
                 fileAPI: fileAPI
             )
             rootCaches[rootKey] = rootEntry
@@ -1254,6 +1498,10 @@ actor CodeScanActor {
             // Mark this root as needing a disk flush
             dirtyRootFoldersForDisk.insert(rootKey)
         }
+
+        #if DEBUG || CODEMAP_PERF
+            diagnosticLookupFingerprintsByFileID.removeValue(forKey: request.fileID)
+        #endif
 
         outstandingScans = max(outstandingScans - 1, 0)
 
@@ -1282,9 +1530,18 @@ actor CodeScanActor {
         totalScheduled = 0
         cacheProcessingCount = 0
         rebuildLookupByRoot.removeAll()
+        #if DEBUG || CODEMAP_PERF
+            diagnosticLookupFingerprintsByFileID.removeAll()
+        #endif
+        #if DEBUG
+            rootCachePinsByID.removeAll()
+        #endif
 
         // Flush dirty caches to disk so we don't lose recent work
         performCacheCleanup()
+        #if DEBUG || CODEMAP_PERF
+            rootCacheSaveTelemetryOperations.removeAll()
+        #endif
         pushProgressUpdate()
     }
 
@@ -1306,6 +1563,13 @@ actor CodeScanActor {
         rootCaches.removeAll()
         dirtyRootFoldersForDisk.removeAll()
         rebuildLookupByRoot.removeAll()
+        #if DEBUG || CODEMAP_PERF
+            diagnosticLookupFingerprintsByFileID.removeAll()
+            rootCacheSaveTelemetryOperations.removeAll()
+        #endif
+        #if DEBUG
+            rootCachePinsByID.removeAll()
+        #endif
     }
 
     /// Removes on-disk caches for roots that no longer exist in any workspace.
@@ -1323,7 +1587,13 @@ actor CodeScanActor {
             rootCaches.removeValue(forKey: rootKey)
             dirtyRootFoldersForDisk.remove(rootKey)
             rebuildLookupByRoot.removeValue(forKey: rootKey)
+            #if DEBUG || CODEMAP_PERF
+                rootCacheSaveTelemetryOperations.removeValue(forKey: rootKey)
+            #endif
         }
+        #if DEBUG
+            rootCachePinsByID = rootCachePinsByID.filter { keepRoots.contains($0.value) }
+        #endif
 
         cacheManager.purgeStaleRootCaches(keepingRootPaths: Array(keepRoots))
     }
@@ -1436,13 +1706,31 @@ actor CodeScanActor {
             for rootPath in Array(dirtyRootFoldersForDisk) {
                 guard let rootEntry = rootCaches[rootPath] else { continue }
                 let saveStart = Date()
-                if cacheManager.saveRootFolderCache(rootPath, rootEntry: rootEntry) {
+                #if DEBUG || CODEMAP_PERF
+                    let saveSucceeded: Bool
+                    if let operation = rootCacheSaveTelemetryOperations[rootPath] {
+                        let saveResult = cacheManager.saveRootFolderCacheWithDiagnostics(
+                            rootPath,
+                            rootEntry: rootEntry
+                        )
+                        operation.recordRootCacheSave(saveResult)
+                        saveSucceeded = saveResult.success
+                    } else {
+                        saveSucceeded = cacheManager.saveRootFolderCache(rootPath, rootEntry: rootEntry)
+                    }
+                #else
+                    let saveSucceeded = cacheManager.saveRootFolderCache(rootPath, rootEntry: rootEntry)
+                #endif
+                if saveSucceeded {
                     #if DEBUG
                         rootCacheDiskSaveCount += 1
                         rootCacheDiskSaveDuration += Date().timeIntervalSince(saveStart)
                         rootCacheDiskSaveFileEntryCount += rootEntry.files.count
                     #endif
                     dirtyRootFoldersForDisk.remove(rootPath)
+                    #if DEBUG || CODEMAP_PERF
+                        rootCacheSaveTelemetryOperations.removeValue(forKey: rootPath)
+                    #endif
                 }
             }
         }
@@ -1456,14 +1744,31 @@ actor CodeScanActor {
     // MARK: 12) Cache rebuild helpers
 
     /// -------------------------------------------------------
-    private func prepareCacheRebuild(forRoots roots: Set<String>) async -> [String: [String: CodeMapCacheFileEntry]] {
+    private func prepareCacheRebuild(
+        forRoots roots: Set<String>,
+        requests: [ScanRequest]
+    ) async -> [String: InitialRootLookup] {
         guard !roots.isEmpty else { return [:] }
 
-        var lookupByRoot: [String: [String: CodeMapCacheFileEntry]] = [:]
+        var lookupByRoot: [String: InitialRootLookup] = [:]
         lookupByRoot.reserveCapacity(roots.count)
         for rootKey in roots {
-            let existing = await ensureRootCacheLoaded(forRootKey: rootKey)
-            lookupByRoot[rootKey] = existing?.files ?? [:]
+            let wasResident = rootCaches[rootKey] != nil
+            #if DEBUG || CODEMAP_PERF
+                let operation = requests.first {
+                    canonicalRoot($0.rootFolderPath) == rootKey
+                }?.legacyTelemetryOperation
+                let existing = await ensureRootCacheLoaded(
+                    forRootKey: rootKey,
+                    telemetryOperation: operation
+                )
+            #else
+                let existing = await ensureRootCacheLoaded(forRootKey: rootKey)
+            #endif
+            lookupByRoot[rootKey] = InitialRootLookup(
+                files: existing?.files ?? [:],
+                hitProvenance: wasResident ? .memory : .disk
+            )
         }
         return lookupByRoot
     }
@@ -1528,6 +1833,9 @@ actor CodeScanActor {
                 acceptedAPIFileIDs.remove(fileID)
                 latestFileModDates.removeValue(forKey: fileID)
                 resultDeliveryPendingFileIDs.remove(fileID)
+                #if DEBUG || CODEMAP_PERF
+                    diagnosticLookupFingerprintsByFileID.removeValue(forKey: fileID)
+                #endif
             }
         }
     }
@@ -1537,6 +1845,29 @@ actor CodeScanActor {
     }
 
     #if DEBUG
+        func pinRootCacheForTesting(rootFolderPath: String) async -> RootCachePinToken {
+            let rootKey = canonicalRoot(rootFolderPath)
+            let token = RootCachePinToken(id: UUID(), rootKey: rootKey)
+            rootCachePinsByID[token.id] = rootKey
+            #if DEBUG || CODEMAP_PERF
+                let operation = LegacyCodeMapTelemetryContext.currentOperation
+                    ?? LegacyCodeMapTelemetryContext.current?.operation()
+                _ = await ensureRootCacheLoaded(
+                    forRootKey: rootKey,
+                    telemetryOperation: operation
+                )
+            #else
+                _ = await ensureRootCacheLoaded(forRootKey: rootKey)
+            #endif
+            return token
+        }
+
+        func releaseRootCachePinForTesting(_ token: RootCachePinToken) {
+            guard rootCachePinsByID[token.id] == token.rootKey else { return }
+            rootCachePinsByID.removeValue(forKey: token.id)
+            evictCleanIdleRootCachesIfNeeded()
+        }
+
         func codemapMemoryCounters() -> CodemapMemoryCounters {
             let trackedFileIDCount = fileIDsByRoot.values.reduce(0) { $0 + $1.count }
             let rootCacheFileEntryCount = rootCaches.values.reduce(0) { $0 + $1.files.count }
@@ -1567,6 +1898,8 @@ actor CodeScanActor {
                 cacheProcessingCount: cacheProcessingCount,
                 resultBatchBufferCount: resultBatchBuffer.count,
                 resultBatchBufferFileAPICount: resultBatchBufferFileAPICount,
+                resultDeliveryPendingCount: resultDeliveryPendingFileIDs.count,
+                rootCachePinCount: rootCachePinsByID.count,
                 actorRetainedFileAPILikeEntryCount: actorRetainedFileAPILikeEntryCount
             )
         }

@@ -30,6 +30,23 @@ private func detectEncodingFull(_ data: Data) -> String.Encoding {
     return guess != 0 ? .init(rawValue: guess) : .utf8
 }
 
+/// The workspace's versioned automatic source decoder policy. Both legacy
+/// content loading and content-addressed source envelopes use this exact pure
+/// transformation so they cannot drift on byte-to-text interpretation.
+func decodeWorkspaceAutomaticV1(_ data: Data) -> DetectedText? {
+    if data.isEmpty {
+        return DetectedText(string: "", encoding: .utf8)
+    }
+    if let utf8String = String(data: data, encoding: .utf8) {
+        return DetectedText(string: utf8String, encoding: .utf8)
+    }
+    let encoding = detectEncodingFull(data)
+    guard let string = String(data: data, encoding: encoding) else {
+        return nil
+    }
+    return DetectedText(string: string, encoding: encoding)
+}
+
 private enum ContentReadMode {
     case automatic
     case streamed
@@ -47,6 +64,9 @@ private struct ContentReadRequest {
     let mode: ContentReadMode
     let workloadClass: ContentReadWorkloadClass
     let schedulerOwnerID: UUID
+    #if DEBUG || CODEMAP_PERF
+        let legacyCodeMapTelemetryOperation: LegacyCodeMapTelemetryOperation?
+    #endif
     #if DEBUG
         let chunkReadHandler: (@Sendable (String) async -> Void)?
     #endif
@@ -69,6 +89,12 @@ private struct ContentReadResult {
     var detectedEncoding: String.Encoding? {
         detectedEncodingRawValue.map(String.Encoding.init(rawValue:))
     }
+}
+
+private struct RawContentReadResult {
+    let data: Data
+    let modificationDate: Date
+    let fingerprint: FileContentFingerprint
 }
 
 struct FileContentPrefix {
@@ -233,6 +259,21 @@ actor ContentReadAsyncLimiter {
         } catch {
             endForegroundActivity(token)
             throw error
+        }
+    }
+
+    func withCodeMapArtifactBuildPermit<T: Sendable>(
+        ownerID: UUID,
+        priority: TaskPriority,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withPermit(workloadClass: .codemap, ownerID: ownerID) {
+            let task = Task.detached(priority: priority, operation: operation)
+            return try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
         }
     }
 
@@ -712,6 +753,18 @@ extension FileSystemService {
         try await contentReadWorkerLimiter.withForegroundActivity(kind: kind, body)
     }
 
+    nonisolated static func withCodeMapArtifactBuildPermit<T: Sendable>(
+        ownerID: UUID,
+        priority: TaskPriority,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await contentReadWorkerLimiter.withCodeMapArtifactBuildPermit(
+            ownerID: ownerID,
+            priority: priority,
+            operation: operation
+        )
+    }
+
     #if DEBUG
         nonisolated static var contentReadWorkerLimitForTesting: Int {
             contentReadWorkerLimit
@@ -770,6 +823,36 @@ extension FileSystemService {
             detectedEncodingRawValue: result.detectedEncodingRawValue,
             modificationDate: result.modificationDate ?? acceptedFingerprint.modificationDate,
             fingerprint: acceptedFingerprint
+        )
+    }
+
+    func loadValidatedRawContent(
+        ofRelativePath relativePath: String,
+        expectedFingerprint: FileContentFingerprint? = nil,
+        maximumBytes: Int64 = 10_000_000,
+        workloadClass: ContentReadWorkloadClass = .codemap,
+        schedulerOwnerID: UUID? = nil
+    ) async throws -> ValidatedRawFileContentSnapshot {
+        guard maximumBytes >= 0 else {
+            throw FileSystemError.fileTooLarge
+        }
+        let request = try makeContentReadRequest(
+            cacheKey: relativePath,
+            chunkSize: 1_048_576,
+            fileSizeLimit: maximumBytes,
+            mode: .automatic,
+            workloadClass: workloadClass,
+            schedulerOwnerID: schedulerOwnerID
+        )
+        let result = try await Self.performRawContentReadOffActor(
+            request,
+            expectedFingerprint: expectedFingerprint
+        )
+        try Task.checkCancellation()
+        return ValidatedRawFileContentSnapshot(
+            data: result.data,
+            modificationDate: result.modificationDate,
+            fingerprint: result.fingerprint
         )
     }
 
@@ -1069,22 +1152,40 @@ extension FileSystemService {
                 mode: mode,
                 workloadClass: workloadClass,
                 schedulerOwnerID: schedulerOwnerID ?? diagnosticRootToken,
+                legacyCodeMapTelemetryOperation: LegacyCodeMapTelemetryContext.currentOperation,
                 chunkReadHandler: contentReadChunkHandler
             )
         #else
-            return ContentReadRequest(
-                cacheKey: cacheKey,
-                relativePath: relativePath,
-                absolutePath: absolutePath,
-                standardizedRootPath: standardizedRootPath,
-                canonicalRootPath: canonicalRootPath,
-                skipSymlinks: skipSymlinks,
-                chunkSize: chunkSize,
-                fileSizeLimit: fileSizeLimit,
-                mode: mode,
-                workloadClass: workloadClass,
-                schedulerOwnerID: schedulerOwnerID ?? diagnosticRootToken
-            )
+            #if CODEMAP_PERF
+                return ContentReadRequest(
+                    cacheKey: cacheKey,
+                    relativePath: relativePath,
+                    absolutePath: absolutePath,
+                    standardizedRootPath: standardizedRootPath,
+                    canonicalRootPath: canonicalRootPath,
+                    skipSymlinks: skipSymlinks,
+                    chunkSize: chunkSize,
+                    fileSizeLimit: fileSizeLimit,
+                    mode: mode,
+                    workloadClass: workloadClass,
+                    schedulerOwnerID: schedulerOwnerID ?? diagnosticRootToken,
+                    legacyCodeMapTelemetryOperation: LegacyCodeMapTelemetryContext.currentOperation
+                )
+            #else
+                return ContentReadRequest(
+                    cacheKey: cacheKey,
+                    relativePath: relativePath,
+                    absolutePath: absolutePath,
+                    standardizedRootPath: standardizedRootPath,
+                    canonicalRootPath: canonicalRootPath,
+                    skipSymlinks: skipSymlinks,
+                    chunkSize: chunkSize,
+                    fileSizeLimit: fileSizeLimit,
+                    mode: mode,
+                    workloadClass: workloadClass,
+                    schedulerOwnerID: schedulerOwnerID ?? diagnosticRootToken
+                )
+            #endif
         #endif
     }
 
@@ -1204,6 +1305,31 @@ extension FileSystemService {
         }
     }
 
+    private nonisolated static func performRawContentReadOffActor(
+        _ request: ContentReadRequest,
+        expectedFingerprint: FileContentFingerprint?
+    ) async throws -> RawContentReadResult {
+        let workerPriority = Task.currentPriority
+        return try await contentReadWorkerLimiter.withPermit(
+            workloadClass: request.workloadClass,
+            ownerID: request.schedulerOwnerID
+        ) {
+            try await withThrowingTaskGroup(of: RawContentReadResult.self) { group in
+                group.addTask(priority: workerPriority) {
+                    try await readRawContentFromDisk(
+                        request,
+                        expectedFingerprint: expectedFingerprint
+                    )
+                }
+                guard let result = try await group.next() else {
+                    throw CancellationError()
+                }
+                group.cancelAll()
+                return result
+            }
+        }
+    }
+
     private nonisolated static func readContentPrefixFromDisk(
         _ request: ContentReadRequest,
         maximumBytes: Int
@@ -1232,6 +1358,9 @@ extension FileSystemService {
 
         try await runContentReadChunkHook(request)
         let data = try handle.read(upToCount: requestedByteCount + 1) ?? Data()
+        #if DEBUG || CODEMAP_PERF
+            request.legacyCodeMapTelemetryOperation?.recordSourceRead(bytes: data.count)
+        #endif
         try Task.checkCancellation()
         guard !data.isEmpty else {
             return FileContentPrefix(content: "", truncated: false)
@@ -1259,6 +1388,12 @@ extension FileSystemService {
         expectedFingerprint: FileContentFingerprint? = nil,
         requirePostReadValidation: Bool = false
     ) async throws -> ContentReadResult {
+        #if DEBUG || CODEMAP_PERF
+            let legacyTelemetryOperation = request.legacyCodeMapTelemetryOperation
+            legacyTelemetryOperation?.recordSourceRequest()
+            var legacyTerminalOutcome = LegacyCodeMapSourceTerminalOutcome.failed
+            defer { legacyTelemetryOperation?.recordSourceTerminal(legacyTerminalOutcome) }
+        #endif
         let workerBodyState = EditFlowPerf.begin(
             EditFlowPerf.Stage.FileSystem.contentReadWorkerBody,
             EditFlowPerf.Dimensions(
@@ -1283,6 +1418,9 @@ extension FileSystemService {
 
         do {
             if hasAlwaysBinaryExtension(request.relativePath), !requirePostReadValidation {
+                #if DEBUG || CODEMAP_PERF
+                    legacyTerminalOutcome = .unavailable
+                #endif
                 workerBodyOutcome = ContentReadTelemetryOutcome.unavailable.rawValue
                 return ContentReadResult(
                     absolutePath: request.absolutePath,
@@ -1325,9 +1463,81 @@ extension FileSystemService {
                 }
             }
             workerBodyOutcome = result.telemetryOutcome.rawValue
+            #if DEBUG || CODEMAP_PERF
+                legacyTerminalOutcome = switch result.telemetryOutcome {
+                case .loaded: .loaded
+                case .unavailable, .oversized: .unavailable
+                }
+            #endif
             return result
         } catch {
+            #if DEBUG || CODEMAP_PERF
+                legacyTerminalOutcome = error is CancellationError ? .cancelled : .failed
+            #endif
             workerBodyOutcome = error is CancellationError ? "cancelled" : "failed"
+            throw error
+        }
+    }
+
+    private nonisolated static func readRawContentFromDisk(
+        _ request: ContentReadRequest,
+        expectedFingerprint: FileContentFingerprint?
+    ) async throws -> RawContentReadResult {
+        #if DEBUG || CODEMAP_PERF
+            let legacyTelemetryOperation = request.legacyCodeMapTelemetryOperation
+            legacyTelemetryOperation?.recordSourceRequest()
+            var legacyTerminalOutcome = LegacyCodeMapSourceTerminalOutcome.failed
+            defer { legacyTelemetryOperation?.recordSourceTerminal(legacyTerminalOutcome) }
+        #endif
+
+        do {
+            try Task.checkCancellation()
+            let validated = try validateContentFileForReading(request)
+            if let expectedFingerprint, validated.fingerprint != expectedFingerprint {
+                throw FileContentValidationError.fingerprintChanged
+            }
+
+            let handle = try openValidatedContentHandle(
+                request,
+                validated: validated,
+                requireStableIdentity: true
+            )
+            defer { try? handle.close() }
+            guard try validateContentFileForReading(request).fingerprint == validated.fingerprint else {
+                throw FileContentValidationError.fingerprintChanged
+            }
+
+            guard validated.fileSize <= request.fileSizeLimit else {
+                throw FileSystemError.fileTooLarge
+            }
+            let data: Data = switch try await readBoundedData(request, handle: handle) {
+            case let .data(data):
+                data
+            case .tooLarge:
+                throw FileSystemError.fileTooLarge
+            }
+            try Task.checkCancellation()
+            guard try FileContentFingerprintReader.fingerprint(fileDescriptor: handle.fileDescriptor)
+                == validated.fingerprint
+            else {
+                throw FileContentValidationError.fingerprintChanged
+            }
+            guard try validateContentFileForReading(request).fingerprint == validated.fingerprint else {
+                throw FileContentValidationError.fingerprintChanged
+            }
+
+            #if DEBUG || CODEMAP_PERF
+                legacyTerminalOutcome = .loaded
+            #endif
+            return RawContentReadResult(
+                data: data,
+                modificationDate: validated.modificationDate,
+                fingerprint: validated.fingerprint
+            )
+        } catch {
+            #if DEBUG || CODEMAP_PERF
+                legacyTerminalOutcome = error is CancellationError ? .cancelled : .failed
+            #endif
             throw error
         }
     }
@@ -1352,6 +1562,9 @@ extension FileSystemService {
         if !skipProbe {
             try await runContentReadChunkHook(request)
             let probe = try handle.read(upToCount: 8192) ?? Data()
+            #if DEBUG || CODEMAP_PERF
+                request.legacyCodeMapTelemetryOperation?.recordSourceRead(bytes: probe.count)
+            #endif
             try Task.checkCancellation()
             if isProbablyBinary(probe) {
                 return try validateOpenContentHandle(
@@ -1380,6 +1593,12 @@ extension FileSystemService {
             let decodeStart = DispatchTime.now().uptimeNanoseconds
             let detected = try decodeSmallFileData(data)
             let decodeEnd = DispatchTime.now().uptimeNanoseconds
+            #if DEBUG || CODEMAP_PERF
+                request.legacyCodeMapTelemetryOperation?.recordDecode(
+                    wallNanoseconds: decodeEnd >= decodeStart ? decodeEnd - decodeStart : 0,
+                    decodedUTF8Bytes: detected.string.utf8.count
+                )
+            #endif
             MCPToolWorkCountDiagnostics.recordReadFileDiskRead(
                 bytes: 0,
                 decodeMicroseconds: Int(clamping: decodeEnd >= decodeStart ? (decodeEnd - decodeStart) / 1000 : 0)
@@ -1448,6 +1667,9 @@ extension FileSystemService {
 
         try await runContentReadChunkHook(request)
         let initialData = try handle.read(upToCount: request.chunkSize) ?? Data()
+        #if DEBUG || CODEMAP_PERF
+            request.legacyCodeMapTelemetryOperation?.recordSourceRead(bytes: initialData.count)
+        #endif
         try Task.checkCancellation()
         if !skipProbe, isProbablyBinary(initialData) {
             return try validateOpenContentHandle(
@@ -1471,6 +1693,9 @@ extension FileSystemService {
         while true {
             try await runContentReadChunkHook(request)
             let next = try handle.read(upToCount: request.chunkSize) ?? Data()
+            #if DEBUG || CODEMAP_PERF
+                request.legacyCodeMapTelemetryOperation?.recordSourceRead(bytes: next.count)
+            #endif
             try Task.checkCancellation()
             if next.isEmpty { break }
             let observedByteCount = Int64(fullData.count) + Int64(next.count)
@@ -1501,6 +1726,12 @@ extension FileSystemService {
         let decodeStart = DispatchTime.now().uptimeNanoseconds
         let decodedContent = String(data: fullData, encoding: encoding) ?? "[Binary data or unknown encoding]"
         let decodeEnd = DispatchTime.now().uptimeNanoseconds
+        #if DEBUG || CODEMAP_PERF
+            request.legacyCodeMapTelemetryOperation?.recordDecode(
+                wallNanoseconds: decodeEnd >= decodeStart ? decodeEnd - decodeStart : 0,
+                decodedUTF8Bytes: decodedContent.utf8.count
+            )
+        #endif
         MCPToolWorkCountDiagnostics.recordReadFileDiskRead(
             bytes: 0,
             decodeMicroseconds: Int(clamping: decodeEnd >= decodeStart ? (decodeEnd - decodeStart) / 1000 : 0)
@@ -1562,6 +1793,9 @@ extension FileSystemService {
         while true {
             try await runContentReadChunkHook(request)
             let next = try handle.read(upToCount: request.chunkSize) ?? Data()
+            #if DEBUG || CODEMAP_PERF
+                request.legacyCodeMapTelemetryOperation?.recordSourceRead(bytes: next.count)
+            #endif
             try Task.checkCancellation()
             if next.isEmpty { break }
             let observedByteCount = Int64(data.count) + Int64(next.count)
@@ -1585,6 +1819,9 @@ extension FileSystemService {
                     throw FileContentValidationError.fingerprintChanged
                 }
             }
+            #if DEBUG || CODEMAP_PERF
+                request.legacyCodeMapTelemetryOperation?.recordSourceOpen(nominalBytes: validated.fileSize)
+            #endif
             return handle
         } catch {
             try? handle.close()
@@ -1658,17 +1895,10 @@ extension FileSystemService {
     }
 
     private nonisolated static func decodeSmallFileData(_ data: Data) throws -> DetectedText {
-        if data.isEmpty {
-            return DetectedText(string: "", encoding: .utf8)
-        }
-        if let utf8String = String(data: data, encoding: .utf8) {
-            return DetectedText(string: utf8String, encoding: .utf8)
-        }
-        let encoding = detectEncodingFull(data)
-        guard let string = String(data: data, encoding: encoding) else {
+        guard let detected = decodeWorkspaceAutomaticV1(data) else {
             throw FileSystemError.failedToReadFile
         }
-        return DetectedText(string: string, encoding: encoding)
+        return detected
     }
 
     private nonisolated static func runContentReadChunkHook(_ request: ContentReadRequest) async throws {
@@ -1987,24 +2217,10 @@ extension FileSystemService {
     /// missing NUL-termination in `Data` buffers.
     func readDataAndDetectEncoding(_ fullPath: String) throws -> DetectedText {
         let data = try Data(contentsOf: URL(fileURLWithPath: fullPath))
-
-        // 0 --> return empty string immediately  ✅
-        if data.isEmpty {
-            return DetectedText(string: "", encoding: .utf8)
-        }
-
-        // 1) Fast-path: strict UTF-8 validation over the *whole* buffer
-        //    This is safe because the initializer is length-aware.
-        if let utf8String = String(data: data, encoding: .utf8) {
-            return DetectedText(string: utf8String, encoding: .utf8)
-        }
-
-        // 2) Charset detector (fallback)
-        let enc = detectEncodingFull(data)
-        guard let str = String(data: data, encoding: enc) else {
+        guard let detected = decodeWorkspaceAutomaticV1(data) else {
             throw FileSystemError.failedToReadFile
         }
-        return DetectedText(string: str, encoding: enc)
+        return detected
     }
 
     /// Quick heuristic: UTF‑16 text usually contains many NUL bytes.

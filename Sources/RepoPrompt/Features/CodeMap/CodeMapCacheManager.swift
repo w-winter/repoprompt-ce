@@ -48,6 +48,22 @@ struct CodeMapCacheContainer: Codable {
     let rootFolder: CodeMapCacheRootFolder
 }
 
+#if DEBUG || CODEMAP_PERF
+    struct CodeMapRootCacheLoadDiagnosticResult {
+        let rootFolder: CodeMapCacheRootFolder?
+        let outcome: LegacyCodeMapRootCacheLoadOutcome
+        let encodedByteCount: Int
+        let durationNanoseconds: UInt64
+    }
+
+    struct CodeMapRootCacheSaveDiagnosticResult {
+        let success: Bool
+        let encodedByteCount: Int
+        let entryCount: Int
+        let durationNanoseconds: UInt64
+    }
+#endif
+
 // ============ The Manager ============
 
 class CodeMapCacheManager {
@@ -65,25 +81,87 @@ class CodeMapCacheManager {
     // NEW: async loader that reads & decodes the entire root cache from disk.
     // No reads/writes to any in-memory state inside this class.
     func loadRootFolderCacheAsync(rootFolderPath: String) async -> CodeMapCacheRootFolder? {
+        await loadRootFolderCacheResultAsync(rootFolderPath: rootFolderPath).rootFolder
+    }
+
+    #if DEBUG || CODEMAP_PERF
+        func loadRootFolderCacheWithDiagnosticsAsync(
+            rootFolderPath: String
+        ) async -> CodeMapRootCacheLoadDiagnosticResult {
+            let start = DispatchTime.now().uptimeNanoseconds
+            let result = await loadRootFolderCacheResultAsync(rootFolderPath: rootFolderPath)
+            let end = DispatchTime.now().uptimeNanoseconds
+            let outcome: LegacyCodeMapRootCacheLoadOutcome = switch result.outcome {
+            case .loaded: .loaded
+            case .missing: .missing
+            case .versionMismatch: .versionMismatch
+            case .decodeFailure: .decodeFailure
+            }
+            return CodeMapRootCacheLoadDiagnosticResult(
+                rootFolder: result.rootFolder,
+                outcome: outcome,
+                encodedByteCount: result.encodedByteCount,
+                durationNanoseconds: end >= start ? end - start : 0
+            )
+        }
+    #endif
+
+    private enum RootCacheLoadOutcome {
+        case loaded
+        case missing
+        case versionMismatch
+        case decodeFailure
+    }
+
+    private struct RootCacheLoadResult {
+        let rootFolder: CodeMapCacheRootFolder?
+        let outcome: RootCacheLoadOutcome
+        let encodedByteCount: Int
+    }
+
+    private func loadRootFolderCacheResultAsync(rootFolderPath: String) async -> RootCacheLoadResult {
         let codeMapFile = cacheFileURL(forRootFolder: rootFolderPath)
         let currentVersion = currentCacheVersion
 
-        return await Task.detached(priority: .utility) { () -> CodeMapCacheRootFolder? in
-            guard FileManager.default.fileExists(atPath: codeMapFile.path) else { return nil }
+        return await Task.detached(priority: .utility) { () -> RootCacheLoadResult in
+            guard FileManager.default.fileExists(atPath: codeMapFile.path) else {
+                return RootCacheLoadResult(rootFolder: nil, outcome: .missing, encodedByteCount: 0)
+            }
             do {
                 let data = try Data(contentsOf: codeMapFile)
-                let container = try JSONDecoder().decode(CodeMapCacheContainer.self, from: data)
+                let container: CodeMapCacheContainer
+                do {
+                    container = try JSONDecoder().decode(CodeMapCacheContainer.self, from: data)
+                } catch {
+                    return RootCacheLoadResult(
+                        rootFolder: nil,
+                        outcome: .decodeFailure,
+                        encodedByteCount: data.count
+                    )
+                }
 
                 // Purge mismatched versions on the spot (keeps follow-ups fast)
                 if container.version == -1 || currentVersion == -1 || container.version != currentVersion {
                     try? FileManager.default.removeItem(at: codeMapFile)
                     print("Purged cache for \(rootFolderPath) due to version mismatch (cached: \(container.version), current: \(currentVersion))")
-                    return nil
+                    return RootCacheLoadResult(
+                        rootFolder: nil,
+                        outcome: .versionMismatch,
+                        encodedByteCount: data.count
+                    )
                 }
-                return container.rootFolder
+                return RootCacheLoadResult(
+                    rootFolder: container.rootFolder,
+                    outcome: .loaded,
+                    encodedByteCount: data.count
+                )
             } catch {
                 // Silent failure: treat as cache miss
-                return nil
+                return RootCacheLoadResult(
+                    rootFolder: nil,
+                    outcome: .decodeFailure,
+                    encodedByteCount: 0
+                )
             }
         }.value
     }
@@ -362,6 +440,30 @@ class CodeMapCacheManager {
     /// CHANGED: made public so the actor can flush its in-memory cache to disk.
     @discardableResult
     func saveRootFolderCache(_ rootFolderPath: String, rootEntry: CodeMapCacheRootFolder) -> Bool {
+        saveRootFolderCacheResult(rootFolderPath, rootEntry: rootEntry).success
+    }
+
+    #if DEBUG || CODEMAP_PERF
+        func saveRootFolderCacheWithDiagnostics(
+            _ rootFolderPath: String,
+            rootEntry: CodeMapCacheRootFolder
+        ) -> CodeMapRootCacheSaveDiagnosticResult {
+            let start = DispatchTime.now().uptimeNanoseconds
+            let result = saveRootFolderCacheResult(rootFolderPath, rootEntry: rootEntry)
+            let end = DispatchTime.now().uptimeNanoseconds
+            return CodeMapRootCacheSaveDiagnosticResult(
+                success: result.success,
+                encodedByteCount: result.encodedByteCount,
+                entryCount: rootEntry.files.count,
+                durationNanoseconds: end >= start ? end - start : 0
+            )
+        }
+    #endif
+
+    private func saveRootFolderCacheResult(
+        _ rootFolderPath: String,
+        rootEntry: CodeMapCacheRootFolder
+    ) -> (success: Bool, encodedByteCount: Int) {
         Self.fileSaveQueue.sync {
             let codeMapFile = cacheFileURL(forRootFolder: rootFolderPath)
             let directoryURL = codeMapFile.deletingLastPathComponent()
@@ -376,10 +478,10 @@ class CodeMapCacheManager {
                 let container = CodeMapCacheContainer(version: currentCacheVersion, rootFolder: rootEntry)
                 let data = try JSONEncoder().encode(container)
                 try data.write(to: codeMapFile, options: .atomic)
-                return true
+                return (true, data.count)
             } catch {
                 print("Failed to save codeMapCache to disk for \(rootFolderPath): \(error)")
-                return false
+                return (false, 0)
             }
         }
     }
