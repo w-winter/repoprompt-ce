@@ -2133,7 +2133,8 @@ actor WorkspaceFileContextStore {
     func prepareSessionWorktreeOwnership(
         ownerID: UUID,
         bindingFingerprint: String,
-        physicalRootPaths: [String]
+        physicalRootPaths: [String],
+        startupContext: WorktreeStartupContext? = nil
     ) async throws -> WorkspaceSessionWorktreeOwnershipPreparation {
         let standardizedPaths = Array(Set(physicalRootPaths.map {
             StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
@@ -2177,6 +2178,16 @@ actor WorkspaceFileContextStore {
             var preparedRoots: [WorkspaceSessionWorktreeOwnedRoot] = []
             for path in standardizedPaths {
                 try Task.checkCancellation()
+                if let startupContext {
+                    // Slice 8A is observation-only. This event intentionally
+                    // precedes the unchanged full crawler and performs no VCS
+                    // detection, preserving zero Git commands for non-Git roots.
+                    WorktreeStartupInstrumentation.record(
+                        .rootLoadStarted,
+                        context: startupContext,
+                        route: .fullCrawl
+                    )
+                }
                 guard latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] == generation else {
                     throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
                 }

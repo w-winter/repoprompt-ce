@@ -23,11 +23,13 @@ actor GitService {
     private enum GitProcessCaptureError: Error {
         case stdoutByteLimitExceeded
         case stderrByteLimitExceeded
+        case timedOut
     }
 
     private enum GitProcessRepositoryBinding {
         case inferred
         case exactObjectRead(GitRepositoryLayout)
+        case exactWorktree(GitRepositoryLayout)
     }
 
     // MARK: - Worktree Layout Cache
@@ -175,12 +177,14 @@ actor GitService {
     private let inheritedProcessEnvironment: [String: String]
     private let gitExecutableURL: URL
     private let processAdmissionController: GitProcessAdmissionController
+    private let workspaceStateAuthority: GitWorkspaceStateAuthority
     private let processTerminationGrace: Duration
     private var preparedBaseProcessEnvironment: [String: String]?
 
     init(
         gitExecutableURL: URL = URL(fileURLWithPath: "/usr/bin/git"),
         processAdmissionController: GitProcessAdmissionController = .shared,
+        workspaceStateAuthority: GitWorkspaceStateAuthority = .shared,
         processTerminationGrace: Duration = GitService.gitProcessTerminationGrace,
         worktreeLayoutCacheLimit: Int = 128,
         inheritedProcessEnvironment: [String: String] = ProcessInfo.processInfo.environment
@@ -188,6 +192,7 @@ actor GitService {
         precondition(worktreeLayoutCacheLimit > 0)
         self.gitExecutableURL = gitExecutableURL
         self.processAdmissionController = processAdmissionController
+        self.workspaceStateAuthority = workspaceStateAuthority
         self.processTerminationGrace = processTerminationGrace
         self.worktreeLayoutCacheLimit = worktreeLayoutCacheLimit
         self.inheritedProcessEnvironment = inheritedProcessEnvironment
@@ -345,55 +350,57 @@ actor GitService {
         let mutationKey = getLayout(for: repoURL)?.commonDir.standardizedFileURL.path
             ?? repoURL.standardizedFileURL.path
 
-        let created = try await worktreeMutationCoordinator.withLock(key: mutationKey) { [weak self] in
-            guard let self else {
-                throw GitError(message: "git service was released before worktree creation")
-            }
-            if let mainWorktreeRoot = request.mainWorktreeRoot {
-                try GitWorktreeDefaultPathPlanner.validate(
-                    path: request.path,
-                    mainWorktreeRoot: mainWorktreeRoot,
-                    knownWorktreeRoots: request.knownWorktreeRoots,
-                    appManagedContainer: request.appManagedContainer,
-                    allowExternalPath: request.allowExternalPath
-                )
-            }
-            var args = ["worktree", "add"]
-            if request.force {
-                args.append("--force")
-            }
-            if request.detach {
-                args.append("--detach")
-            }
-            if let lockReason = request.lockReason {
-                args.append("--lock")
-                if !lockReason.isEmpty {
-                    args.append("--reason")
-                    args.append(lockReason)
+        let created = try await withWorkspaceAuthorityMutation(at: repoURL, kind: .worktreeCreate) {
+            try await worktreeMutationCoordinator.withLock(key: mutationKey) { [weak self] in
+                guard let self else {
+                    throw GitError(message: "git service was released before worktree creation")
                 }
-            }
-            if let branch = request.branch, !branch.isEmpty {
-                args.append("-b")
-                args.append(branch)
-            }
-            args.append(request.path.standardizedFileURL.path)
-            if let baseRef = request.baseRef, !baseRef.isEmpty {
-                args.append(baseRef)
-            }
+                if let mainWorktreeRoot = request.mainWorktreeRoot {
+                    try GitWorktreeDefaultPathPlanner.validate(
+                        path: request.path,
+                        mainWorktreeRoot: mainWorktreeRoot,
+                        knownWorktreeRoots: request.knownWorktreeRoots,
+                        appManagedContainer: request.appManagedContainer,
+                        allowExternalPath: request.allowExternalPath
+                    )
+                }
+                var args = ["worktree", "add"]
+                if request.force {
+                    args.append("--force")
+                }
+                if request.detach {
+                    args.append("--detach")
+                }
+                if let lockReason = request.lockReason {
+                    args.append("--lock")
+                    if !lockReason.isEmpty {
+                        args.append("--reason")
+                        args.append(lockReason)
+                    }
+                }
+                if let branch = request.branch, !branch.isEmpty {
+                    args.append("-b")
+                    args.append(branch)
+                }
+                args.append(request.path.standardizedFileURL.path)
+                if let baseRef = request.baseRef, !baseRef.isEmpty {
+                    args.append(baseRef)
+                }
 
-            let (_, stderr, exitCode) = try await runGit(args, at: repoURL)
-            guard exitCode == 0 else {
-                throw GitError(message: "git worktree add failed: \(stderr)")
-            }
+                let (_, stderr, exitCode) = try await runGit(args, at: repoURL)
+                guard exitCode == 0 else {
+                    throw GitError(message: "git worktree add failed: \(stderr)")
+                }
 
-            await clearLayoutCache()
-            let createdPath = request.path.standardizedFileURL.path
-            let worktrees = try await listWorktrees(at: repoURL)
-            if let created = worktrees.first(where: { $0.path == createdPath }) {
-                return created
-            }
+                await clearLayoutCache()
+                let createdPath = request.path.standardizedFileURL.path
+                let worktrees = try await listWorktrees(at: repoURL)
+                if let created = worktrees.first(where: { $0.path == createdPath }) {
+                    return created
+                }
 
-            throw GitError(message: "git worktree add succeeded but created worktree was not listed: \(createdPath)")
+                throw GitError(message: "git worktree add succeeded but created worktree was not listed: \(createdPath)")
+            }
         }
 
         let destinationURL = URL(fileURLWithPath: created.path, isDirectory: true)
@@ -682,18 +689,20 @@ actor GitService {
         sourceHead: String,
         at targetRepoURL: URL
     ) async throws -> GitWorktreeMergeState {
-        try await withWorktreeMergeAdvisoryLock(at: targetRepoURL) { [weak self] in
-            guard let self else {
-                throw GitError(message: "git service was released before merge apply")
+        try await withWorkspaceAuthorityMutation(at: targetRepoURL, kind: .mergeApply) {
+            try await withWorktreeMergeAdvisoryLock(at: targetRepoURL) { [weak self] in
+                guard let self else {
+                    throw GitError(message: "git service was released before merge apply")
+                }
+                let (_, stderr, exitCode) = try await runGit(
+                    ["merge", "--no-ff", "--no-commit", "--no-edit", sourceHead],
+                    at: targetRepoURL
+                )
+                if exitCode == 0 || exitCode == 1 {
+                    return try await inspectMergeState(at: targetRepoURL)
+                }
+                throw GitError(message: "git merge --no-commit failed: \(stderr)")
             }
-            let (_, stderr, exitCode) = try await runGit(
-                ["merge", "--no-ff", "--no-commit", "--no-edit", sourceHead],
-                at: targetRepoURL
-            )
-            if exitCode == 0 || exitCode == 1 {
-                return try await inspectMergeState(at: targetRepoURL)
-            }
-            throw GitError(message: "git merge --no-commit failed: \(stderr)")
         }
     }
 
@@ -702,55 +711,63 @@ actor GitService {
         message: String,
         at targetRepoURL: URL
     ) async throws -> (state: GitWorktreeMergeState, commit: String?) {
-        try await withWorktreeMergeAdvisoryLock(at: targetRepoURL) { [weak self] in
-            guard let self else {
-                throw GitError(message: "git service was released before merge apply")
+        try await withWorkspaceAuthorityMutation(at: targetRepoURL, kind: .mergeApply) {
+            try await withWorktreeMergeAdvisoryLock(at: targetRepoURL) { [weak self] in
+                guard let self else {
+                    throw GitError(message: "git service was released before merge apply")
+                }
+                let (_, stderr, exitCode) = try await runGit(
+                    ["merge", "--no-ff", "--no-commit", "--no-edit", sourceHead],
+                    at: targetRepoURL
+                )
+                if exitCode == 0 || exitCode == 1 {
+                    let state = try await inspectMergeState(at: targetRepoURL)
+                    guard state.conflictFiles.isEmpty else { return (state: state, commit: nil) }
+                    guard state.inProgress else { return (state: state, commit: nil) }
+                    let commit = try await commitCurrentMergeWithoutLock(message: message, at: targetRepoURL)
+                    return (state: state, commit: commit)
+                }
+                throw GitError(message: "git merge --no-commit failed: \(stderr)")
             }
-            let (_, stderr, exitCode) = try await runGit(
-                ["merge", "--no-ff", "--no-commit", "--no-edit", sourceHead],
-                at: targetRepoURL
-            )
-            if exitCode == 0 || exitCode == 1 {
-                let state = try await inspectMergeState(at: targetRepoURL)
-                guard state.conflictFiles.isEmpty else { return (state: state, commit: nil) }
-                guard state.inProgress else { return (state: state, commit: nil) }
-                let commit = try await commitCurrentMergeWithoutLock(message: message, at: targetRepoURL)
-                return (state: state, commit: commit)
-            }
-            throw GitError(message: "git merge --no-commit failed: \(stderr)")
         }
     }
 
     func commitWorktreeMerge(message: String, at targetRepoURL: URL) async throws -> String {
-        try await withWorktreeMergeAdvisoryLock(at: targetRepoURL) { [weak self] in
-            guard let self else {
-                throw GitError(message: "git service was released before merge commit")
+        try await withWorkspaceAuthorityMutation(at: targetRepoURL, kind: .mergeCommit) {
+            try await withWorktreeMergeAdvisoryLock(at: targetRepoURL) { [weak self] in
+                guard let self else {
+                    throw GitError(message: "git service was released before merge commit")
+                }
+                return try await commitCurrentMergeWithoutLock(message: message, at: targetRepoURL)
             }
-            return try await commitCurrentMergeWithoutLock(message: message, at: targetRepoURL)
         }
     }
 
     func continueWorktreeMerge(message: String, at targetRepoURL: URL) async throws -> String {
-        try await withWorktreeMergeAdvisoryLock(at: targetRepoURL) { [weak self] in
-            guard let self else {
-                throw GitError(message: "git service was released before merge continue")
+        try await withWorkspaceAuthorityMutation(at: targetRepoURL, kind: .mergeContinue) {
+            try await withWorktreeMergeAdvisoryLock(at: targetRepoURL) { [weak self] in
+                guard let self else {
+                    throw GitError(message: "git service was released before merge continue")
+                }
+                return try await commitCurrentMergeWithoutLock(message: message, at: targetRepoURL)
             }
-            return try await commitCurrentMergeWithoutLock(message: message, at: targetRepoURL)
         }
     }
 
     func abortWorktreeMerge(at targetRepoURL: URL) async throws -> Bool {
-        try await withWorktreeMergeAdvisoryLock(at: targetRepoURL) { [weak self] in
-            guard let self else {
-                throw GitError(message: "git service was released before merge abort")
+        let state = try await inspectMergeState(at: targetRepoURL)
+        guard state.inProgress else { return false }
+        return try await withWorkspaceAuthorityMutation(at: targetRepoURL, kind: .mergeAbort) {
+            try await withWorktreeMergeAdvisoryLock(at: targetRepoURL) { [weak self] in
+                guard let self else {
+                    throw GitError(message: "git service was released before merge abort")
+                }
+                let (_, stderr, exitCode) = try await runGit(["merge", "--abort"], at: targetRepoURL)
+                guard exitCode == 0 else {
+                    throw GitError(message: "git merge --abort failed: \(stderr)")
+                }
+                return true
             }
-            let state = try await inspectMergeState(at: targetRepoURL)
-            guard state.inProgress else { return false }
-            let (_, stderr, exitCode) = try await runGit(["merge", "--abort"], at: targetRepoURL)
-            guard exitCode == 0 else {
-                throw GitError(message: "git merge --abort failed: \(stderr)")
-            }
-            return true
         }
     }
 
@@ -1694,32 +1711,34 @@ actor GitService {
 
             try await requireBranchNotCheckedOutInAnotherWorktree(request.branchName, at: repoURL)
 
-            let switchResult = try await runGit(["switch", "--no-guess", request.branchName], at: repoURL)
-            if switchResult.2 != 0 {
-                if Self.shouldFallbackFromGitSwitchError(switchResult.1) {
-                    let checkoutResult = try await runGit(["checkout", request.branchName], at: repoURL)
-                    guard checkoutResult.2 == 0 else {
-                        throw GitBranchSwitchError.gitRefused("git checkout failed: \(checkoutResult.1)")
+            return try await withWorkspaceAuthorityMutation(at: repoURL, kind: .branchSwitch) {
+                let switchResult = try await self.runGit(["switch", "--no-guess", request.branchName], at: repoURL)
+                if switchResult.2 != 0 {
+                    if Self.shouldFallbackFromGitSwitchError(switchResult.1) {
+                        let checkoutResult = try await self.runGit(["checkout", request.branchName], at: repoURL)
+                        guard checkoutResult.2 == 0 else {
+                            throw GitBranchSwitchError.gitRefused("git checkout failed: \(checkoutResult.1)")
+                        }
+                    } else {
+                        throw GitBranchSwitchError.gitRefused("git switch failed: \(switchResult.1)")
                     }
-                } else {
-                    throw GitBranchSwitchError.gitRefused("git switch failed: \(switchResult.1)")
                 }
-            }
 
-            let newBranch = try await currentBranchOrNil(at: repoURL)
-            let newHead = try await getHeadSHA(at: repoURL)
-            guard newBranch == request.branchName else {
-                throw GitBranchSwitchError.gitRefused("Git reported success, but the checkout is now on \(newBranch ?? "detached HEAD") instead of \(request.branchName).")
+                let newBranch = try await self.currentBranchOrNil(at: repoURL)
+                let newHead = try await self.getHeadSHA(at: repoURL)
+                guard newBranch == request.branchName else {
+                    throw GitBranchSwitchError.gitRefused("Git reported success, but the checkout is now on \(newBranch ?? "detached HEAD") instead of \(request.branchName).")
+                }
+                return GitBranchSwitchResult(
+                    rootPath: repoURL.standardizedFileURL.path,
+                    repoRootPath: repoURL.standardizedFileURL.path,
+                    previousBranch: previousBranch,
+                    previousHead: previousHead,
+                    newBranch: request.branchName,
+                    newHead: newHead,
+                    didSwitch: true
+                )
             }
-            return GitBranchSwitchResult(
-                rootPath: repoURL.standardizedFileURL.path,
-                repoRootPath: repoURL.standardizedFileURL.path,
-                previousBranch: previousBranch,
-                previousHead: previousHead,
-                newBranch: request.branchName,
-                newHead: newHead,
-                didSwitch: true
-            )
         }
     }
 
@@ -1837,13 +1856,15 @@ actor GitService {
     /// Fetch updates from all remotes
     /// Updates local tracking refs (e.g., origin/main) to match remote state
     func fetch(at repoURL: URL) async throws {
-        let (_, stderr, exitCode) = try await runGit(
-            ["fetch", "--all", "--prune"],
-            at: repoURL
-        )
+        try await withWorkspaceAuthorityMutation(at: repoURL, kind: .fetch) {
+            let (_, stderr, exitCode) = try await runGit(
+                ["fetch", "--all", "--prune"],
+                at: repoURL
+            )
 
-        guard exitCode == 0 else {
-            throw GitError(message: "git fetch failed: \(stderr)")
+            guard exitCode == 0 else {
+                throw GitError(message: "git fetch failed: \(stderr)")
+            }
         }
     }
 
@@ -2274,10 +2295,641 @@ actor GitService {
         return layout
     }
 
+    // MARK: - Bounded Worktree Initialization Authority
+
+    func resolveTreeOID(
+        _ ref: String,
+        in layout: GitRepositoryLayout,
+        priority: GitProcessAdmissionPriority = .rootBootstrap
+    ) async throws -> GitObjectID {
+        guard !ref.isEmpty, ref.utf8.count <= 4096, !ref.utf8.contains(0) else {
+            throw GitWorktreeInitializationError.malformedOutput("invalid tree reference")
+        }
+        let format = try await boundedObjectFormat(in: layout, priority: priority, timeout: .seconds(5))
+        let data = try await runBoundedAuthorityGit(
+            ["rev-parse", "--verify", "--end-of-options", "\(ref)^{tree}"],
+            layout: layout,
+            limits: .delta,
+            priority: priority,
+            family: .treeResolution
+        )
+        guard let value = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        else {
+            throw GitWorktreeInitializationError.malformedOutput("tree object ID is not UTF-8")
+        }
+        return try GitObjectID(objectFormat: format, lowercaseHex: value)
+    }
+
+    func listTree(
+        _ treeOID: GitObjectID,
+        in layout: GitRepositoryLayout,
+        prefix: GitRepositoryRelativeRootPrefix,
+        limits: GitWorktreeInitializationLimits = .treeInventory,
+        priority: GitProcessAdmissionPriority = .rootBootstrap
+    ) async throws -> GitTreeInventorySnapshot {
+        var args = [
+            "ls-tree", "-r", "-t", "-z", "--full-tree",
+            "--format=%(objectmode) %(objecttype) %(objectname)%x09%(path)",
+            treeOID.lowercaseHex
+        ]
+        appendLiteralPrefix(prefix, to: &args)
+        let data = try await runBoundedAuthorityGit(
+            args,
+            layout: layout,
+            limits: limits,
+            priority: priority,
+            family: .treeInventory
+        )
+        return try GitTreeInventoryParser.parseTreeInventory(
+            data,
+            treeOID: treeOID,
+            rootPrefix: prefix,
+            limits: limits
+        )
+    }
+
+    func diffTrees(
+        baseTreeOID: GitObjectID,
+        targetTreeOID: GitObjectID,
+        in layout: GitRepositoryLayout,
+        prefix: GitRepositoryRelativeRootPrefix,
+        limits: GitWorktreeInitializationLimits = .delta,
+        priority: GitProcessAdmissionPriority = .rootBootstrap
+    ) async throws -> [GitTreeDeltaRecord] {
+        guard baseTreeOID.objectFormat == targetTreeOID.objectFormat else {
+            throw GitWorktreeInitializationError.malformedOutput("tree object formats differ")
+        }
+        var args = [
+            "diff-tree", "-r", "--raw", "-z", "--no-commit-id",
+            "--find-renames", "--find-copies", "--no-ext-diff",
+            baseTreeOID.lowercaseHex, targetTreeOID.lowercaseHex
+        ]
+        appendLiteralPrefix(prefix, to: &args)
+        let data = try await runBoundedAuthorityGit(
+            args,
+            layout: layout,
+            limits: limits,
+            priority: priority,
+            family: .treeDelta
+        )
+        return try GitTreeInventoryParser.parseTreeDelta(
+            data,
+            objectFormat: baseTreeOID.objectFormat,
+            rootPrefix: prefix,
+            limits: limits
+        )
+    }
+
+    func indexManifest(
+        in layout: GitRepositoryLayout,
+        prefix: GitRepositoryRelativeRootPrefix,
+        limits: GitWorktreeInitializationLimits = .index,
+        priority: GitProcessAdmissionPriority = .rootBootstrap
+    ) async throws -> GitIndexManifest {
+        let format = try await boundedObjectFormat(in: layout, priority: priority, timeout: limits.commandTimeout)
+        var args = ["ls-files", "--stage", "-v", "-z"]
+        appendLiteralPrefix(prefix, to: &args)
+        let data = try await runBoundedAuthorityGit(
+            args,
+            layout: layout,
+            limits: limits,
+            priority: priority,
+            family: .indexManifest
+        )
+        return try GitTreeInventoryParser.parseIndexManifest(
+            data,
+            objectFormat: format,
+            rootPrefix: prefix,
+            limits: limits
+        )
+    }
+
+    func worktreeStatus(
+        in layout: GitRepositoryLayout,
+        prefix: GitRepositoryRelativeRootPrefix,
+        includeUntracked: Bool = true,
+        includeIgnored: Bool = true,
+        limits: GitWorktreeInitializationLimits = .status,
+        priority: GitProcessAdmissionPriority = .rootBootstrap
+    ) async throws -> GitStatusPorcelainV2Snapshot {
+        var args = [
+            "status", "--porcelain=v2", "-z",
+            includeUntracked ? "--untracked-files=all" : "--untracked-files=no"
+        ]
+        if includeIgnored {
+            args.append("--ignored=matching")
+        }
+        appendLiteralPrefix(prefix, to: &args)
+        let data = try await runBoundedAuthorityGit(
+            args,
+            layout: layout,
+            limits: limits,
+            priority: priority,
+            family: .status
+        )
+        return try GitTreeInventoryParser.validateStatusSnapshot(
+            data,
+            rootPrefix: prefix,
+            limits: limits
+        )
+    }
+
+    func authorityMetadata(
+        in layout: GitRepositoryLayout,
+        prefix: GitRepositoryRelativeRootPrefix,
+        priority: GitProcessAdmissionPriority = .rootBootstrap
+    ) async throws -> GitWorkspaceAuthorityMetadata {
+        let format = try await boundedObjectFormat(in: layout, priority: priority, timeout: .seconds(5))
+        let headCommit = try await boundedObjectID(
+            "HEAD^{commit}",
+            objectFormat: format,
+            layout: layout,
+            priority: priority
+        )
+        let tree = try await boundedObjectID(
+            "HEAD^{tree}",
+            objectFormat: format,
+            layout: layout,
+            priority: priority
+        )
+        let configLimits = GitWorktreeInitializationLimits(
+            maximumRecordCount: 4096,
+            maximumOutputBytes: 1024 * 1024,
+            commandTimeout: .seconds(5)
+        )
+        let configData = try await runBoundedAuthorityGit(
+            [
+                "config", "--null", "--show-origin", "--get-regexp",
+                "^(core\\.(autocrlf|eol|attributesfile|excludesfile|sparsecheckout|sparsecheckoutcone)|filter\\.)"
+            ],
+            layout: layout,
+            limits: configLimits,
+            priority: priority,
+            family: .authorityMetadata,
+            allowedExitCodes: [0, 1]
+        )
+        // Configured authority paths are operational metadata only. Reusable
+        // policy identity carries their resolved contents below, never the
+        // machine-local absolute path stored in Git config.
+        let rootNeutralPolicyConfigData = try await runBoundedAuthorityGit(
+            [
+                "config", "--null", "--get-regexp",
+                "^(core\\.(autocrlf|eol|sparsecheckout|sparsecheckoutcone)|filter\\.)"
+            ],
+            layout: layout,
+            limits: configLimits,
+            priority: priority,
+            family: .authorityMetadata,
+            allowedExitCodes: [0, 1]
+        )
+        let resolvedExcludesFileURL = try await boundedConfigPath(
+            "core.excludesFile",
+            layout: layout,
+            priority: priority
+        )
+        let resolvedAttributesFileURL = try await boundedConfigPath(
+            "core.attributesFile",
+            layout: layout,
+            priority: priority
+        )
+        let resolvedExcludesFileIdentity = try resolvedExcludesFileURL.map {
+            try Self.boundedAuthorityContentIdentity(at: $0)
+        }
+        let resolvedAttributesFileIdentity = try resolvedAttributesFileURL.map {
+            try Self.boundedAuthorityContentIdentity(at: $0)
+        }
+        let prefixControlIdentities = try Self.boundedPrefixControlIdentities(
+            layout: layout,
+            prefix: prefix,
+            limits: .delta
+        )
+        let ignoreControlIdentities = prefixControlIdentities.filter { $0.kind != .gitAttributes }
+        let attributeControlIdentities = prefixControlIdentities.filter { $0.kind == .gitAttributes }
+        let indexDigest = try Self.boundedAuthorityFileDigest([
+            ("index", layout.gitDir.appendingPathComponent("index"))
+        ], maximumBytesPerFile: 32 * 1024 * 1024)
+        let repositoryIgnoreDigest = try Self.boundedAuthorityFileDigest([
+            ("info/exclude", layout.commonDir.appendingPathComponent("info/exclude"))
+        ])
+        let repositoryAttributeDigest = try Self.boundedAuthorityFileDigest([
+            ("info/attributes", layout.commonDir.appendingPathComponent("info/attributes"))
+        ])
+        let sparseDigest = try Self.boundedAuthorityFileDigest([
+            ("sparse-checkout", layout.gitDir.appendingPathComponent("info/sparse-checkout"))
+        ])
+        let metadataDigest = try Self.boundedAuthorityFileDigest([
+            ("dot-git", layout.dotGitPath),
+            ("head", layout.gitDir.appendingPathComponent("HEAD")),
+            ("packed-refs", layout.commonDir.appendingPathComponent("packed-refs")),
+            ("config", layout.commonDir.appendingPathComponent("config")),
+            ("config.worktree", layout.gitDir.appendingPathComponent("config.worktree"))
+        ])
+        let committedIgnoreControlDigest = Self.canonicalControlIdentityDigest(ignoreControlIdentities)
+        let prefixAttributeDigest = Self.canonicalControlIdentityDigest(attributeControlIdentities)
+        let configuredIgnoreAuthorityDigest = Self.sha256Hex(
+            rootNeutralPolicyConfigData
+                + Data(repositoryIgnoreDigest.utf8)
+                + Self.canonicalOptionalContentIdentityData(resolvedExcludesFileIdentity)
+        )
+        let attributePolicyDigest = Self.sha256Hex(
+            rootNeutralPolicyConfigData
+                + Data(repositoryAttributeDigest.utf8)
+                + Data(prefixAttributeDigest.utf8)
+                + Self.canonicalOptionalContentIdentityData(resolvedAttributesFileIdentity)
+        )
+        let policyIdentity = GitWorkspacePolicyIdentity(
+            mandatoryIgnorePolicyIdentity: "git-ignore-policy-v1",
+            committedIgnoreControlDigest: committedIgnoreControlDigest,
+            configuredIgnoreAuthorityDigest: configuredIgnoreAuthorityDigest,
+            attributePolicyDigest: attributePolicyDigest,
+            sparsePolicyDigest: Self.sha256Hex(rootNeutralPolicyConfigData + Data(sparseDigest.utf8)),
+            searchABI: .current,
+            resolvedExcludesFileIdentity: resolvedExcludesFileIdentity,
+            resolvedAttributesFileIdentity: resolvedAttributesFileIdentity,
+            prefixControlIdentities: prefixControlIdentities
+        )
+        return GitWorkspaceAuthorityMetadata(
+            repositoryKey: GitWorkspaceAuthorityRepositoryKey(layout: layout),
+            objectFormat: format,
+            headCommitOID: headCommit,
+            treeOID: tree,
+            repositoryRelativeRootPrefix: prefix,
+            indexGeneration: indexDigest,
+            checkoutConfigurationGeneration: Self.sha256Hex(configData),
+            ignoreAuthorityGeneration: configuredIgnoreAuthorityDigest,
+            attributeAuthorityGeneration: attributePolicyDigest,
+            sparsePolicyGeneration: policyIdentity.sparsePolicyDigest,
+            metadataGeneration: metadataDigest,
+            policyIdentity: policyIdentity,
+            resolvedExternalAuthorityPaths: [resolvedExcludesFileURL, resolvedAttributesFileURL].compactMap(\.self)
+        )
+    }
+
+    private func boundedConfigPath(
+        _ key: String,
+        layout: GitRepositoryLayout,
+        priority: GitProcessAdmissionPriority
+    ) async throws -> URL? {
+        let limits = GitWorktreeInitializationLimits(
+            maximumRecordCount: 1,
+            maximumOutputBytes: 16 * 1024,
+            commandTimeout: .seconds(5)
+        )
+        let data = try await runBoundedAuthorityGit(
+            ["config", "--path", "-z", "--get", key],
+            layout: layout,
+            limits: limits,
+            priority: priority,
+            family: .authorityMetadata,
+            allowedExitCodes: [0, 1]
+        )
+        guard !data.isEmpty else { return nil }
+        guard data.last == 0 else {
+            throw GitWorktreeInitializationError.malformedOutput("config path is not NUL terminated")
+        }
+        let records = data.dropLast().split(separator: 0, omittingEmptySubsequences: false)
+        guard records.count == 1,
+              let value = String(data: records[0], encoding: .utf8),
+              !value.isEmpty,
+              !value.contains("\0")
+        else {
+            throw GitWorktreeInitializationError.malformedOutput("invalid config path")
+        }
+        let url = value.hasPrefix("/")
+            ? URL(fileURLWithPath: value)
+            : layout.workTreeRoot.appendingPathComponent(value)
+        return url.standardizedFileURL
+    }
+
+    private func boundedObjectID(
+        _ specification: String,
+        objectFormat: GitObjectFormat,
+        layout: GitRepositoryLayout,
+        priority: GitProcessAdmissionPriority
+    ) async throws -> GitObjectID {
+        let data = try await runBoundedAuthorityGit(
+            ["rev-parse", "--verify", "--end-of-options", specification],
+            layout: layout,
+            limits: .delta,
+            priority: priority,
+            family: .treeResolution
+        )
+        guard let value = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        else {
+            throw GitWorktreeInitializationError.malformedOutput("object ID is not UTF-8")
+        }
+        return try GitObjectID(objectFormat: objectFormat, lowercaseHex: value)
+    }
+
+    private func boundedObjectFormat(
+        in layout: GitRepositoryLayout,
+        priority: GitProcessAdmissionPriority,
+        timeout: Duration
+    ) async throws -> GitObjectFormat {
+        let limits = GitWorktreeInitializationLimits(
+            maximumRecordCount: 1,
+            maximumOutputBytes: 64,
+            commandTimeout: timeout
+        )
+        let data = try await runBoundedAuthorityGit(
+            ["rev-parse", "--show-object-format"],
+            layout: layout,
+            limits: limits,
+            priority: priority,
+            family: .treeResolution
+        )
+        guard let value = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        else {
+            throw GitWorktreeInitializationError.malformedOutput("object format is not UTF-8")
+        }
+        do {
+            return try GitObjectFormat(gitValue: value)
+        } catch {
+            throw GitWorktreeInitializationError.malformedOutput("unsupported object format")
+        }
+    }
+
+    private func runBoundedAuthorityGit(
+        _ args: [String],
+        layout: GitRepositoryLayout,
+        limits: GitWorktreeInitializationLimits,
+        priority: GitProcessAdmissionPriority,
+        family: GitProcessCommandFamily,
+        allowedExitCodes: Set<Int32> = [0]
+    ) async throws -> Data {
+        do {
+            let (stdout, _, exitCode) = try await runGitData(
+                args,
+                at: layout.workTreeRoot,
+                env: ["GIT_LITERAL_PATHSPECS": "1"],
+                stdoutByteLimit: limits.maximumOutputBytes,
+                stderrByteLimit: 64 * 1024,
+                repositoryBinding: .exactWorktree(layout),
+                admissionPriority: priority,
+                admissionDeadline: priority == .rootBootstrap || priority == .userInitiatedAuthority
+                    ? Self.gitAdmissionDeadline(after: limits.commandTimeout)
+                    : nil,
+                commandFamily: family,
+                commandTimeout: limits.commandTimeout
+            )
+            guard allowedExitCodes.contains(exitCode) else {
+                throw GitWorktreeInitializationError.gitFailure(exitCode: exitCode)
+            }
+            return stdout
+        } catch GitProcessCaptureError.stdoutByteLimitExceeded,
+            GitProcessCaptureError.stderrByteLimitExceeded
+        {
+            throw GitWorktreeInitializationError.outputLimitExceeded
+        } catch GitProcessCaptureError.timedOut {
+            throw GitWorktreeInitializationError.timeout
+        } catch is CancellationError {
+            throw CancellationError()
+        }
+    }
+
+    private nonisolated static func boundedAuthorityFileDigest(
+        _ files: [(String, URL)],
+        maximumBytesPerFile: Int = 4 * 1024 * 1024
+    ) throws -> String {
+        var canonical = Data()
+        for (label, url) in files.sorted(by: { $0.0 < $1.0 }) {
+            appendLengthPrefixed(Data(label.utf8), to: &canonical)
+            var value = stat()
+            if lstat(url.path, &value) != 0 {
+                guard errno == ENOENT else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                appendLengthPrefixed(Data("missing".utf8), to: &canonical)
+                continue
+            }
+            let kind = value.st_mode & S_IFMT
+            if kind == S_IFDIR {
+                appendLengthPrefixed(Data("directory".utf8), to: &canonical)
+                continue
+            }
+            guard kind == S_IFREG else {
+                throw GitWorktreeInitializationError.malformedOutput("authority evidence is not a regular file")
+            }
+            appendLengthPrefixed(Data("regular".utf8), to: &canonical)
+            let data = try boundedRead(url, maximumBytes: maximumBytesPerFile)
+            appendLengthPrefixed(data, to: &canonical)
+        }
+        return sha256Hex(canonical)
+    }
+
+    private nonisolated static func boundedAuthorityContentIdentity(
+        at url: URL,
+        maximumBytes: Int = 4 * 1024 * 1024
+    ) throws -> GitWorkspaceAuthorityContentIdentity {
+        var value = stat()
+        if lstat(url.path, &value) != 0 {
+            guard errno == ENOENT else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            return GitWorkspaceAuthorityContentIdentity(
+                exists: false,
+                sha256: sha256Hex(Data("missing".utf8)),
+                byteCount: 0
+            )
+        }
+        guard value.st_mode & S_IFMT == S_IFREG else {
+            throw GitWorktreeInitializationError.malformedOutput("configured authority path is not a regular file")
+        }
+        let data = try boundedRead(url, maximumBytes: maximumBytes)
+        return GitWorkspaceAuthorityContentIdentity(
+            exists: true,
+            sha256: sha256Hex(data),
+            byteCount: data.count
+        )
+    }
+
+    private nonisolated static func boundedPrefixControlIdentities(
+        layout: GitRepositoryLayout,
+        prefix: GitRepositoryRelativeRootPrefix,
+        limits: GitWorktreeInitializationLimits
+    ) throws -> [GitWorkspacePrefixControlIdentity] {
+        let controlKinds: [String: GitWorkspacePrefixControlKind] = [
+            ".gitignore": .gitignore,
+            ".repo_ignore": .repoIgnore,
+            ".cursorignore": .cursorIgnore,
+            ".gitattributes": .gitAttributes
+        ]
+        let root = layout.workTreeRoot.standardizedFileURL
+        let prefixRoot = prefix.value.isEmpty
+            ? root
+            : root.appendingPathComponent(prefix.value, isDirectory: true).standardizedFileURL
+        var prefixIsDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: prefixRoot.path, isDirectory: &prefixIsDirectory),
+              prefixIsDirectory.boolValue
+        else {
+            throw GitWorktreeInitializationError.malformedOutput("loaded-root prefix directory is unavailable")
+        }
+
+        var candidates: [String: GitWorkspacePrefixControlKind] = [:]
+        func addCandidate(_ url: URL, kind: GitWorkspacePrefixControlKind) throws {
+            let path = url.standardizedFileURL.path
+            let rootPath = root.path
+            guard path.hasPrefix(rootPath + "/") else {
+                throw GitWorktreeInitializationError.malformedOutput("control path escapes repository root")
+            }
+            let relative = String(path.dropFirst(rootPath.count + 1))
+            guard !relative.isEmpty,
+                  relative.utf8.count <= limits.maximumPathUTF8Bytes,
+                  relative.split(separator: "/", omittingEmptySubsequences: false).count <= limits.maximumPathDepth,
+                  !relative.split(separator: "/", omittingEmptySubsequences: false)
+                  .contains(where: { $0.isEmpty || $0 == "." || $0 == ".." })
+            else {
+                throw GitWorktreeInitializationError.pathLimitExceeded
+            }
+            candidates[relative] = kind
+        }
+
+        var ancestor = root
+        let prefixComponents = prefix.value.isEmpty ? [] : prefix.value.split(separator: "/").map(String.init)
+        for depth in 0 ... prefixComponents.count {
+            for (name, kind) in controlKinds {
+                let url = ancestor.appendingPathComponent(name)
+                if FileManager.default.fileExists(atPath: url.path) {
+                    try addCandidate(url, kind: kind)
+                }
+            }
+            if depth < prefixComponents.count {
+                ancestor.appendPathComponent(prefixComponents[depth], isDirectory: true)
+            }
+        }
+
+        var enumerationError: Error?
+        guard let enumerator = FileManager.default.enumerator(
+            at: prefixRoot,
+            includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey],
+            options: [.skipsPackageDescendants],
+            errorHandler: { _, error in
+                enumerationError = error
+                return false
+            }
+        ) else {
+            throw GitWorktreeInitializationError.malformedOutput("prefix control enumeration failed")
+        }
+        var inspectedCount = 0
+        while let url = enumerator.nextObject() as? URL {
+            inspectedCount += 1
+            guard inspectedCount <= limits.maximumRecordCount else {
+                throw GitWorktreeInitializationError.recordLimitExceeded
+            }
+            if url.lastPathComponent == ".git" {
+                enumerator.skipDescendants()
+                continue
+            }
+            guard let kind = controlKinds[url.lastPathComponent] else { continue }
+            try addCandidate(url, kind: kind)
+        }
+        if let enumerationError { throw enumerationError }
+
+        var result: [GitWorkspacePrefixControlIdentity] = []
+        var totalBytes = 0
+        for (relativePath, kind) in candidates.sorted(by: { $0.key < $1.key }) {
+            let identity = try boundedAuthorityContentIdentity(
+                at: root.appendingPathComponent(relativePath),
+                maximumBytes: min(4 * 1024 * 1024, limits.maximumOutputBytes)
+            )
+            let addition = totalBytes.addingReportingOverflow(identity.byteCount)
+            guard !addition.overflow, addition.partialValue <= limits.maximumOutputBytes else {
+                throw GitWorktreeInitializationError.outputLimitExceeded
+            }
+            totalBytes = addition.partialValue
+            result.append(GitWorkspacePrefixControlIdentity(
+                repositoryRelativePath: relativePath,
+                kind: kind,
+                content: identity
+            ))
+        }
+        return result
+    }
+
+    private nonisolated static func canonicalControlIdentityDigest(
+        _ identities: [GitWorkspacePrefixControlIdentity]
+    ) -> String {
+        var data = Data()
+        for identity in identities.sorted(by: { $0.repositoryRelativePath < $1.repositoryRelativePath }) {
+            appendLengthPrefixed(Data(identity.repositoryRelativePath.utf8), to: &data)
+            appendLengthPrefixed(Data(identity.kind.rawValue.utf8), to: &data)
+            appendLengthPrefixed(canonicalContentIdentityData(identity.content), to: &data)
+        }
+        return sha256Hex(data)
+    }
+
+    private nonisolated static func canonicalOptionalContentIdentityData(
+        _ identity: GitWorkspaceAuthorityContentIdentity?
+    ) -> Data {
+        guard let identity else { return Data("unset".utf8) }
+        return canonicalContentIdentityData(identity)
+    }
+
+    private nonisolated static func canonicalContentIdentityData(
+        _ identity: GitWorkspaceAuthorityContentIdentity
+    ) -> Data {
+        var data = Data()
+        appendLengthPrefixed(Data(identity.exists ? "present".utf8 : "missing".utf8), to: &data)
+        appendLengthPrefixed(Data(identity.sha256.utf8), to: &data)
+        appendUInt64(UInt64(clamping: identity.byteCount), to: &data)
+        return data
+    }
+
+    private nonisolated static func boundedRead(_ url: URL, maximumBytes: Int) throws -> Data {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let data = try handle.read(upToCount: maximumBytes + 1) ?? Data()
+        guard data.count <= maximumBytes else {
+            throw GitWorktreeInitializationError.outputLimitExceeded
+        }
+        return data
+    }
+
+    private nonisolated static func appendLengthPrefixed(_ value: Data, to data: inout Data) {
+        appendUInt64(UInt64(clamping: value.count), to: &data)
+        data.append(value)
+    }
+
+    private nonisolated static func appendUInt64(_ value: UInt64, to data: inout Data) {
+        var bigEndian = value.bigEndian
+        withUnsafeBytes(of: &bigEndian) { data.append(contentsOf: $0) }
+    }
+
+    private nonisolated static func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private nonisolated static func gitAdmissionDeadline(
+        after duration: Duration
+    ) -> GitProcessAdmissionDeadline {
+        let components = duration.components
+        let seconds = UInt64(clamping: max(0, components.seconds))
+        let attoseconds = UInt64(clamping: max(0, components.attoseconds))
+        let secondsNanoseconds = seconds.multipliedReportingOverflow(by: 1_000_000_000)
+        let nanoseconds = secondsNanoseconds.overflow
+            ? UInt64.max
+            : secondsNanoseconds.partialValue.addingReportingOverflow(attoseconds / 1_000_000_000).partialValue
+        let now = DispatchTime.now().uptimeNanoseconds
+        let deadline = now.addingReportingOverflow(nanoseconds)
+        return GitProcessAdmissionDeadline(
+            uptimeNanoseconds: deadline.overflow ? UInt64.max : deadline.partialValue
+        )
+    }
+
+    private nonisolated func appendLiteralPrefix(
+        _ prefix: GitRepositoryRelativeRootPrefix,
+        to args: inout [String]
+    ) {
+        guard !prefix.value.isEmpty else { return }
+        args.append("--")
+        args.append(prefix.value)
+    }
+
     func gitBlobObjectFormat(at repositoryRoot: URL) async throws -> GitObjectFormat {
         let (stdout, stderr, exitCode) = try await runGit(
             ["rev-parse", "--show-object-format"],
-            at: repositoryRoot
+            at: repositoryRoot,
+            admissionPriority: .codemapDemand,
+            commandFamily: .codemapAuthority
         )
         guard exitCode == 0 else {
             throw GitBlobIdentityError.unsupportedGit(stderr.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -2303,7 +2955,9 @@ actor GitService {
                 at: layout.workTreeRoot,
                 stdoutByteLimit: Self.gitBlobSizeOutputByteLimit,
                 stderrByteLimit: Self.gitBlobDiagnosticOutputByteLimit,
-                repositoryBinding: .exactObjectRead(layout)
+                repositoryBinding: .exactObjectRead(layout),
+                admissionPriority: .codemapDemand,
+                commandFamily: .codemapAuthority
             )
             guard exitCode == 0 else { throw GitBlobObjectReadError.unavailable }
             let value = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2336,7 +2990,9 @@ actor GitService {
                 at: layout.workTreeRoot,
                 stdoutByteLimit: captureLimit,
                 stderrByteLimit: Self.gitBlobDiagnosticOutputByteLimit,
-                repositoryBinding: .exactObjectRead(layout)
+                repositoryBinding: .exactObjectRead(layout),
+                admissionPriority: .codemapDemand,
+                commandFamily: .codemapAuthority
             )
             guard exitCode == 0 else { throw GitBlobObjectReadError.unavailable }
             return stdout
@@ -2357,7 +3013,9 @@ actor GitService {
         let (stdout, stderr, exitCode) = try await runGit(
             args,
             at: repositoryRoot,
-            env: ["GIT_LITERAL_PATHSPECS": "1"]
+            env: ["GIT_LITERAL_PATHSPECS": "1"],
+            admissionPriority: .codemapDemand,
+            commandFamily: .codemapAuthority
         )
         guard exitCode == 0 else {
             throw GitError(message: "git ls-files for blob identity failed: \(stderr)")
@@ -2404,7 +3062,9 @@ actor GitService {
         let (stdout, stderr, exitCode) = try await runGit(
             args,
             at: repositoryRoot,
-            env: ["GIT_LITERAL_PATHSPECS": "1"]
+            env: ["GIT_LITERAL_PATHSPECS": "1"],
+            admissionPriority: .codemapDemand,
+            commandFamily: .codemapAuthority
         )
         guard exitCode == 0 else {
             throw GitError(message: "git status for blob identity failed: \(stderr)")
@@ -2437,7 +3097,9 @@ actor GitService {
                 at: repositoryRoot,
                 env: ["GIT_LITERAL_PATHSPECS": "1"],
                 stdin: makePathspecStdinData(repositoryRelativePaths),
-                stdoutByteLimit: Self.gitCheckAttrOutputByteLimit
+                stdoutByteLimit: Self.gitCheckAttrOutputByteLimit,
+                admissionPriority: .codemapDemand,
+                commandFamily: .codemapAuthority
             )
         } catch GitProcessCaptureError.stdoutByteLimitExceeded {
             throw GitBlobIdentityError.malformedGitOutput("check-attr output exceeds byte limit")
@@ -2491,11 +3153,23 @@ actor GitService {
     }
 
     func gitBlobCheckoutConfiguration(at repositoryRoot: URL) async throws -> GitBlobCheckoutConfiguration {
-        async let autoCRLFResult = runGit(["config", "--get", "core.autocrlf"], at: repositoryRoot)
-        async let eolResult = runGit(["config", "--get", "core.eol"], at: repositoryRoot)
+        async let autoCRLFResult = runGit(
+            ["config", "--get", "core.autocrlf"],
+            at: repositoryRoot,
+            admissionPriority: .codemapDemand,
+            commandFamily: .codemapAuthority
+        )
+        async let eolResult = runGit(
+            ["config", "--get", "core.eol"],
+            at: repositoryRoot,
+            admissionPriority: .codemapDemand,
+            commandFamily: .codemapAuthority
+        )
         async let filtersResult = runGit(
             ["config", "--null", "--get-regexp", "^filter\\..*\\.(clean|smudge|process|required)$"],
-            at: repositoryRoot
+            at: repositoryRoot,
+            admissionPriority: .codemapDemand,
+            commandFamily: .codemapAuthority
         )
         let (autoCRLF, eol, filters) = try await (autoCRLFResult, eolResult, filtersResult)
         func optionalValue(_ result: (String, String, Int32), name: String) throws -> String? {
@@ -2532,15 +3206,21 @@ actor GitService {
         async let checkout = gitBlobCheckoutConfiguration(at: repositoryRoot)
         async let attributesFile = runGit(
             ["config", "--path", "--get", "core.attributesFile"],
-            at: repositoryRoot
+            at: repositoryRoot,
+            admissionPriority: .codemapDemand,
+            commandFamily: .codemapAuthority
         )
         async let sparseCheckout = runGit(
             ["config", "--bool", "--get", "core.sparseCheckout"],
-            at: repositoryRoot
+            at: repositoryRoot,
+            admissionPriority: .codemapDemand,
+            commandFamily: .codemapAuthority
         )
         async let sparseCone = runGit(
             ["config", "--bool", "--get", "core.sparseCheckoutCone"],
-            at: repositoryRoot
+            at: repositoryRoot,
+            admissionPriority: .codemapDemand,
+            commandFamily: .codemapAuthority
         )
         let (checkoutValue, attributesResult, sparseResult, coneResult) = try await (
             checkout, attributesFile, sparseCheckout, sparseCone
@@ -2867,7 +3547,7 @@ actor GitService {
     nonisolated static func isVerifiedReadOnlyGitOperation(_ args: [String]) -> Bool {
         guard let command = args.first else { return false }
         switch command {
-        case "rev-parse", "status", "ls-files", "check-attr", "diff", "merge-base", "merge-tree",
+        case "rev-parse", "status", "ls-files", "ls-tree", "diff", "diff-tree", "check-attr", "merge-base", "merge-tree",
              "show-ref", "for-each-ref", "log", "rev-list", "show", "blame", "cat-file":
             return true
         case "worktree":
@@ -2886,6 +3566,33 @@ actor GitService {
         }
     }
 
+    private func withWorkspaceAuthorityMutation<T>(
+        at repoURL: URL,
+        kind: GitWorkspaceMutationKind,
+        correlationID: UUID? = nil,
+        operation: () async throws -> T
+    ) async throws -> T {
+        guard let layout = getLayout(for: repoURL) else {
+            return try await operation()
+        }
+        let token = await workspaceStateAuthority.beginMutation(
+            repositoryKey: GitWorkspaceAuthorityRepositoryKey(layout: layout),
+            kind: kind,
+            correlationID: correlationID
+        )
+        do {
+            let value = try await operation()
+            await workspaceStateAuthority.finishMutation(token, outcome: .succeeded)
+            return value
+        } catch is CancellationError {
+            await workspaceStateAuthority.finishMutation(token, outcome: .cancelled)
+            throw CancellationError()
+        } catch {
+            await workspaceStateAuthority.finishMutation(token, outcome: .failed)
+            throw error
+        }
+    }
+
     private func runGit(
         _ args: [String],
         at repoURL: URL,
@@ -2895,7 +3602,11 @@ actor GitService {
         budgetRepoURL: URL? = nil,
         stdoutByteLimit: Int? = nil,
         stderrByteLimit: Int? = nil,
-        repositoryBinding: GitProcessRepositoryBinding = .inferred
+        repositoryBinding: GitProcessRepositoryBinding = .inferred,
+        admissionPriority: GitProcessAdmissionPriority = .userInitiatedAuthority,
+        admissionDeadline: GitProcessAdmissionDeadline? = nil,
+        commandFamily: GitProcessCommandFamily? = nil,
+        commandTimeout: Duration = GitService.gitProcessTimeout
     ) async throws -> (String, String, Int32) {
         let (stdout, stderr, exitCode) = try await runGitData(
             args,
@@ -2906,7 +3617,11 @@ actor GitService {
             budgetRepoURL: budgetRepoURL,
             stdoutByteLimit: stdoutByteLimit,
             stderrByteLimit: stderrByteLimit,
-            repositoryBinding: repositoryBinding
+            repositoryBinding: repositoryBinding,
+            admissionPriority: admissionPriority,
+            admissionDeadline: admissionDeadline,
+            commandFamily: commandFamily,
+            commandTimeout: commandTimeout
         )
         return (
             String(data: stdout, encoding: .utf8) ?? "",
@@ -2924,7 +3639,11 @@ actor GitService {
         budgetRepoURL: URL? = nil,
         stdoutByteLimit: Int? = nil,
         stderrByteLimit: Int? = nil,
-        repositoryBinding: GitProcessRepositoryBinding = .inferred
+        repositoryBinding: GitProcessRepositoryBinding = .inferred,
+        admissionPriority: GitProcessAdmissionPriority = .userInitiatedAuthority,
+        admissionDeadline: GitProcessAdmissionDeadline? = nil,
+        commandFamily: GitProcessCommandFamily? = nil,
+        commandTimeout: Duration = GitService.gitProcessTimeout
     ) async throws -> (Data, Data, Int32) {
         var environment = await processEnvironment()
         environment["GIT_TERMINAL_PROMPT"] = "0"
@@ -2950,6 +3669,12 @@ actor GitService {
                 baseEnvironment: environment,
                 layout: layout
             )
+        case let .exactWorktree(layout):
+            environment.merge(env) { _, new in new }
+            environment = Self.exactWorktreeEnvironment(
+                baseEnvironment: environment,
+                layout: layout
+            )
         }
 
         let budgetURL = budgetRepoURL ?? repoURL
@@ -2959,8 +3684,14 @@ actor GitService {
                 ?? budgetURL.standardizedFileURL.path
         case let .exactObjectRead(layout):
             layout.commonDir.standardizedFileURL.path
+        case let .exactWorktree(layout):
+            layout.commonDir.standardizedFileURL.path
         }
-        let lease = try await processAdmissionController.acquire(repositoryKey: repositoryKey)
+        let lease = try await processAdmissionController.acquire(
+            repositoryKey: repositoryKey,
+            priority: admissionPriority,
+            deadline: admissionDeadline
+        )
         do {
             try Task.checkCancellation()
             let result = try await runAdmittedGitData(
@@ -2971,7 +3702,10 @@ actor GitService {
                 diagnosticRepositoryPath: budgetURL.standardizedFileURL.path,
                 processQueueWaitMicroseconds: lease.queueWaitMicroseconds,
                 stdoutByteLimit: stdoutByteLimit,
-                stderrByteLimit: stderrByteLimit
+                stderrByteLimit: stderrByteLimit,
+                admissionPriority: admissionPriority,
+                commandFamily: commandFamily ?? Self.commandFamily(for: args),
+                commandTimeout: commandTimeout
             )
             await processAdmissionController.release(lease)
             return result
@@ -3012,6 +3746,35 @@ actor GitService {
         return environment
     }
 
+    private nonisolated static func exactWorktreeEnvironment(
+        baseEnvironment: [String: String],
+        layout: GitRepositoryLayout
+    ) -> [String: String] {
+        var environment = baseEnvironment
+        environment["GIT_DIR"] = layout.gitDir.standardizedFileURL.path
+        environment["GIT_COMMON_DIR"] = layout.commonDir.standardizedFileURL.path
+        environment["GIT_WORK_TREE"] = layout.workTreeRoot.standardizedFileURL.path
+        environment["GIT_INDEX_FILE"] = layout.gitDir
+            .appendingPathComponent("index")
+            .standardizedFileURL.path
+        environment["GIT_LITERAL_PATHSPECS"] = "1"
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+        return environment
+    }
+
+    private nonisolated static func commandFamily(for args: [String]) -> GitProcessCommandFamily {
+        guard let command = args.first else { return .repositoryRead }
+        switch command {
+        case "status": return .status
+        case "ls-files": return .indexManifest
+        case "ls-tree": return .treeInventory
+        case "diff-tree": return .treeDelta
+        case "rev-parse": return .treeResolution
+        default:
+            return isVerifiedReadOnlyGitOperation(args) ? .repositoryRead : .mutation
+        }
+    }
+
     private func runAdmittedGitData(
         _ args: [String],
         at repoURL: URL,
@@ -3020,7 +3783,10 @@ actor GitService {
         diagnosticRepositoryPath: String,
         processQueueWaitMicroseconds: Int,
         stdoutByteLimit: Int?,
-        stderrByteLimit: Int?
+        stderrByteLimit: Int?,
+        admissionPriority: GitProcessAdmissionPriority,
+        commandFamily: GitProcessCommandFamily,
+        commandTimeout: Duration
     ) async throws -> (Data, Data, Int32) {
         let process = Process()
         let timeoutController = GitProcessTimeoutController()
@@ -3059,6 +3825,7 @@ actor GitService {
         )
 
         let processMetrics = GitProcessMetricsBox()
+        let commandStartedAt = DispatchTime.now().uptimeNanoseconds
         let outCollector = Task(priority: .userInitiated) { () -> Data in
             var buf = Data()
             for await chunk in outStream {
@@ -3127,6 +3894,25 @@ actor GitService {
                             stdoutData.count + stderrData.count
                         )
 
+                        let commandFinishedAt = DispatchTime.now().uptimeNanoseconds
+                        WorktreeStartupInstrumentation.recordGitCommand(
+                            family: commandFamily,
+                            priority: admissionPriority,
+                            queueWaitMicroseconds: processQueueWaitMicroseconds,
+                            durationMicroseconds: Int(
+                                clamping: commandFinishedAt >= commandStartedAt
+                                    ? (commandFinishedAt - commandStartedAt) / 1000
+                                    : 0
+                            ),
+                            outputByteCount: stdoutData.count + stderrData.count,
+                            cancelled: lifecycleController.cancellationErrorIfRequested() != nil
+                        )
+
+                        if timeoutController.didTimeOut {
+                            continuation.resume(throwing: GitProcessCaptureError.timedOut)
+                            return
+                        }
+
                         if outDrain.didExceedByteLimit {
                             continuation.resume(throwing: GitProcessCaptureError.stdoutByteLimitExceeded)
                             return
@@ -3154,7 +3940,7 @@ actor GitService {
                         timeoutController.schedule(
                             process: process,
                             processIdentifier: processIdentifier,
-                            timeout: Self.gitProcessTimeout,
+                            timeout: commandTimeout,
                             terminationGrace: processTerminationGrace
                         )
                         if !lifecycleController.shouldKeepNormalTimeout() {
@@ -3194,6 +3980,19 @@ actor GitService {
                         processQueueWaitMicroseconds,
                         processMetrics.spawnMicroseconds,
                         0
+                    )
+                    let commandFinishedAt = DispatchTime.now().uptimeNanoseconds
+                    WorktreeStartupInstrumentation.recordGitCommand(
+                        family: commandFamily,
+                        priority: admissionPriority,
+                        queueWaitMicroseconds: processQueueWaitMicroseconds,
+                        durationMicroseconds: Int(
+                            clamping: commandFinishedAt >= commandStartedAt
+                                ? (commandFinishedAt - commandStartedAt) / 1000
+                                : 0
+                        ),
+                        outputByteCount: 0,
+                        cancelled: lifecycleController.cancellationErrorIfRequested() != nil
                     )
                     // Ensure handlers and collectors are released when launch fails.
                     timeoutController.cancel()
@@ -3855,6 +4654,13 @@ private extension GitService.WorkingStatus {
 private final class GitProcessTimeoutController: @unchecked Sendable {
     private let lock = NSLock()
     private var task: Task<Void, Never>?
+    private var timedOut = false
+
+    var didTimeOut: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return timedOut
+    }
 
     func schedule(
         process: Process,
@@ -3865,10 +4671,12 @@ private final class GitProcessTimeoutController: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         task?.cancel()
+        timedOut = false
         task = Task {
             do {
                 try await Task.sleep(for: timeout)
                 guard !Task.isCancelled, process.isRunning else { return }
+                self.markTimedOut()
                 process.terminate()
                 try await Task.sleep(for: terminationGrace)
                 guard !Task.isCancelled, process.isRunning else { return }
@@ -3884,6 +4692,12 @@ private final class GitProcessTimeoutController: @unchecked Sendable {
         defer { lock.unlock() }
         task?.cancel()
         task = nil
+    }
+
+    private func markTimedOut() {
+        lock.lock()
+        timedOut = true
+        lock.unlock()
     }
 }
 

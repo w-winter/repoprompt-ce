@@ -125,12 +125,16 @@ struct AgentMCPStartWorktreeCoordinator {
     func prepare(
         request: Request,
         target: AgentModeViewModel.MCPSessionTarget,
-        targetWindow: WindowState
+        targetWindow: WindowState,
+        startupContext: WorktreeStartupContext? = nil
     ) async throws {
         guard let targetSessionID = target.sessionID else {
             throw MCPError.internalError("\(operationName) target did not resolve a session ID for worktree binding.")
         }
         let agentModeVM = targetWindow.agentModeViewModel
+        if let startupContext {
+            WorktreeStartupInstrumentation.record(.worktreePreparationStarted, context: startupContext)
+        }
         try Task.checkCancellation()
         if request.hasExplicitWorktreeArgs {
             do {
@@ -176,7 +180,8 @@ struct AgentMCPStartWorktreeCoordinator {
                 _ = try await agentModeVM.transitionWorktreeBindings(
                     desiredBindings,
                     forSessionID: targetSessionID,
-                    intent: .initialSend
+                    intent: .initialSend,
+                    startupContext: startupContext
                 )
             } catch {
                 throw preparationError(error)

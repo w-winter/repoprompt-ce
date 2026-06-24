@@ -5519,7 +5519,8 @@ final class AgentModeViewModel: ObservableObject {
     func transitionWorktreeBindings(
         _ desiredBindings: [AgentSessionWorktreeBinding],
         forSessionID sessionID: UUID,
-        intent: WorktreeBindingTransitionIntent
+        intent: WorktreeBindingTransitionIntent,
+        startupContext: WorktreeStartupContext? = nil
     ) async throws -> [AgentSessionWorktreeBinding] {
         guard let session = try authoritativeLiveSession(for: sessionID) else {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
@@ -5529,6 +5530,9 @@ final class AgentModeViewModel: ObservableObject {
         }
         session.worktreeBindingTransitionInProgress = true
         defer { session.worktreeBindingTransitionInProgress = false }
+        if let startupContext {
+            WorktreeStartupInstrumentation.record(.bindingTransitionStarted, context: startupContext)
+        }
         let previousBindings = session.worktreeBindings
         let previousDestination = executionDestinationIdentity(in: previousBindings)
         let nextDestination = executionDestinationIdentity(in: desiredBindings)
@@ -5555,7 +5559,11 @@ final class AgentModeViewModel: ObservableObject {
         let preparation: WorkspaceRootBindingProjectionPreparation?
         if let materializer {
             do {
-                preparation = try await materializer.prepare(sessionID: sessionID, bindings: desiredBindings)
+                preparation = try await materializer.prepare(
+                    sessionID: sessionID,
+                    bindings: desiredBindings,
+                    startupContext: startupContext
+                )
             } catch {
                 throw ExecutionLocationTransitionError.unavailable(error.localizedDescription)
             }

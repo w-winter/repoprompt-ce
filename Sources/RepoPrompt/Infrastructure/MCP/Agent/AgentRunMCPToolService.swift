@@ -267,6 +267,8 @@ struct AgentRunMCPToolService {
         let message = try resolveMessage(args["message"], name: "message")
         let workflow = try resolveWorkflow(args: args)
         let worktreeStartRequest = try startWorktreeCoordinator.parseRequest(args: args)
+        let worktreeStartupContext = WorktreeStartupContext()
+        WorktreeStartupInstrumentation.record(.agentRunStarted, context: worktreeStartupContext)
         // start always creates a new session — reject explicit session_id
         if normalizedString(args["session_id"]) != nil {
             throw MCPError.invalidParams("agent_run.start always creates a new session. Use agent_run op=steer with session_id to continue an existing session.")
@@ -360,9 +362,15 @@ struct AgentRunMCPToolService {
             try await startWorktreeCoordinator.prepare(
                 request: worktreeStartRequest,
                 target: target,
-                targetWindow: targetWindow
+                targetWindow: targetWindow,
+                startupContext: worktreeStartupContext
             )
         } catch {
+            WorktreeStartupInstrumentation.record(
+                .failed,
+                context: worktreeStartupContext,
+                fallback: error is CancellationError ? .cancellation : nil
+            )
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw error
         }
@@ -380,6 +388,7 @@ struct AgentRunMCPToolService {
         #endif
         let outcome: AgentExternalMCPRunStarter.StartOutcome
         do {
+            WorktreeStartupInstrumentation.record(.providerStart, context: worktreeStartupContext)
             outcome = try await startRun(
                 target,
                 message,

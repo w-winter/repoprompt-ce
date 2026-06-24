@@ -348,6 +348,7 @@ struct WorkspaceRootBindingProjectionPreparation {
     let bindings: [AgentSessionWorktreeBinding]
     let visibleRoots: [WorkspaceRootRef]
     let ownership: WorkspaceSessionWorktreeOwnershipPreparation
+    let startupContext: WorktreeStartupContext?
 }
 
 struct WorkspaceRootBindingProjectionMaterializer {
@@ -355,31 +356,36 @@ struct WorkspaceRootBindingProjectionMaterializer {
 
     func prepare(
         sessionID: UUID,
-        bindings: [AgentSessionWorktreeBinding]
+        bindings: [AgentSessionWorktreeBinding],
+        startupContext: WorktreeStartupContext? = nil
     ) async throws -> WorkspaceRootBindingProjectionPreparation {
         let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
         return try await prepare(
             sessionID: sessionID,
             bindings: bindings,
-            visibleRoots: visibleRoots
+            visibleRoots: visibleRoots,
+            startupContext: startupContext
         )
     }
 
     private func prepare(
         sessionID: UUID,
         bindings: [AgentSessionWorktreeBinding],
-        visibleRoots: [WorkspaceRootRef]
+        visibleRoots: [WorkspaceRootRef],
+        startupContext: WorktreeStartupContext?
     ) async throws -> WorkspaceRootBindingProjectionPreparation {
         let ownership = try await store.prepareSessionWorktreeOwnership(
             ownerID: sessionID,
             bindingFingerprint: AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(bindings),
-            physicalRootPaths: bindings.map(\.worktreeRootPath)
+            physicalRootPaths: bindings.map(\.worktreeRootPath),
+            startupContext: startupContext
         )
         return WorkspaceRootBindingProjectionPreparation(
             sessionID: sessionID,
             bindings: bindings,
             visibleRoots: visibleRoots,
-            ownership: ownership
+            ownership: ownership,
+            startupContext: startupContext
         )
     }
 
@@ -387,6 +393,9 @@ struct WorkspaceRootBindingProjectionMaterializer {
         _ preparation: WorkspaceRootBindingProjectionPreparation
     ) async throws -> WorkspaceRootBindingProjection? {
         let records = try await store.commitSessionWorktreeOwnership(preparation.ownership)
+        if let startupContext = preparation.startupContext {
+            WorktreeStartupInstrumentation.record(.rootReady, context: startupContext)
+        }
         guard !preparation.bindings.isEmpty else { return nil }
 
         let recordsByPath = Dictionary(uniqueKeysWithValues: records.map {
@@ -462,7 +471,8 @@ struct WorkspaceRootBindingProjectionMaterializer {
             let preparation = try await prepare(
                 sessionID: sessionID,
                 bindings: bindings,
-                visibleRoots: visibleRoots
+                visibleRoots: visibleRoots,
+                startupContext: nil
             )
             #if DEBUG
                 prepareNanoseconds = WorkspaceFileSearchDebugTiming.elapsed(
