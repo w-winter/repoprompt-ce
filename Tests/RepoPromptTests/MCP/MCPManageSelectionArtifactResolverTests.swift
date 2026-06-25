@@ -75,8 +75,11 @@ final class MCPManageSelectionArtifactResolverTests: XCTestCase {
         )
         XCTAssertEqual(
             removal.absolutePaths,
-            [patch.absolutePath, fixture.published.map.absolutePath]
+            [patch.absolutePath]
         )
+        XCTAssertTrue(removal.invalidDiagnostics.contains {
+            $0.contains("alias is not selected")
+        })
         XCTAssertNil(removal.fence?.grantSnapshot)
 
         let siblingAlias = patchAlias.replacingOccurrences(

@@ -1845,14 +1845,12 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
                 "Sources/Second.swift": "struct Second {}\n"
             ]
         )
-        let writeGate = EngineBlockingGate()
+        let writerGate = EngineAsyncGate()
         let runtime = try CodeMapArtifactRuntime(
-            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
-            manifestStoreHooks: CodeMapRootManifestStoreHooks(
-                afterWriteShardAdmission: { writeGate.enterAndWait() }
-            )
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
         )
         let service = capabilityService()
+        let hookEvents = EngineHookEvents()
         let firstEpoch = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
         let secondEpoch = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
         let firstFileIDs = EngineFileIDs()
@@ -1903,6 +1901,13 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             capabilityService: service,
             sourceReader: reader,
             catalogClient: catalog,
+            hooks: WorkspaceCodemapBindingEngineHooks(
+                event: { hookEvents.record($0) },
+                afterManifestStoreWriteBeforeCompletion: { rootEpoch in
+                    guard rootEpoch == firstEpoch else { return }
+                    await writerGate.enterAndWait()
+                }
+            ),
             accessEpochSeconds: { 42 }
         )
         addTeardownBlock { await engine.shutdown() }
@@ -1953,20 +1958,42 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
                 path: "Sources/First.swift"
             ))
         }
-        XCTAssertTrue(writeGate.waitUntilEntered())
+        XCTAssertTrue(writerGate.waitUntilEntered())
+        defer { writerGate.release() }
         await engine.unloadRoot(rootEpoch: firstEpoch)
+        guard case .cancelled = await first.value else {
+            return XCTFail("Expected unloaded predecessor demand to cancel.")
+        }
+        let secondFinished = EngineCompletionFlag()
         let second = Task {
-            await engine.demand(demand(
+            let result = await engine.demand(demand(
                 epoch: secondEpoch,
                 fileIDs: secondFileIDs,
                 path: "Sources/Second.swift"
             ))
+            secondFinished.finish()
+            return result
         }
-        writeGate.release()
+        XCTAssertTrue(hookEvents.wait(
+            kind: .manifestRevisionQueued,
+            rootEpoch: secondEpoch,
+            numericValue: 1
+        ))
+        XCTAssertFalse(secondFinished.waitUntilFinished(timeout: 0))
+        let overlapEvents = hookEvents.snapshot()
+        let firstQueuedIndex = try XCTUnwrap(overlapEvents.firstIndex {
+            $0.kind == .manifestRevisionQueued && $0.rootEpoch == firstEpoch
+        })
+        let unloadIndex = try XCTUnwrap(overlapEvents.firstIndex {
+            $0.kind == .rootUnload && $0.rootEpoch == firstEpoch
+        })
+        let secondQueuedIndex = try XCTUnwrap(overlapEvents.firstIndex {
+            $0.kind == .manifestRevisionQueued && $0.rootEpoch == secondEpoch
+        })
+        XCTAssertLessThan(firstQueuedIndex, unloadIndex)
+        XCTAssertLessThan(unloadIndex, secondQueuedIndex)
+        writerGate.release()
 
-        guard case .cancelled = await first.value else {
-            return XCTFail("Expected unloaded predecessor demand to cancel.")
-        }
         guard case .ready = await second.value else {
             return XCTFail("Expected same-namespace successor demand to complete.")
         }
@@ -2959,6 +2986,52 @@ private final class EngineBlockingGate: @unchecked Sendable {
     }
 }
 
+private final class EngineAsyncGate: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var entered = false
+    private var released = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func enterAndWait() async {
+        await withCheckedContinuation { continuation in
+            register(continuation)
+        }
+    }
+
+    private func register(_ continuation: CheckedContinuation<Void, Never>) {
+        condition.lock()
+        entered = true
+        condition.broadcast()
+        if released {
+            condition.unlock()
+            continuation.resume()
+        } else {
+            self.continuation = continuation
+            condition.unlock()
+        }
+    }
+
+    func waitUntilEntered(timeout: TimeInterval = 10) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        let deadline = Date().addingTimeInterval(timeout)
+        while !entered {
+            guard condition.wait(until: deadline) else { return false }
+        }
+        return true
+    }
+
+    func release() {
+        condition.lock()
+        released = true
+        let continuation = continuation
+        self.continuation = nil
+        condition.broadcast()
+        condition.unlock()
+        continuation?.resume()
+    }
+}
+
 private enum EngineBulkCancellationOperation: CaseIterable {
     case pathInvalidation
     case authorityInvalidation
@@ -3065,6 +3138,12 @@ private final class EngineHookEvents: @unchecked Sendable {
         return events.filter { $0.kind == kind }
     }
 
+    func snapshot() -> [WorkspaceCodemapBindingEngineHookEvent] {
+        condition.lock()
+        defer { condition.unlock() }
+        return events
+    }
+
     func wait(
         kind: WorkspaceCodemapBindingEngineHookKind,
         numericValue: UInt64,
@@ -3074,6 +3153,23 @@ private final class EngineHookEvents: @unchecked Sendable {
         defer { condition.unlock() }
         let deadline = Date().addingTimeInterval(timeout)
         while !events.contains(where: { $0.kind == kind && $0.numericValue == numericValue }) {
+            guard condition.wait(until: deadline) else { return false }
+        }
+        return true
+    }
+
+    func wait(
+        kind: WorkspaceCodemapBindingEngineHookKind,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        numericValue: UInt64,
+        timeout: TimeInterval = 10
+    ) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        let deadline = Date().addingTimeInterval(timeout)
+        while !events.contains(where: {
+            $0.kind == kind && $0.rootEpoch == rootEpoch && $0.numericValue == numericValue
+        }) {
             guard condition.wait(until: deadline) else { return false }
         }
         return true

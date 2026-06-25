@@ -2750,6 +2750,7 @@ actor WorkspaceCodemapBindingEngine {
                     upserts: upserts,
                     removals: removals
                 )
+                await hooks.afterManifestStoreWriteBeforeCompletion(scope.rootEpoch)
                 guard var currentWriter = manifestWriters[namespace],
                       currentWriter.writerID == writerID
                 else { return }

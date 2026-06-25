@@ -247,7 +247,8 @@ extension MCPServerViewModel {
             rootScope: WorkspaceLookupRootScope = .allLoaded,
             contentPolicy: PromptContextAccountingContentPolicy = .loadContent,
             lookupContext: WorkspaceLookupContext? = nil,
-            codemapPresentation: WorkspaceCodemapOperationPresentation? = nil
+            codemapPresentation: WorkspaceCodemapOperationPresentation? = nil,
+            issuePathDisplay: FilePathDisplay = .relative
         ) async -> SelectionCollections {
             do {
                 return try await withCollections(
@@ -256,7 +257,8 @@ extension MCPServerViewModel {
                     rootScope: rootScope,
                     contentPolicy: contentPolicy,
                     lookupContext: lookupContext,
-                    codemapPresentation: codemapPresentation
+                    codemapPresentation: codemapPresentation,
+                    issuePathDisplay: issuePathDisplay
                 ) { $0 }
             } catch {
                 return await .empty(codeMapUsage: source.currentCodeMapUsage())
@@ -270,6 +272,7 @@ extension MCPServerViewModel {
             contentPolicy: PromptContextAccountingContentPolicy = .loadContent,
             lookupContext: WorkspaceLookupContext? = nil,
             codemapPresentation: WorkspaceCodemapOperationPresentation? = nil,
+            issuePathDisplay: FilePathDisplay = .relative,
             operation: (SelectionCollections) async throws -> Value
         ) async throws -> Value {
             let selection = await source.resolvedSelection()
@@ -302,7 +305,8 @@ extension MCPServerViewModel {
                         path,
                         roots: roots,
                         rootDisplayNamesByRootID: rootDisplayNames,
-                        lookupContext: effectiveLookupContext
+                        lookupContext: effectiveLookupContext,
+                        display: issuePathDisplay
                     )
                 }.sorted(by: utf8Precedes)
                 let collections = makeCollections(
@@ -371,24 +375,32 @@ extension MCPServerViewModel {
             )
         }
 
-        private static func logicalIssuePath(
+        static func logicalIssuePath(
             _ path: String,
             roots: [WorkspaceRootRef],
             rootDisplayNamesByRootID: [UUID: String],
-            lookupContext: WorkspaceLookupContext
+            lookupContext: WorkspaceLookupContext,
+            display: FilePathDisplay
         ) -> String {
+            guard path.hasPrefix("/") else { return path }
+            let absolute = StandardizedPath.absolute(path)
+            let authorizingRoots = roots.filter {
+                absolute == $0.standardizedFullPath || absolute.hasPrefix($0.standardizedFullPath + "/")
+            }
+            guard authorizingRoots.count == 1, let authorizedRoot = authorizingRoots.first else {
+                return "unmapped:\(URL(fileURLWithPath: path).lastPathComponent)"
+            }
             if let projected = lookupContext.bindingProjection?.projectedLogicalDisplayPath(
-                forPhysicalPath: path,
-                display: .relative
+                forPhysicalPath: absolute,
+                display: display
             ) {
                 return projected
             }
-            guard path.hasPrefix("/") else { return path }
-            let absolute = StandardizedPath.absolute(path)
-            if let root = roots.first(where: {
-                absolute == $0.standardizedFullPath || absolute.hasPrefix($0.standardizedFullPath + "/")
-            }), let label = rootDisplayNamesByRootID[root.id] {
-                let relative = String(absolute.dropFirst(root.standardizedFullPath.count))
+            if display == .full {
+                return absolute
+            }
+            if let label = rootDisplayNamesByRootID[authorizedRoot.id] {
+                let relative = String(absolute.dropFirst(authorizedRoot.standardizedFullPath.count))
                     .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
                 return relative.isEmpty ? label : "\(label)/\(relative)"
             }

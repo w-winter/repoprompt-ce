@@ -300,9 +300,14 @@ struct WorkspaceCodemapBindingEngineHookEvent {
 
 struct WorkspaceCodemapBindingEngineHooks {
     let event: @Sendable (WorkspaceCodemapBindingEngineHookEvent) -> Void
+    let afterManifestStoreWriteBeforeCompletion: @Sendable (WorkspaceCodemapRootEpoch) async -> Void
 
-    init(event: @escaping @Sendable (WorkspaceCodemapBindingEngineHookEvent) -> Void = { _ in }) {
+    init(
+        event: @escaping @Sendable (WorkspaceCodemapBindingEngineHookEvent) -> Void = { _ in },
+        afterManifestStoreWriteBeforeCompletion: @escaping @Sendable (WorkspaceCodemapRootEpoch) async -> Void = { _ in }
+    ) {
         self.event = event
+        self.afterManifestStoreWriteBeforeCompletion = afterManifestStoreWriteBeforeCompletion
     }
 
     static let none = WorkspaceCodemapBindingEngineHooks()

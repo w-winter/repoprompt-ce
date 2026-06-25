@@ -462,7 +462,8 @@ extension MCPServerViewModel {
                 rootScope: lookupContext.rootScope.excludingWorkspaceGitData,
                 bindingProjection: lookupContext.bindingProjection
             ),
-            codemapPresentation: codemapPresentationOverride
+            codemapPresentation: codemapPresentationOverride,
+            issuePathDisplay: display
         )
         let collections = overlaySelectedGitArtifacts(
             artifactAuthorization,
@@ -659,7 +660,10 @@ extension MCPServerViewModel {
         resolvedContext: ResolvedTabContextSnapshot,
         lookupContext: WorkspaceLookupContext
     ) async -> ToolResultDTOs.SelectionReply {
-        let context = await stabilizedVirtualContext(for: resolvedContext.snapshot)
+        var context = resolvedContext.snapshot
+        if !resolvedContext.usesActiveTabCompatibility {
+            context = await stabilizedVirtualContext(for: context)
+        }
         return await buildTabSelectionReply(
             from: context.selection,
             includeBlocks: includeBlocks,
@@ -667,7 +671,7 @@ extension MCPServerViewModel {
             extraInvalid: extraInvalid,
             viewMode: viewMode,
             codeMapUsageOverride: .auto,
-            virtualContext: context,
+            virtualContext: resolvedContext.usesActiveTabCompatibility ? nil : context,
             lookupContextOverride: lookupContext,
             ingressPolicy: .alreadyAwaited
         )

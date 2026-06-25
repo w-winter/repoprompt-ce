@@ -4,6 +4,52 @@ import XCTest
 
 @MainActor
 final class MCPSelectionReplyFreshnessTests: XCTestCase {
+    func testFullIssuePathReturnsAbsoluteForExactlyOneAuthorizedRoot() {
+        let root = WorkspaceRootRef(id: UUID(), name: "Project", fullPath: "/workspace/project")
+        let path = "/workspace/project/Sources/Missing.swift"
+
+        XCTAssertEqual(
+            MCPServerViewModel.SelectionReplyAssembler.logicalIssuePath(
+                path,
+                roots: [root],
+                rootDisplayNamesByRootID: [root.id: root.name],
+                lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil),
+                display: .full
+            ),
+            path
+        )
+    }
+
+    func testFullIssuePathRedactsOutOfScopeAndCrossRootStaleSelections() {
+        let authorizedRoot = WorkspaceRootRef(id: UUID(), name: "Project", fullPath: "/workspace/project")
+        let nestedRoot = WorkspaceRootRef(id: UUID(), name: "Nested", fullPath: "/workspace/project/Packages/Nested")
+        let labels = [authorizedRoot.id: authorizedRoot.name, nestedRoot.id: nestedRoot.name]
+        let lookupContext = WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil)
+        let scenarios: [(path: String, roots: [WorkspaceRootRef], expected: String)] = [
+            ("/private/outside/Secret.swift", [authorizedRoot], "unmapped:Secret.swift"),
+            ("/workspace/other/Stale.swift", [authorizedRoot], "unmapped:Stale.swift"),
+            (
+                "/workspace/project/Packages/Nested/Ambiguous.swift",
+                [authorizedRoot, nestedRoot],
+                "unmapped:Ambiguous.swift"
+            )
+        ]
+
+        for scenario in scenarios {
+            XCTAssertEqual(
+                MCPServerViewModel.SelectionReplyAssembler.logicalIssuePath(
+                    scenario.path,
+                    roots: scenario.roots,
+                    rootDisplayNamesByRootID: labels,
+                    lookupContext: lookupContext,
+                    display: .full
+                ),
+                scenario.expected,
+                scenario.path
+            )
+        }
+    }
+
     func testMutationReplyRereadsLiveTabSelectionAfterProviderStabilization() async throws {
         let root = try makeTemporaryRoot(name: "MutationReply")
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }

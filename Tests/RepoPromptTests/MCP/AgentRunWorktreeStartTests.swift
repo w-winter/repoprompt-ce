@@ -2019,8 +2019,18 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let instrumentation = WorktreeStartupInstrumentation.snapshot()
         XCTAssertEqual(instrumentation.fallbackCounts[.noReceipt] ?? 0, 0)
         XCTAssertEqual(instrumentation.routeCounts[.diffSeedObservation], 1)
-        XCTAssertEqual(instrumentation.shadow.inventoryComparisons, 1)
-        XCTAssertEqual(instrumentation.shadow.inventoryMatches, 1)
+        #if DEBUG
+            let decisions = WorktreeStartupInstrumentation.receiptDecisions(correlationID: correlationID)
+            XCTAssertEqual(decisions.count, 1)
+            let consumption = try XCTUnwrap(decisions.first?.consumption)
+            XCTAssertEqual(consumption.ownerGenerationMatch, .match)
+            XCTAssertEqual(consumption.hintSessionMatch, .match)
+            XCTAssertEqual(consumption.hintCorrelationMatch, .match)
+            XCTAssertEqual(consumption.hintOwnerMatch, .match)
+            XCTAssertEqual(consumption.ownershipReused, false)
+            XCTAssertNotEqual(consumption.initialHintObservation, .fallback(.noReceipt))
+            XCTAssertNotEqual(consumption.finalObservation, .fallback(.noReceipt))
+        #endif
         XCTAssertTrue(instrumentation.events.allSatisfy {
             $0.agentSessionID == sessionID && $0.correlationID == correlationID
         })

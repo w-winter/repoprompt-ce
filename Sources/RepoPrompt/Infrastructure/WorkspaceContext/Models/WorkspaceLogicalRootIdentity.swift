@@ -78,11 +78,18 @@ extension WorkspaceLookupContext {
         rootDisplayNamesByRootID: [UUID: String],
         display: FilePathDisplay
     ) -> String? {
-        guard roots.contains(where: { $0.id == file.rootID }),
-              let rootLabel = rootDisplayNamesByRootID[file.rootID]
+        guard roots.contains(where: { $0.id == file.rootID }) else { return nil }
+        if display == .full {
+            return bindingProjection?.projectedLogicalDisplayPath(
+                forPhysicalPath: file.standardizedFullPath,
+                display: .full
+            ) ?? file.standardizedFullPath
+        }
+        guard
+            let rootLabel = rootDisplayNamesByRootID[file.rootID]
         else { return nil }
         let relativePath = file.standardizedRelativePath
-        if display == .relative, roots.count == 1 {
+        if roots.count == 1 {
             return relativePath
         }
         return relativePath.isEmpty ? rootLabel : "\(rootLabel)/\(relativePath)"
