@@ -2,6 +2,11 @@ import CryptoKit
 import Darwin
 import Foundation
 
+enum GitPrefixControlEvidenceCacheMode {
+    case automatic
+    case bypassReadAndAdmission
+}
+
 struct GitLoadedRootTreeInventorySpool: @unchecked Sendable {
     static let commandFormat = "git-ls-tree-recursive-full-tree-z-v1"
 
@@ -14,6 +19,20 @@ struct GitLoadedRootTreeInventorySpool: @unchecked Sendable {
 protocol GitPrefixControlCandidateSource: AnyObject {
     func nextCandidate() throws -> URL?
     func skipDescendants()
+    var currentCandidateKind: GitPrefixControlCandidateKind { get }
+}
+
+enum GitPrefixControlCandidateKind {
+    case directory
+    case regularFile
+    case symbolicLink
+    case other
+}
+
+extension GitPrefixControlCandidateSource {
+    var currentCandidateKind: GitPrefixControlCandidateKind {
+        .other
+    }
 }
 
 private final class GitFileManagerPrefixControlCandidateSource: GitPrefixControlCandidateSource {
@@ -23,6 +42,7 @@ private final class GitFileManagerPrefixControlCandidateSource: GitPrefixControl
 
     private let enumerator: FileManager.DirectoryEnumerator
     private let errorBox: ErrorBox
+    private(set) var currentCandidateKind: GitPrefixControlCandidateKind = .other
 
     init?(root: URL) {
         let errorBox = ErrorBox()
@@ -40,7 +60,15 @@ private final class GitFileManagerPrefixControlCandidateSource: GitPrefixControl
     }
 
     func nextCandidate() throws -> URL? {
-        if let url = enumerator.nextObject() as? URL { return url }
+        if let url = enumerator.nextObject() as? URL {
+            currentCandidateKind = switch enumerator.fileAttributes?[.type] as? FileAttributeType {
+            case .typeDirectory: .directory
+            case .typeRegular: .regularFile
+            case .typeSymbolicLink: .symbolicLink
+            default: .other
+            }
+            return url
+        }
         if let error = errorBox.error { throw error }
         return nil
     }
@@ -4259,8 +4287,14 @@ actor GitService {
     func authorityMetadata(
         in layout: GitRepositoryLayout,
         prefix: GitRepositoryRelativeRootPrefix,
-        priority: GitProcessAdmissionPriority = .rootBootstrap
+        priority: GitProcessAdmissionPriority = .rootBootstrap,
+        cacheMode: GitPrefixControlEvidenceCacheMode = .automatic
     ) async throws -> GitWorkspaceAuthorityMetadata {
+        #if DEBUG
+            let authorityMetadataSpan = WorktreeStartupPreparationInstrumentation.currentRecorder?
+                .begin(.authorityMetadataGit)
+            defer { authorityMetadataSpan?.end() }
+        #endif
         let format = try await boundedObjectFormat(in: layout, priority: priority, timeout: .seconds(5))
         let headCommit = try await boundedObjectID(
             "HEAD^{commit}",
@@ -4320,10 +4354,16 @@ actor GitService {
         let resolvedAttributesFileIdentity = try resolvedAttributesFileURL.map {
             try Self.boundedAuthorityContentIdentity(at: $0)
         }
-        let prefixControlEvidence = try await Self.streamedPrefixControlEvidence(
-            layout: layout,
-            prefix: prefix
-        )
+        let prefixControlEvidence = try await workspaceStateAuthority.prefixControlEvidence(
+            in: layout,
+            prefix: prefix,
+            cacheMode: cacheMode
+        ) {
+            try await Self.streamedPrefixControlEvidence(
+                layout: layout,
+                prefix: prefix
+            )
+        }
         let indexDigest = try Self.boundedAuthorityFileDigest([
             ("index", layout.gitDir.appendingPathComponent("index"))
         ], maximumBytesPerFile: 32 * 1024 * 1024)
@@ -4386,9 +4426,15 @@ actor GitService {
     func workspaceAuthoritySnapshot(
         in layout: GitRepositoryLayout,
         prefix: GitRepositoryRelativeRootPrefix,
-        priority: GitProcessAdmissionPriority = .rootBootstrap
+        priority: GitProcessAdmissionPriority = .rootBootstrap,
+        cacheMode: GitPrefixControlEvidenceCacheMode = .automatic
     ) async throws -> (metadata: GitWorkspaceAuthorityMetadata, snapshot: GitWorkspaceAuthoritySnapshot) {
-        let metadata = try await authorityMetadata(in: layout, prefix: prefix, priority: priority)
+        let metadata = try await authorityMetadata(
+            in: layout,
+            prefix: prefix,
+            priority: priority,
+            cacheMode: cacheMode
+        )
         return try (metadata, makeWorkspaceAuthoritySnapshot(metadata: metadata, layout: layout))
     }
 
@@ -4619,6 +4665,25 @@ actor GitService {
         candidateSource suppliedSource: GitPrefixControlCandidateSource? = nil,
         resourcePolicy: GitPrefixControlEvidenceResourcePolicy = .default
     ) async throws -> GitPrefixControlEvidenceManifestFooter {
+        #if DEBUG
+            let recorder = WorktreeStartupPreparationInstrumentation.currentRecorder
+            let scanSpan = recorder?.begin(.prefixControlScan)
+            recorder?.increment(.prefixScanCount)
+            defer { scanSpan?.end() }
+            var unpublishedCandidateCount: UInt64 = 0
+            var unpublishedDirectoryCount: UInt64 = 0
+            var unpublishedPrunedDirectoryCount: UInt64 = 0
+            var controlRecordCount: UInt64 = 0
+            func publishPrefixControlProgress(force: Bool = false) {
+                guard force || unpublishedCandidateCount >= 4096 else { return }
+                recorder?.increment(.enumeratedCandidates, by: unpublishedCandidateCount)
+                recorder?.increment(.enumeratedDirectories, by: unpublishedDirectoryCount)
+                recorder?.increment(.explicitlyPrunedDirectories, by: unpublishedPrunedDirectoryCount)
+                unpublishedCandidateCount = 0
+                unpublishedDirectoryCount = 0
+                unpublishedPrunedDirectoryCount = 0
+            }
+        #endif
         let controlKinds: [String: GitWorkspacePrefixControlKind] = [
             ".gitignore": .gitignore,
             ".repo_ignore": .repoIgnore,
@@ -4660,6 +4725,9 @@ actor GitService {
                 kind: kind,
                 content: content
             ))
+            #if DEBUG
+                controlRecordCount &+= 1
+            #endif
         }
 
         do {
@@ -4691,6 +4759,12 @@ actor GitService {
             }
             while let url = try source.nextCandidate() {
                 try Task.checkCancellation()
+                #if DEBUG
+                    unpublishedCandidateCount &+= 1
+                    if source.currentCandidateKind == .directory {
+                        unpublishedDirectoryCount &+= 1
+                    }
+                #endif
                 let standardized = url.standardizedFileURL
                 let rootPath = root.path
                 guard standardized.path.hasPrefix(rootPath + "/") else {
@@ -4701,9 +4775,18 @@ actor GitService {
                 if relativeComponents.contains(".git") {
                     if relativeComponents.last == ".git" {
                         source.skipDescendants()
+                        #if DEBUG
+                            unpublishedPrunedDirectoryCount &+= 1
+                        #endif
                     }
+                    #if DEBUG
+                        publishPrefixControlProgress()
+                    #endif
                     continue
                 }
+                #if DEBUG
+                    publishPrefixControlProgress()
+                #endif
                 guard let kind = controlKinds[url.lastPathComponent] else { continue }
                 try await appendCandidate(url, kind: kind)
             }
@@ -4715,8 +4798,21 @@ actor GitService {
             guard await reader.validationState == .verified else {
                 throw GitPrefixControlEvidenceManifestError.corrupt("prefix-control reader did not verify")
             }
+            #if DEBUG
+                publishPrefixControlProgress(force: true)
+                recorder?.increment(.controlRecordCount, by: controlRecordCount)
+            #endif
             return lease.footer
         } catch {
+            #if DEBUG
+                publishPrefixControlProgress(force: true)
+                recorder?.increment(.controlRecordCount, by: controlRecordCount)
+                if error is CancellationError {
+                    recorder?.recordReason(.cancellation)
+                } else {
+                    recorder?.recordReason(.failure)
+                }
+            #endif
             await writer.cancel()
             throw error
         }

@@ -5472,7 +5472,8 @@ actor WorkspaceFileContextStore {
 
     func admitReusableSnapshotForLoadedRoot(
         rootID: UUID,
-        expectedStandardizedPath: String
+        expectedStandardizedPath: String,
+        prefixControlEvidenceCacheMode: GitPrefixControlEvidenceCacheMode = .automatic
     ) async throws -> WorkspaceRootReusableSnapshotCoordinator.ObservationResult {
         guard !Task.isCancelled else {
             return .failed(.init(stage: .loadedRootValidation, cause: .cancelled))
@@ -5488,7 +5489,14 @@ actor WorkspaceFileContextStore {
             name: initialState.root.name,
             fullPath: initialState.root.standardizedFullPath
         )
-        let ingressSamples = await awaitAppliedIngress(rootRefs: [rootRef])
+        let ingressSamples = await {
+            #if DEBUG
+                let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
+                    .begin(.loadedRootIngressFence)
+                defer { span?.end() }
+            #endif
+            return await awaitAppliedIngress(rootRefs: [rootRef])
+        }()
         guard !Task.isCancelled else {
             return .failed(.init(stage: .initialCurrentness, cause: .cancelled))
         }
@@ -5538,11 +5546,19 @@ actor WorkspaceFileContextStore {
         }
         let rootURL = URL(fileURLWithPath: expectedStandardizedPath).standardizedFileURL
         let service = state.service
-        let catalogPolicyIdentity = await service.currentWorkspaceRootCatalogPolicyIdentity()
+        let catalogPolicyIdentity = await {
+            #if DEBUG
+                let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
+                    .begin(.loadedRootPolicySnapshot)
+                defer { span?.end() }
+            #endif
+            return await service.currentWorkspaceRootCatalogPolicyIdentity()
+        }()
 
         let result = await rootReusableSnapshotCoordinator.observeStreamedAuthoritativeFullLoad(
             rootURL: rootURL,
             catalogPolicyIdentity: catalogPolicyIdentity,
+            prefixControlEvidenceCacheMode: prefixControlEvidenceCacheMode,
             catalogBatchEvidenceProvider: { [weak self] relativePaths in
                 guard let self else { return .stale(.loadedRootOwnerStale) }
                 return await loadedRootCatalogBatchEvidence(
@@ -5560,6 +5576,11 @@ actor WorkspaceFileContextStore {
         guard case let .admitted(snapshotIdentity) = result else {
             return result
         }
+        #if DEBUG
+            let finalCurrentnessSpan = WorktreeStartupPreparationInstrumentation.currentRecorder?
+                .begin(.finalLoadedRootCurrentness)
+            defer { finalCurrentnessSpan?.end() }
+        #endif
         if Task.isCancelled {
             await workspaceStateAuthority.revokeReusableSnapshotAdmissions(
                 snapshotIdentity: snapshotIdentity

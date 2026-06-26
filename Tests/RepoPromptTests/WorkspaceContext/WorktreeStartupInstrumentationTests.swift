@@ -730,13 +730,13 @@ import XCTest
             var boundaryEvents = Dictionary(
                 uniqueKeysWithValues: WorktreeStartupBenchmarkDiagnostics.requiredBoundaryPhasesForTesting
                     .enumerated().map { index, phase in
-                        (phase, UInt64(10_000 + index * 1_000))
+                        (phase, UInt64(10000 + index * 1000))
                     }
             )
-            boundaryEvents[.rootReady] = 9_999
+            boundaryEvents[.rootReady] = 9999
             let invalidBoundary = WorktreeStartupBenchmarkDiagnostics.boundaryEvidenceForTesting(
                 boundaryEvents,
-                baseline: 10_000
+                baseline: 10000
             )
             XCTAssertFalse(invalidBoundary.valid)
             XCTAssertTrue(invalidBoundary.milestones[WorktreeStartupPhase.rootReady.rawValue] is NSNull)
@@ -798,6 +798,144 @@ import XCTest
             let resetSnapshot = WorktreeStartupInstrumentation.snapshot()
             XCTAssertTrue(resetSnapshot.receiptDecisions.isEmpty)
             XCTAssertEqual(resetSnapshot.receiptDecisionEvictionCount, 0)
+        }
+
+        func testPreparationRecorderReportsActiveCompletedSaturatingPathFreeSchema() {
+            let preparationID = UUID()
+            let recorder = WorktreeStartupPreparationInstrumentation.Recorder(preparationID: preparationID)
+            recorder.recordCompleted(.scopeResolution, durationNanoseconds: 5000)
+            let total = recorder.begin(.setFlagsTotal)
+            let scan = recorder.begin(.prefixControlScan)
+            recorder.increment(.authorityCaptures, by: 2)
+            recorder.setAbsolute(.enumeratedCandidates, to: UInt64.max)
+            recorder.increment(.enumeratedCandidates)
+            recorder.recordReason(.absent)
+
+            let active = recorder.snapshot()
+            XCTAssertEqual(active.preparationID, preparationID)
+            XCTAssertNil(active.terminalState)
+            XCTAssertEqual(active.currentActivePhase, .prefixControlScan)
+            XCTAssertEqual(active.phases.count, WorktreeStartupPreparationInstrumentation.Phase.allCases.count)
+            XCTAssertEqual(active.phases[.scopeResolution]?.completedCount, 1)
+            XCTAssertEqual(active.phases[.scopeResolution]?.completedDurationNanoseconds, 5000)
+            XCTAssertEqual(active.phases[.prefixControlScan]?.activeCount, 1)
+            XCTAssertEqual(active.counters.count, WorktreeStartupPreparationInstrumentation.Counter.allCases.count)
+            XCTAssertEqual(active.counters[.authorityCaptures], 2)
+            XCTAssertEqual(active.counters[.enumeratedCandidates], UInt64.max)
+            XCTAssertTrue(active.saturatedCounters.contains(.enumeratedCandidates))
+            XCTAssertEqual(active.reasons[.absent], 1)
+
+            scan.end()
+            scan.end()
+            total.end()
+            XCTAssertTrue(recorder.terminalize(.admitted))
+            XCTAssertFalse(recorder.terminalize(.failed))
+            let terminal = recorder.snapshot()
+            XCTAssertEqual(terminal.terminalState, .admitted)
+            XCTAssertNil(terminal.currentActivePhase)
+            XCTAssertEqual(terminal.phases[.prefixControlScan]?.count, 1)
+            XCTAssertEqual(terminal.phases[.prefixControlScan]?.completedCount, 1)
+        }
+
+        func testPreparationRegistryScopesBoundsAndEvictsOnlyCompletedRecords() throws {
+            WorktreeStartupBenchmarkDiagnostics.setGateEnabled(true)
+            defer { WorktreeStartupBenchmarkDiagnostics.setGateEnabled(false) }
+            let diagnostics = WorktreeStartupBenchmarkDiagnostics(maximumPreparationRecordCount: 2)
+            let scope = DebugWorktreeStartupBenchmarkScope(
+                windowID: 610,
+                workspaceID: UUID(),
+                contextID: UUID(),
+                rootID: UUID()
+            )
+            let otherScope = DebugWorktreeStartupBenchmarkScope(
+                windowID: 611,
+                workspaceID: scope.workspaceID,
+                contextID: scope.contextID,
+                rootID: scope.rootID
+            )
+            let first = UUID()
+            let second = UUID()
+            _ = try diagnostics.beginPreparationForTesting(preparationID: first, scope: scope)
+            _ = try diagnostics.beginPreparationForTesting(preparationID: second, scope: scope)
+            XCTAssertThrowsError(
+                try diagnostics.beginPreparationForTesting(preparationID: UUID(), scope: scope)
+            ) { error in
+                XCTAssertEqual(error as? DebugWorktreeStartupBenchmarkError, .preparationCapacityExceeded)
+            }
+            XCTAssertThrowsError(try diagnostics.preparationSnapshot(scope: otherScope, preparationID: first)) {
+                XCTAssertEqual($0 as? DebugWorktreeStartupBenchmarkError, .invalidPreparation)
+            }
+
+            diagnostics.terminalizePreparationForTesting(preparationID: first, state: .failed)
+            let third = UUID()
+            _ = try diagnostics.beginPreparationForTesting(preparationID: third, scope: scope)
+            XCTAssertThrowsError(try diagnostics.preparationSnapshot(scope: scope, preparationID: first))
+            XCTAssertNil(try diagnostics.preparationSnapshot(scope: scope, preparationID: second).terminalState)
+            XCTAssertNil(try diagnostics.preparationSnapshot(scope: scope, preparationID: third).terminalState)
+        }
+
+        func testCompletedPreparationRegistryRecordsExpire() throws {
+            WorktreeStartupBenchmarkDiagnostics.setGateEnabled(true)
+            defer { WorktreeStartupBenchmarkDiagnostics.setGateEnabled(false) }
+            let diagnostics = WorktreeStartupBenchmarkDiagnostics(completedPreparationTTLNanoseconds: 0)
+            let scope = DebugWorktreeStartupBenchmarkScope(
+                windowID: 612,
+                workspaceID: UUID(),
+                contextID: UUID(),
+                rootID: UUID()
+            )
+            let preparationID = UUID()
+            _ = try diagnostics.beginPreparationForTesting(preparationID: preparationID, scope: scope)
+            diagnostics.terminalizePreparationForTesting(preparationID: preparationID, state: .admitted)
+            XCTAssertThrowsError(try diagnostics.preparationSnapshot(scope: scope, preparationID: preparationID)) {
+                XCTAssertEqual($0 as? DebugWorktreeStartupBenchmarkError, .invalidPreparation)
+            }
+        }
+
+        func testClientDisconnectAfterControlCreationRevokesExactOwnedControl() async throws {
+            WorktreeStartupBenchmarkDiagnostics.setGateEnabled(true)
+            defer { WorktreeStartupBenchmarkDiagnostics.setGateEnabled(false) }
+            let diagnostics = WorktreeStartupBenchmarkDiagnostics(afterControlLeaseForTesting: {
+                withUnsafeCurrentTask { task in task?.cancel() }
+            })
+            let scope = DebugWorktreeStartupBenchmarkScope(
+                windowID: 613,
+                workspaceID: UUID(),
+                contextID: UUID(),
+                rootID: UUID()
+            )
+            let preparationID = UUID()
+            let task = Task {
+                try await diagnostics.setFlagsPreparingBaseSnapshot(
+                    scope: scope,
+                    observe: true,
+                    serve: true,
+                    forceFullCrawl: true,
+                    expiresSeconds: 120,
+                    store: WorkspaceFileContextStore(),
+                    expectedStandardizedRootPath: "/not-loaded",
+                    preparationID: preparationID
+                )
+            }
+            do {
+                _ = try await task.value
+                XCTFail("A disconnected set_flags caller must not receive an orphaned control.")
+            } catch is CancellationError {
+                // Expected.
+            }
+            let snapshot = try diagnostics.preparationSnapshot(scope: scope, preparationID: preparationID)
+            XCTAssertEqual(snapshot.terminalState, .cancelled)
+            XCTAssertEqual(snapshot.reasons[.cancellation], 1)
+            let ownership = try XCTUnwrap(snapshot.routeControlOwnership)
+            XCTAssertEqual(ownership.windowID, scope.windowID)
+            XCTAssertEqual(ownership.workspaceID, scope.workspaceID)
+            XCTAssertEqual(ownership.contextID, scope.contextID)
+            XCTAssertEqual(ownership.rootID, scope.rootID)
+            XCTAssertTrue(ownership.revoked)
+            XCTAssertThrowsError(try diagnostics.restoreFlags(scope: scope, controlID: ownership.controlID)) {
+                XCTAssertEqual($0 as? DebugWorktreeStartupBenchmarkError, .invalidControl)
+            }
+            XCTAssertEqual(try diagnostics.reset(scope: scope)["control_count"], 0)
         }
 
         private func benchmarkExpectedStart(

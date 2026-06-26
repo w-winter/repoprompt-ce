@@ -658,3 +658,176 @@ Artifact:
 - Oracle iteration-1 decision remains **RETAIN**. Work stops here for independent
   re-review; campaign acceptance remains incomplete because follow-ons and the
   projected comparison are not established.
+
+## 2026-06-26 — Iteration 3 currentness-keyed prefix-control evidence cache (append-only)
+
+### Single attributed implementation and focused validation
+
+- Implemented only the response-bound projected `set_flags` optimization: a
+  process-local cache of the verified prefix-control evidence footer, keyed by
+  repository identity, canonical worktree-root path plus `lstat` device/inode,
+  loaded-root prefix, collector format, authority invalidation/publication
+  generations, accepted monitor watermark, and existing mutation state.
+- Typed prefix-control monitor coverage observes repository-root-to-prefix
+  controls, controls below the prefix, and directory/symlink topology; `.git`
+  descendants are excluded. Activation/flush barriers and the synchronous
+  accepted-watermark cut fail closed on event, gap, root replacement,
+  ambiguity, or stale actor state. The unchanged collector still performs
+  no-follow descriptor/path/NFC/corruption checks and preserves cancellation,
+  manifest, byte, and lease budgets plus existing topology fallbacks.
+- Completed entries and in-flight admissions have separate count/resident/
+  artifact-byte limits. Identical work coalesces by exact currentness key;
+  waiter cancellation is scoped and flight-ID cleanup cannot remove a newer
+  flight. Only the fixed footer and typed monitor token are retained.
+- New exact deterministic tests passed for cold/warm/bypass scan counts and
+  snapshot parity; coalescing plus scoped waiter cancellation; accepted
+  watermark invalidation before actor delivery; corrupt-footer and byte-budget
+  cleanup; monitor-unavailable fallback and typed matcher; preparation schema,
+  saturation, scope/capacity/expiry, and cancellation-before-lease zero-control.
+  Existing 10,001 and 100,000 collectors passed through conductor; the opt-in
+  1,000,000 collector passed directly in 192.402 s because conductor cannot
+  forward its opt-in environment key. No full suite, release build, or lint ran.
+- Coordinated product builds passed: RepoPrompt ticket
+  `06edc430-7ea8-4437-bd69-cb3ec81a1ac6`; `repoprompt-mcp` ticket
+  `a0fd5d81-e0cc-4234-8c94-2b05b502058b`. Harness Python compile/self-test and
+  `git diff --check` passed. The unchanged scoped-control test still expects
+  `stale_currentness` while unchanged product logic returns
+  `loaded_root_owner_stale`; it was recorded and not repaired.
+
+### Relaunch, frozen scope, plans, and preflights
+
+- The single approved coordinated relaunch passed: ticket
+  `23f2e446-cadf-4101-a474-179a617e224a`, PID `24495`.
+- Exact build/checkout: HEAD `7bbbd3ec9e966a52065b7398106d877bcba4ce49`,
+  2,142 tracked files; app/CLI SHA-256
+  `7f14d7b46867bd3d44714933b4270921a211670611d52e800cd72560a365c66b` /
+  `78b9037683c1d8322bd34d2d266e286049c075a01577fa3f8339051da15ca647`.
+- Fresh window/workspace/context/root: `1` /
+  `163E658F-4313-4894-B003-595287E59AE9` /
+  `E7BC2FDA-0CBD-4DE9-9C94-C31984E5F783` /
+  `A8E3ED38-B9D4-44DE-87C2-4717FFE9DAA0` in
+  `RPCE Search Bench Main 20260618` with the sole real checkout root.
+- Primary/confirmation plans are under
+  `/tmp/rpce-worktree-startup/iteration3-prefix-cache-20260626T195803Z/`.
+  File SHA-256: primary
+  `38611fb688b033d45203fb6854ca2831a548983a7ce501bfa2876dccb12e38c3`,
+  confirmation
+  `8e564a5fa6507d8e63a33d504dad381e782f871698fa5e1ba4ae75d52696d356`.
+  Frozen plan SHA fields: primary
+  `c627812ab2a8c3e15e1545abc842eddd9b97afd402e5822974be2868f065302d`,
+  confirmation
+  `6d2556de593b0343c3f5a1ac241d22765dfbe2a145d575be5514852bff4a19d2`.
+- Fresh exact preflights passed at
+  `/tmp/rpce-worktree-startup/v1/20260626T195839Z-preflight-92d45719` and
+  `/tmp/rpce-worktree-startup/v1/20260626T195840Z-preflight-572b0ad4`.
+
+### Projected `set_flags` attribution
+
+Artifact raw call:
+`/tmp/rpce-worktree-startup/v1/20260626T200311Z-warm-projected-w1-59d08950/raw/0003-set-route-projected.json`.
+
+- Setup returned in 7.466 s wall / 7.425 s attributed total, prepared snapshot
+  `2284181fc0644c2a2beac957623287c36bf851ef60de19efcef20f5ffbd496d1`,
+  and configured route `diffSeedServing`; it did not hit the 300 s timeout.
+- Exact cache counters: 2 authority captures, 1 physical scan, 1 miss, 1 hit,
+  1 admission, 0 bypass/coalesce/invalidation/eviction. The two setup consumers
+  therefore shared one physical scan. The scan enumerated 115,848 candidates,
+  pruned 209 `.git` directories, and hashed 340 controls; the directory counter
+  remained 0 and loaded-searchable counters remained 0, so those attributions
+  are unavailable rather than inferred.
+- Major phase durations: prefix scan 4,545.623 ms; combined authority metadata
+  4,702.651 ms; discovery capture 4,626.857 ms; catalog manifest build
+  2,621.477 ms; captured capture 76.148 ms; snapshot materialization 69.958 ms;
+  tree spool 27.001 ms; cache lookup/admit 0.583/0.170 ms. Scan time was 61.2%
+  of `set_flags_total`; physical candidates were 54.1x the exact tracked count.
+- Forced-full preparation was the zero-work control: 0 captures/scans/cache
+  events and 0.113 ms `set_flags_total`. Thus forced→projected counter deltas
+  were +2 captures, +1 scan/miss/hit/admission, +115,848 candidates, +209 prunes,
+  and +340 controls. A real bypass/warm setup A/B was not run after the mandated
+  cohorts; deterministic tests prove 2/1/0 bypass/cold/warm scan behavior.
+
+### Width-1 numeric cohorts (forced-full first, projected second)
+
+Forced-full artifact:
+`/tmp/rpce-worktree-startup/v1/20260626T195921Z-warm-forced-full-w1-5dc66787`.
+
+- One excluded warmup plus five retained completed without replacement. Warmup
+  raw primary: `[815.105] ms`; retained raw primary:
+  `[1027.499, 963.629, 873.941, 966.917, 939.151] ms`.
+- Raw p50 / nearest-rank p95 / population CV:
+  `963.629 ms` / `1027.499 ms` / `0.051959`.
+- Actual route/fallback was exactly `{"fullCrawl":1}` / `{}` per sample
+  (aggregate `{"fullCrawl":6}` / `{}`). All six primary records were invalid
+  solely as `resource_evidence_invalid` (`inconsistent_resident_peak_delta`),
+  while all six separate follow-ons were accepted. Valid retained count: 0.
+- Resources: 2,039 samples over 210.9 s; average/peak core 132.7%/405.0%;
+  resident baseline/peak/final 329.2/437.4/431.0 MiB (peak delta 108.3 MiB);
+  physical footprint baseline/peak/final 119.7/225.5/198.6 MiB
+  (peak delta 105.8 MiB); session CPU 279,736.6 ms.
+
+Projected artifact:
+`/tmp/rpce-worktree-startup/v1/20260626T200311Z-warm-projected-w1-59d08950`.
+
+- One excluded warmup plus five retained completed without replacement. Warmup
+  raw primary: `[1286.730] ms`; retained raw primary:
+  `[1180.898, 1171.841, 1132.876, 1456.798, 1227.935] ms`.
+- Raw p50 / nearest-rank p95 / population CV:
+  `1180.898 ms` / `1456.798 ms` / `0.093511`.
+- Every sample was invalid: actual route/fallback was
+  `{"diffSeedServing":1,"fullCrawl":1}` /
+  `{"compatibilityMismatch":1}` (aggregate each count 6), not the required
+  projected-only route with empty fallback. Valid retained count: 0; no timing
+  improvement or p95 claim is made.
+- All six follow-ons failed and remain separate: route/fallback/receipt contract,
+  incomplete planner evidence, first-codemap timeout in at least the warmup,
+  passive-tree current-marker validation, and selection `worktree_scope`
+  validation. These were not repaired.
+- Resources: 3,515 samples over 364.6 s; average/peak core 121.1%/389.7%;
+  resident baseline/peak/final 521.5/579.5/573.9 MiB (peak delta 58.0 MiB);
+  physical footprint baseline/peak/final 246.8/267.4/239.3 MiB
+  (peak delta 20.6 MiB); session CPU 441,393.7 ms.
+
+### Stop, follow-on smoke, cleanup, and recommendation
+
+- The projected mixed route plus `compatibilityMismatch` fallback triggered the
+  frozen stop rule. No confirmation, replacement, numeric rerun, bypass cohort,
+  or additional correctness repair was attempted.
+- The requested correctness-only live Agent Mode smoke was therefore **skipped**:
+  running it after an invalid projected route would violate the earlier
+  stop-on-route/fallback rule. No inference timing claim was created.
+- Both cohort summaries report cleanup complete. All 12 owned Agent sessions are
+  terminal, all 12 owned worktrees are absent, memory samplers stopped, route and
+  diagnostics reset, and the sole workspace root restored. The ownership marker
+  was removed only after exact identity verification. Proof:
+  `/tmp/rpce-worktree-startup/iteration3-prefix-cache-20260626T195803Z/final-owned-cleanup-proof.json`.
+  Harness-created sample branch refs were preserved as immutable provenance.
+- Machine-readable rollup:
+  `/tmp/rpce-worktree-startup/iteration3-prefix-cache-20260626T195803Z/iteration3-measurement-summary.json`.
+- Recommendation: **REVERT / do not retain**. The cache removed the duplicated
+  physical scan and made projected setup return in 7.5 s, but mandatory serving
+  route/fallback, valid primary cohorts, warm setup A/B, resource comparison,
+  and follow-on acceptance gates did not pass. No commit was created.
+
+## 2026-06-26 — Prefix-cache iteration identity and disposition supersession (append-only)
+
+- The section headed `Iteration 3 currentness-keyed prefix-control evidence
+  cache` is superseded **for iteration identity and disposition only**. Its raw
+  measurements, hashes, artifact paths, invalid route/fallback evidence, and
+  cleanup proof remain unchanged.
+- The prefix-control evidence cache is **iteration 2**, the next sequential
+  campaign after completed iteration 1. The planned iteration-2 narrowed
+  mutation-lock row was never implemented or measured and confers no iteration
+  identity; this cache did not change mutation-lock behavior.
+- Iteration 3 remains the distinct reserved
+  `demand-reserved CodeMap capacity, only if attributed` row. No CodeMap
+  scheduler/capacity change is part of prefix-cache iteration 2.
+- Historical `/tmp/.../iteration3-prefix-cache-...` directory names and the
+  `iteration3-measurement-summary.json` filename are immutable artifact labels,
+  not the corrected campaign identity; they are not renamed or rewritten.
+- Independent verdict supersedes the earlier `REVERT / do not retain`
+  recommendation with **REPAIR THEN RETAIN**, limited to four P1 repairs:
+  separated prefix/full-monitor recovery authority, bounded saturated/cancelled
+  single-flight accounting, recoverable DEBUG preparation-owned route controls,
+  and this append-only identity correction. Retention remains pending the
+  requested exact focused validation and independent re-review; no new live or
+  performance claim is introduced here.

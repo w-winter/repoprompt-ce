@@ -1,4 +1,32 @@
+import Darwin
 import Foundation
+
+struct GitPrefixControlEvidenceCacheLimits: Equatable {
+    static let production = GitPrefixControlEvidenceCacheLimits(
+        maximumEntryCount: 32,
+        maximumEntriesPerRepository: 4,
+        maximumResidentBytes: 64 * 1024,
+        maximumArtifactBytes: 0,
+        maximumPendingAdmissionCount: 8,
+        maximumPendingResidentBytes: 16 * 1024,
+        maximumPendingArtifactBytes: 0
+    )
+
+    let maximumEntryCount: Int
+    let maximumEntriesPerRepository: Int
+    let maximumResidentBytes: Int
+    let maximumArtifactBytes: UInt64
+    let maximumPendingAdmissionCount: Int
+    let maximumPendingResidentBytes: Int
+    let maximumPendingArtifactBytes: UInt64
+}
+
+enum GitPrefixControlEvidenceCacheError: Error, Equatable {
+    case invalidatedDuringCollection
+    case rootIdentityChanged
+    case corruptFooter
+    case resourceAdmission
+}
 
 private final class GitWorkspaceAuthoritySynchronousState: @unchecked Sendable {
     private struct RepositoryState {
@@ -74,6 +102,20 @@ actor GitWorkspaceStateAuthority {
             let pendingReusableSnapshotArtifactBytes: UInt64
             let reusableSnapshotArtifactBudgetRejectionCount: UInt64
             let invalidationSubscriberCount: Int
+            let prefixControlCacheEntryCount: Int
+            let prefixControlCacheResidentBytes: Int
+            let prefixControlCacheArtifactBytes: UInt64
+            let pendingPrefixControlAdmissionCount: Int
+            let pendingPrefixControlResidentBytes: Int
+            let pendingPrefixControlArtifactBytes: UInt64
+            let prefixControlCacheHitCount: UInt64
+            let prefixControlCacheMissCount: UInt64
+            let prefixControlCacheCoalescedWaiterCount: UInt64
+            let prefixControlCacheAdmissionCount: UInt64
+            let prefixControlCacheEvictionCount: UInt64
+            let prefixControlCacheInvalidationCount: UInt64
+            let prefixControlCacheBypassCount: UInt64
+            let prefixControlPhysicalScanCount: UInt64
         }
     #endif
 
@@ -115,9 +157,62 @@ actor GitWorkspaceStateAuthority {
         let reservedArtifactBytes: UInt64
     }
 
+    private struct PrefixControlRootIdentity: Hashable {
+        let canonicalPath: String
+        let device: UInt64
+        let inode: UInt64
+    }
+
+    private struct PrefixControlCacheKey: Hashable {
+        let repositoryKey: GitWorkspaceAuthorityRepositoryKey
+        let rootIdentity: PrefixControlRootIdentity
+        let prefix: GitRepositoryRelativeRootPrefix
+        let collectorFormatVersion: UInt32
+    }
+
+    private struct PrefixControlCurrentnessKey: Hashable {
+        let invalidationGeneration: UInt64
+        let publicationGeneration: UInt64
+        let acceptedWatermark: UInt64
+        let mutationDepth: Int
+        let monitorCoverageUnavailable: Bool
+    }
+
+    private struct PrefixControlCacheEntry {
+        let id: UUID
+        let footer: GitPrefixControlEvidenceManifestFooter
+        let observationToken: GitWorkspaceMetadataMonitor.RetainToken
+        var currentness: PrefixControlCurrentnessKey
+        var lastAccessOrdinal: UInt64
+        let residentBytes: Int
+        let artifactBytes: UInt64
+    }
+
+    private struct PendingPrefixControlAdmission {
+        let id: UUID
+        let task: Task<GitPrefixControlEvidenceManifestFooter, Error>
+        let observationToken: GitWorkspaceMetadataMonitor.RetainToken
+        let currentness: PrefixControlCurrentnessKey
+        let repositoryRoot: URL
+        var waiters: [UUID: CheckedContinuation<GitPrefixControlEvidenceManifestFooter, Error>]
+        var isCancelled: Bool
+        let reservedResidentBytes: Int
+        let reservedArtifactBytes: UInt64
+    }
+
+    private struct PendingUncachedPrefixControlFlight {
+        let id: UUID
+        let task: Task<GitPrefixControlEvidenceManifestFooter, Error>
+        var waiters: [UUID: CheckedContinuation<GitPrefixControlEvidenceManifestFooter, Error>]
+        var isCancelled: Bool
+        let reservedResidentBytes: Int
+        let reservedArtifactBytes: UInt64
+    }
+
     private let metadataMonitor: GitWorkspaceMetadataMonitor
     private nonisolated let synchronousState = GitWorkspaceAuthoritySynchronousState()
     private let reusableSnapshotCacheLimits: WorkspaceRootReusableSnapshotCacheLimits
+    private let prefixControlCacheLimits: GitPrefixControlEvidenceCacheLimits
     private var records: [GitWorkspaceAuthorityRepositoryKey: Record] = [:]
     private var activeMutations: [UUID: GitWorkspaceMutationToken] = [:]
     private var reusableSnapshotsByIdentity: [WorkspaceRootReusableSnapshotIdentity: ReusableSnapshotCacheEntry] = [:]
@@ -129,17 +224,42 @@ actor GitWorkspaceStateAuthority {
     private var pendingReusableSnapshotArtifactBytes: UInt64 = 0
     private var reusableSnapshotArtifactBudgetRejectionCount: UInt64 = 0
     private var invalidationContinuations: [UUID: AsyncStream<GitWorkspaceAuthorityInvalidationEvent>.Continuation] = [:]
+    private var prefixControlCacheEntries: [PrefixControlCacheKey: PrefixControlCacheEntry] = [:]
+    private var pendingPrefixControlAdmissions: [PrefixControlCacheKey: PendingPrefixControlAdmission] = [:]
+    private var pendingUncachedPrefixControlFlights: [PrefixControlCacheKey: PendingUncachedPrefixControlFlight] = [:]
+    private var prefixControlCacheAccessOrdinal: UInt64 = 0
+    private var prefixControlCacheResidentBytes = 0
+    private var prefixControlCacheArtifactBytes: UInt64 = 0
+    private var pendingPrefixControlResidentBytes = 0
+    private var pendingPrefixControlArtifactBytes: UInt64 = 0
+    private var pendingUncachedPrefixControlResidentBytes = 0
+    private var pendingUncachedPrefixControlArtifactBytes: UInt64 = 0
+    private var prefixControlCacheHitCount: UInt64 = 0
+    private var prefixControlCacheMissCount: UInt64 = 0
+    private var prefixControlCacheCoalescedWaiterCount: UInt64 = 0
+    private var prefixControlCacheAdmissionCount: UInt64 = 0
+    private var prefixControlCacheEvictionCount: UInt64 = 0
+    private var prefixControlCacheInvalidationCount: UInt64 = 0
+    private var prefixControlCacheBypassCount: UInt64 = 0
+    private var prefixControlPhysicalScanCount: UInt64 = 0
 
     init(
         metadataMonitor: GitWorkspaceMetadataMonitor = GitWorkspaceMetadataMonitor(),
-        reusableSnapshotCacheLimits: WorkspaceRootReusableSnapshotCacheLimits = .production
+        reusableSnapshotCacheLimits: WorkspaceRootReusableSnapshotCacheLimits = .production,
+        prefixControlCacheLimits: GitPrefixControlEvidenceCacheLimits = .production
     ) {
         precondition(reusableSnapshotCacheLimits.maximumSnapshotCount > 0)
         precondition(reusableSnapshotCacheLimits.maximumSnapshotsPerRepository > 0)
         precondition(reusableSnapshotCacheLimits.maximumEstimatedBytes > 0)
         precondition(reusableSnapshotCacheLimits.maximumArtifactBytes > 0)
+        precondition(prefixControlCacheLimits.maximumEntryCount > 0)
+        precondition(prefixControlCacheLimits.maximumEntriesPerRepository > 0)
+        precondition(prefixControlCacheLimits.maximumResidentBytes > 0)
+        precondition(prefixControlCacheLimits.maximumPendingAdmissionCount > 0)
+        precondition(prefixControlCacheLimits.maximumPendingResidentBytes > 0)
         self.metadataMonitor = metadataMonitor
         self.reusableSnapshotCacheLimits = reusableSnapshotCacheLimits
+        self.prefixControlCacheLimits = prefixControlCacheLimits
     }
 
     func collectionMutationFenceReason(
@@ -149,6 +269,528 @@ actor GitWorkspaceStateAuthority {
         return hasActiveMutation(for: repositoryKey) || (record?.mutationDepth ?? 0) > 0
             ? .mutationInProgress
             : nil
+    }
+
+    func prefixControlEvidence(
+        in layout: GitRepositoryLayout,
+        prefix: GitRepositoryRelativeRootPrefix,
+        cacheMode: GitPrefixControlEvidenceCacheMode,
+        collector: @escaping @Sendable () async throws -> GitPrefixControlEvidenceManifestFooter
+    ) async throws -> GitPrefixControlEvidenceManifestFooter {
+        #if DEBUG
+            let recorder = WorktreeStartupPreparationInstrumentation.currentRecorder
+        #endif
+        if cacheMode == .bypassReadAndAdmission {
+            prefixControlCacheBypassCount &+= 1
+            prefixControlPhysicalScanCount &+= 1
+            #if DEBUG
+                recorder?.increment(.prefixCacheBypasses)
+                recorder?.recordReason(.bypassed)
+            #endif
+            return try await collector()
+        }
+
+        #if DEBUG
+            let lookupSpan = recorder?.begin(.prefixControlCacheLookup)
+        #endif
+
+        let repositoryKey = GitWorkspaceAuthorityRepositoryKey(layout: layout)
+        let rootIdentity = try Self.prefixControlRootIdentity(for: layout.workTreeRoot)
+        let key = PrefixControlCacheKey(
+            repositoryKey: repositoryKey,
+            rootIdentity: rootIdentity,
+            prefix: prefix,
+            collectorFormatVersion: GitPrefixControlEvidenceManifestHeader.currentSchemaVersion
+        )
+        let scopeKey = GitWorkspaceAuthorityScopeKey(
+            repositoryKey: repositoryKey,
+            repositoryRelativeRootPrefix: prefix
+        )
+
+        let replacedRootEntryKeys = prefixControlCacheEntries.keys.filter {
+            $0.repositoryKey == repositoryKey
+                && $0.prefix == prefix
+                && $0.collectorFormatVersion == key.collectorFormatVersion
+                && $0.rootIdentity != rootIdentity
+        }
+        for replacedKey in replacedRootEntryKeys {
+            #if DEBUG
+                recorder?.increment(.prefixCacheInvalidations)
+                recorder?.recordReason(.rootIdentityChanged)
+            #endif
+            await removePrefixControlCacheEntry(replacedKey, invalidated: true)
+        }
+        let replacedRootPendingKeys = pendingPrefixControlAdmissions.keys.filter {
+            $0.repositoryKey == repositoryKey
+                && $0.prefix == prefix
+                && $0.collectorFormatVersion == key.collectorFormatVersion
+                && $0.rootIdentity != rootIdentity
+        }
+        for replacedKey in replacedRootPendingKeys {
+            #if DEBUG
+                recorder?.recordReason(.rootIdentityChanged)
+            #endif
+            await cancelPendingPrefixControlAdmission(replacedKey, invalidated: true)
+        }
+
+        if var entry = prefixControlCacheEntries[key] {
+            let expectedEntryID = entry.id
+            let expectedCurrentness = entry.currentness
+            let coverageCurrent = await metadataMonitor.flushCoverageAndCheckCurrent(
+                entry.observationToken,
+                repositoryKey: repositoryKey,
+                repositoryRoot: layout.workTreeRoot,
+                prefix: prefix,
+                expectedAcceptedWatermark: expectedCurrentness.acceptedWatermark
+            )
+            let currentRootIdentity = try? Self.prefixControlRootIdentity(for: layout.workTreeRoot)
+            if coverageCurrent,
+               currentRootIdentity == rootIdentity,
+               prefixControlCacheEntries[key]?.id == expectedEntryID,
+               prefixControlCurrentness(for: scopeKey) == expectedCurrentness,
+               Self.prefixControlFooterIsValid(entry.footer)
+            {
+                prefixControlCacheAccessOrdinal &+= 1
+                entry.lastAccessOrdinal = prefixControlCacheAccessOrdinal
+                prefixControlCacheEntries[key] = entry
+                prefixControlCacheHitCount &+= 1
+                #if DEBUG
+                    recorder?.increment(.prefixCacheHits)
+                    lookupSpan?.end()
+                #endif
+                return entry.footer
+            }
+            #if DEBUG
+                recorder?.increment(.prefixCacheInvalidations)
+                if currentRootIdentity != rootIdentity {
+                    recorder?.recordReason(.rootIdentityChanged)
+                } else if metadataMonitor.acceptedWatermark(for: repositoryKey)
+                    != expectedCurrentness.acceptedWatermark
+                {
+                    recorder?.recordReason(.watermarkAdvanced)
+                } else if !coverageCurrent {
+                    recorder?.recordReason(.coverageLost)
+                } else {
+                    recorder?.recordReason(.authorityGenerationChanged)
+                }
+            #endif
+            await removePrefixControlCacheEntry(key, invalidated: true)
+        }
+
+        if let pending = pendingPrefixControlAdmissions[key] {
+            if pending.isCancelled {
+                #if DEBUG
+                    recorder?.recordReason(.fallback)
+                    lookupSpan?.end()
+                #endif
+                throw GitPrefixControlEvidenceCacheError.resourceAdmission
+            }
+            if pending.currentness == prefixControlCurrentness(for: scopeKey),
+               (try? Self.prefixControlRootIdentity(for: layout.workTreeRoot)) == rootIdentity
+            {
+                prefixControlCacheCoalescedWaiterCount &+= 1
+                #if DEBUG
+                    recorder?.increment(.prefixCacheCoalesces)
+                    lookupSpan?.end()
+                #endif
+                return try await waitForPendingPrefixControlAdmission(key: key, flightID: pending.id)
+            }
+            #if DEBUG
+                recorder?.recordReason(.staleCurrentness)
+                lookupSpan?.end()
+            #endif
+            await cancelPendingPrefixControlAdmission(key, invalidated: true)
+            throw GitPrefixControlEvidenceCacheError.resourceAdmission
+        }
+
+        if let pending = pendingUncachedPrefixControlFlights[key] {
+            if pending.isCancelled {
+                #if DEBUG
+                    recorder?.recordReason(.fallback)
+                    lookupSpan?.end()
+                #endif
+                throw GitPrefixControlEvidenceCacheError.resourceAdmission
+            }
+            prefixControlCacheCoalescedWaiterCount &+= 1
+            #if DEBUG
+                recorder?.increment(.prefixCacheCoalesces)
+                lookupSpan?.end()
+            #endif
+            return try await waitForPendingUncachedPrefixControlFlight(key: key, flightID: pending.id)
+        }
+
+        prefixControlCacheMissCount &+= 1
+        #if DEBUG
+            recorder?.increment(.prefixCacheMisses)
+            recorder?.recordReason(.absent)
+            lookupSpan?.end()
+        #endif
+        let observationToken: GitWorkspaceMetadataMonitor.RetainToken
+        do {
+            observationToken = try await metadataMonitor.retainPrefixControlScope(
+                repositoryKey: repositoryKey,
+                repositoryRoot: layout.workTreeRoot,
+                prefix: prefix
+            ) { [weak self] kinds in
+                Task { await self?.metadataDidChange(repositoryKey: repositoryKey, kinds: kinds) }
+            }
+        } catch {
+            // Monitoring is an optimization prerequisite, not an authority
+            // prerequisite. Preserve the old uncached collector on any
+            // unavailable or ambiguous coverage setup.
+            prefixControlPhysicalScanCount &+= 1
+            #if DEBUG
+                recorder?.recordReason(.monitorUnavailable)
+            #endif
+            return try await collector()
+        }
+
+        let currentness = prefixControlCurrentness(for: scopeKey)
+        guard currentness.mutationDepth == 0,
+              (try? Self.prefixControlRootIdentity(for: layout.workTreeRoot)) == rootIdentity
+        else {
+            await metadataMonitor.release(observationToken)
+            #if DEBUG
+                recorder?.recordReason(.staleCurrentness)
+            #endif
+            throw GitPrefixControlEvidenceCacheError.invalidatedDuringCollection
+        }
+
+        let reservedResidentBytes = Self.maximumPrefixControlFooterResidentBytes
+        let reservedArtifactBytes: UInt64 = 0
+        let (nextPendingResidentBytes, residentOverflow) = pendingPrefixControlResidentBytes
+            .addingReportingOverflow(reservedResidentBytes)
+        let (nextPendingArtifactBytes, artifactOverflow) = pendingPrefixControlArtifactBytes
+            .addingReportingOverflow(reservedArtifactBytes)
+        guard !residentOverflow,
+              !artifactOverflow,
+              pendingPrefixControlAdmissions.count < prefixControlCacheLimits.maximumPendingAdmissionCount,
+              nextPendingResidentBytes <= prefixControlCacheLimits.maximumPendingResidentBytes,
+              nextPendingArtifactBytes <= prefixControlCacheLimits.maximumPendingArtifactBytes
+        else {
+            await metadataMonitor.release(observationToken)
+            #if DEBUG
+                recorder?.recordReason(.fallback)
+            #endif
+            return try await startOrJoinBoundedUncachedPrefixControlFlight(
+                key: key,
+                collector: collector
+            )
+        }
+
+        let flightID = UUID()
+        prefixControlPhysicalScanCount &+= 1
+        let task = Task { try await collector() }
+        pendingPrefixControlResidentBytes = nextPendingResidentBytes
+        pendingPrefixControlArtifactBytes = nextPendingArtifactBytes
+        pendingPrefixControlAdmissions[key] = PendingPrefixControlAdmission(
+            id: flightID,
+            task: task,
+            observationToken: observationToken,
+            currentness: currentness,
+            repositoryRoot: layout.workTreeRoot,
+            waiters: [:],
+            isCancelled: false,
+            reservedResidentBytes: reservedResidentBytes,
+            reservedArtifactBytes: reservedArtifactBytes
+        )
+        Task { [weak self] in
+            let result: Result<GitPrefixControlEvidenceManifestFooter, Error>
+            do {
+                result = try await .success(task.value)
+            } catch {
+                result = .failure(error)
+            }
+            await self?.completePendingPrefixControlAdmission(
+                key: key,
+                flightID: flightID,
+                result: result
+            )
+        }
+        return try await waitForPendingPrefixControlAdmission(key: key, flightID: flightID)
+    }
+
+    private func waitForPendingPrefixControlAdmission(
+        key: PrefixControlCacheKey,
+        flightID: UUID
+    ) async throws -> GitPrefixControlEvidenceManifestFooter {
+        let waiterID = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard var pending = pendingPrefixControlAdmissions[key],
+                      pending.id == flightID
+                else {
+                    continuation.resume(throwing: GitPrefixControlEvidenceCacheError.invalidatedDuringCollection)
+                    return
+                }
+                pending.waiters[waiterID] = continuation
+                pendingPrefixControlAdmissions[key] = pending
+                if Task.isCancelled {
+                    Task { await self.cancelPrefixControlWaiter(
+                        key: key,
+                        flightID: flightID,
+                        waiterID: waiterID
+                    ) }
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelPrefixControlWaiter(
+                key: key,
+                flightID: flightID,
+                waiterID: waiterID
+            ) }
+        }
+    }
+
+    private func cancelPrefixControlWaiter(
+        key: PrefixControlCacheKey,
+        flightID: UUID,
+        waiterID: UUID
+    ) async {
+        guard var pending = pendingPrefixControlAdmissions[key],
+              pending.id == flightID,
+              let waiter = pending.waiters.removeValue(forKey: waiterID)
+        else { return }
+        waiter.resume(throwing: CancellationError())
+        if pending.waiters.isEmpty {
+            pendingPrefixControlAdmissions[key] = pending
+            await cancelPendingPrefixControlAdmission(key, invalidated: false)
+        } else {
+            pendingPrefixControlAdmissions[key] = pending
+        }
+    }
+
+    private func completePendingPrefixControlAdmission(
+        key: PrefixControlCacheKey,
+        flightID: UUID,
+        result: Result<GitPrefixControlEvidenceManifestFooter, Error>
+    ) async {
+        guard let initial = pendingPrefixControlAdmissions[key],
+              initial.id == flightID
+        else { return }
+
+        if initial.isCancelled {
+            let pending = takePendingPrefixControlAdmission(key, flightID: flightID)
+            if let pending { await metadataMonitor.release(pending.observationToken) }
+            return
+        }
+
+        switch result {
+        case let .failure(error):
+            let pending = takePendingPrefixControlAdmission(key, flightID: flightID)
+            pending?.waiters.values.forEach { $0.resume(throwing: error) }
+            if let pending { await metadataMonitor.release(pending.observationToken) }
+        case let .success(footer):
+            #if DEBUG
+                let admissionSpan = WorktreeStartupPreparationInstrumentation.currentRecorder?
+                    .begin(.prefixControlCacheAdmit)
+                defer { admissionSpan?.end() }
+            #endif
+            guard Self.prefixControlFooterIsValid(footer) else {
+                let pending = takePendingPrefixControlAdmission(key, flightID: flightID)
+                pending?.waiters.values.forEach {
+                    $0.resume(throwing: GitPrefixControlEvidenceCacheError.corruptFooter)
+                }
+                if let pending { await metadataMonitor.release(pending.observationToken) }
+                #if DEBUG
+                    WorktreeStartupPreparationInstrumentation.currentRecorder?.recordReason(.failure)
+                #endif
+                return
+            }
+            let coverageCurrent = await metadataMonitor.flushCoverageAndCheckCurrent(
+                initial.observationToken,
+                repositoryKey: key.repositoryKey,
+                repositoryRoot: initial.repositoryRoot,
+                prefix: key.prefix,
+                expectedAcceptedWatermark: initial.currentness.acceptedWatermark
+            )
+            guard let pending = pendingPrefixControlAdmissions[key],
+                  pending.id == flightID,
+                  !pending.isCancelled,
+                  coverageCurrent,
+                  (try? Self.prefixControlRootIdentity(for: pending.repositoryRoot)) == key.rootIdentity,
+                  prefixControlCurrentness(for: GitWorkspaceAuthorityScopeKey(
+                      repositoryKey: key.repositoryKey,
+                      repositoryRelativeRootPrefix: key.prefix
+                  )) == pending.currentness
+            else {
+                let removed = takePendingPrefixControlAdmission(key, flightID: flightID)
+                removed?.waiters.values.forEach {
+                    $0.resume(throwing: GitPrefixControlEvidenceCacheError.invalidatedDuringCollection)
+                }
+                if let removed { await metadataMonitor.release(removed.observationToken) }
+                #if DEBUG
+                    WorktreeStartupPreparationInstrumentation.currentRecorder?
+                        .increment(.prefixCacheInvalidations)
+                    WorktreeStartupPreparationInstrumentation.currentRecorder?
+                        .recordReason(.staleCurrentness)
+                #endif
+                return
+            }
+
+            guard let completed = takePendingPrefixControlAdmission(key, flightID: flightID) else { return }
+            let residentBytes = Self.prefixControlFooterResidentBytes(footer)
+            let artifactBytes: UInt64 = 0
+            prefixControlCacheAccessOrdinal &+= 1
+            let entry = PrefixControlCacheEntry(
+                id: UUID(),
+                footer: footer,
+                observationToken: completed.observationToken,
+                currentness: completed.currentness,
+                lastAccessOrdinal: prefixControlCacheAccessOrdinal,
+                residentBytes: residentBytes,
+                artifactBytes: artifactBytes
+            )
+            if let replaced = prefixControlCacheEntries.updateValue(entry, forKey: key) {
+                prefixControlCacheResidentBytes = max(0, prefixControlCacheResidentBytes - replaced.residentBytes)
+                prefixControlCacheArtifactBytes = prefixControlCacheArtifactBytes >= replaced.artifactBytes
+                    ? prefixControlCacheArtifactBytes - replaced.artifactBytes
+                    : 0
+                await metadataMonitor.release(replaced.observationToken)
+            }
+            prefixControlCacheResidentBytes += residentBytes
+            prefixControlCacheArtifactBytes += artifactBytes
+            prefixControlCacheAdmissionCount &+= 1
+            #if DEBUG
+                WorktreeStartupPreparationInstrumentation.currentRecorder?
+                    .increment(.prefixCacheAdmissions)
+            #endif
+            await evictPrefixControlCacheIfNeeded()
+            completed.waiters.values.forEach { $0.resume(returning: footer) }
+        }
+    }
+
+    private func startOrJoinBoundedUncachedPrefixControlFlight(
+        key: PrefixControlCacheKey,
+        collector: @escaping @Sendable () async throws -> GitPrefixControlEvidenceManifestFooter
+    ) async throws -> GitPrefixControlEvidenceManifestFooter {
+        if let pending = pendingUncachedPrefixControlFlights[key], !pending.isCancelled {
+            prefixControlCacheCoalescedWaiterCount &+= 1
+            #if DEBUG
+                WorktreeStartupPreparationInstrumentation.currentRecorder?
+                    .increment(.prefixCacheCoalesces)
+            #endif
+            return try await waitForPendingUncachedPrefixControlFlight(key: key, flightID: pending.id)
+        }
+
+        let reservedResidentBytes = Self.maximumPrefixControlFooterResidentBytes
+        let reservedArtifactBytes: UInt64 = 0
+        let (nextResidentBytes, residentOverflow) = pendingUncachedPrefixControlResidentBytes
+            .addingReportingOverflow(reservedResidentBytes)
+        let (nextArtifactBytes, artifactOverflow) = pendingUncachedPrefixControlArtifactBytes
+            .addingReportingOverflow(reservedArtifactBytes)
+        guard !residentOverflow,
+              !artifactOverflow,
+              pendingUncachedPrefixControlFlights.count < Self.maximumPendingUncachedPrefixControlFlightCount,
+              nextResidentBytes <= Self.maximumPendingUncachedPrefixControlResidentBytes,
+              nextArtifactBytes <= Self.maximumPendingUncachedPrefixControlArtifactBytes
+        else { throw GitPrefixControlEvidenceCacheError.resourceAdmission }
+
+        let flightID = UUID()
+        prefixControlPhysicalScanCount &+= 1
+        let task = Task { try await collector() }
+        pendingUncachedPrefixControlResidentBytes = nextResidentBytes
+        pendingUncachedPrefixControlArtifactBytes = nextArtifactBytes
+        pendingUncachedPrefixControlFlights[key] = PendingUncachedPrefixControlFlight(
+            id: flightID,
+            task: task,
+            waiters: [:],
+            isCancelled: false,
+            reservedResidentBytes: reservedResidentBytes,
+            reservedArtifactBytes: reservedArtifactBytes
+        )
+        Task { [weak self] in
+            let result: Result<GitPrefixControlEvidenceManifestFooter, Error>
+            do {
+                result = try await .success(task.value)
+            } catch {
+                result = .failure(error)
+            }
+            await self?.completePendingUncachedPrefixControlFlight(
+                key: key,
+                flightID: flightID,
+                result: result
+            )
+        }
+        return try await waitForPendingUncachedPrefixControlFlight(key: key, flightID: flightID)
+    }
+
+    private func waitForPendingUncachedPrefixControlFlight(
+        key: PrefixControlCacheKey,
+        flightID: UUID
+    ) async throws -> GitPrefixControlEvidenceManifestFooter {
+        let waiterID = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard var pending = pendingUncachedPrefixControlFlights[key],
+                      pending.id == flightID,
+                      !pending.isCancelled
+                else {
+                    continuation.resume(throwing: GitPrefixControlEvidenceCacheError.invalidatedDuringCollection)
+                    return
+                }
+                pending.waiters[waiterID] = continuation
+                pendingUncachedPrefixControlFlights[key] = pending
+                if Task.isCancelled {
+                    Task { await self.cancelUncachedPrefixControlWaiter(
+                        key: key,
+                        flightID: flightID,
+                        waiterID: waiterID
+                    ) }
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelUncachedPrefixControlWaiter(
+                key: key,
+                flightID: flightID,
+                waiterID: waiterID
+            ) }
+        }
+    }
+
+    private func cancelUncachedPrefixControlWaiter(
+        key: PrefixControlCacheKey,
+        flightID: UUID,
+        waiterID: UUID
+    ) {
+        guard var pending = pendingUncachedPrefixControlFlights[key],
+              pending.id == flightID,
+              let waiter = pending.waiters.removeValue(forKey: waiterID)
+        else { return }
+        waiter.resume(throwing: CancellationError())
+        if pending.waiters.isEmpty {
+            pending.isCancelled = true
+            pending.task.cancel()
+        }
+        pendingUncachedPrefixControlFlights[key] = pending
+    }
+
+    private func completePendingUncachedPrefixControlFlight(
+        key: PrefixControlCacheKey,
+        flightID: UUID,
+        result: Result<GitPrefixControlEvidenceManifestFooter, Error>
+    ) {
+        guard let completed = takePendingUncachedPrefixControlFlight(key, flightID: flightID) else { return }
+        guard !completed.isCancelled else { return }
+        switch result {
+        case let .success(footer):
+            completed.waiters.values.forEach { $0.resume(returning: footer) }
+        case let .failure(error):
+            completed.waiters.values.forEach { $0.resume(throwing: error) }
+        }
+    }
+
+    private func prefixControlCurrentness(
+        for scopeKey: GitWorkspaceAuthorityScopeKey
+    ) -> PrefixControlCurrentnessKey {
+        let record = records[scopeKey.repositoryKey] ?? Record()
+        return PrefixControlCurrentnessKey(
+            invalidationGeneration: record.invalidationGeneration,
+            publicationGeneration: record.publicationGenerationByScope[scopeKey] ?? 0,
+            acceptedWatermark: metadataMonitor.acceptedWatermark(for: scopeKey.repositoryKey),
+            mutationDepth: hasActiveMutation(for: scopeKey.repositoryKey) ? max(1, record.mutationDepth) : record.mutationDepth,
+            monitorCoverageUnavailable: record.monitorCoverageUnavailable
+        )
     }
 
     func beginCollection(
@@ -216,6 +858,28 @@ actor GitWorkspaceStateAuthority {
             record.acceptedWatermarkByScope[scopeKey] = token.acceptedMetadataWatermark
             records[scopeKey.repositoryKey] = record
             updateSynchronousState(repositoryKey: scopeKey.repositoryKey, record: record)
+            let promotedCurrentness = PrefixControlCurrentnessKey(
+                invalidationGeneration: record.invalidationGeneration,
+                publicationGeneration: publicationGeneration,
+                acceptedWatermark: token.acceptedMetadataWatermark,
+                mutationDepth: record.mutationDepth,
+                monitorCoverageUnavailable: record.monitorCoverageUnavailable
+            )
+            let promotableKeys = prefixControlCacheEntries.keys.filter { key in
+                guard let entry = prefixControlCacheEntries[key] else { return false }
+                return key.repositoryKey == scopeKey.repositoryKey
+                    && key.prefix == scopeKey.repositoryRelativeRootPrefix
+                    && entry.currentness.invalidationGeneration == record.invalidationGeneration
+                    && entry.currentness.publicationGeneration == token.scopePublicationGeneration
+                    && entry.currentness.acceptedWatermark == token.acceptedMetadataWatermark
+                    && entry.currentness.mutationDepth == 0
+                    && !entry.currentness.monitorCoverageUnavailable
+            }
+            for key in promotableKeys {
+                guard var entry = prefixControlCacheEntries[key] else { continue }
+                entry.currentness = promotedCurrentness
+                prefixControlCacheEntries[key] = entry
+            }
             return GitWorkspaceAuthorityLease(
                 scopeKey: scopeKey,
                 authorityGeneration: publicationGeneration,
@@ -704,6 +1368,7 @@ actor GitWorkspaceStateAuthority {
                 kind: .mutationBegan(kind)
             )
         }
+        await invalidatePrefixControlCache(for: affectedKeys)
         await removeReusableSnapshotAliases(for: affectedKeys)
         activeMutations[token.id] = token
         return token
@@ -748,6 +1413,7 @@ actor GitWorkspaceStateAuthority {
             record: record,
             kind: .metadata(kinds)
         )
+        await invalidatePrefixControlCache(for: [repositoryKey])
         await removeReusableSnapshotAliases(for: [repositoryKey])
     }
 
@@ -772,11 +1438,19 @@ actor GitWorkspaceStateAuthority {
         let token = try await metadataMonitor.retain(repositoryKey: key, paths: paths) { [weak self] kinds in
             Task { await self?.metadataDidChange(repositoryKey: key, kinds: kinds) }
         }
+        let acceptedWatermark = metadataMonitor.acceptedWatermark(for: key)
+        let hasValidatedFullCoverage = await metadataMonitor.flushCoverageAndCheckCurrent(
+            token,
+            repositoryKey: key,
+            paths: paths,
+            expectedAcceptedWatermark: acceptedWatermark
+        )
         var record = records[key] ?? Record()
-        if record.monitorCoverageUnavailable {
+        if record.monitorCoverageUnavailable, hasValidatedFullCoverage {
             record.monitorCoverageUnavailable = false
             record.invalidationGeneration &+= 1
             record.snapshotsByScope.removeAll(keepingCapacity: true)
+            await invalidatePrefixControlCache(for: [key])
         }
         records[key] = record
         updateSynchronousState(repositoryKey: key, record: record)
@@ -811,11 +1485,186 @@ actor GitWorkspaceStateAuthority {
         record.snapshotsByScope.removeAll(keepingCapacity: true)
         records[lease.repositoryKey] = record
         updateSynchronousState(repositoryKey: lease.repositoryKey, record: record)
+        await invalidatePrefixControlCache(for: [lease.repositoryKey])
         await removeReusableSnapshotAliases(for: [lease.repositoryKey])
     }
 
     func releaseMetadataObservation(_ token: GitWorkspaceMetadataMonitor.RetainToken) async {
         await metadataMonitor.release(token)
+    }
+
+    private func takePendingPrefixControlAdmission(
+        _ key: PrefixControlCacheKey,
+        flightID: UUID
+    ) -> PendingPrefixControlAdmission? {
+        guard let pending = pendingPrefixControlAdmissions[key],
+              pending.id == flightID
+        else { return nil }
+        pendingPrefixControlAdmissions.removeValue(forKey: key)
+        pendingPrefixControlResidentBytes = max(
+            0,
+            pendingPrefixControlResidentBytes - pending.reservedResidentBytes
+        )
+        pendingPrefixControlArtifactBytes = pendingPrefixControlArtifactBytes >= pending.reservedArtifactBytes
+            ? pendingPrefixControlArtifactBytes - pending.reservedArtifactBytes
+            : 0
+        return pending
+    }
+
+    private func cancelPendingPrefixControlAdmission(
+        _ key: PrefixControlCacheKey,
+        invalidated: Bool
+    ) async {
+        guard var pending = pendingPrefixControlAdmissions[key],
+              !pending.isCancelled
+        else { return }
+        pending.isCancelled = true
+        let waiters = pending.waiters
+        pending.waiters.removeAll(keepingCapacity: false)
+        pendingPrefixControlAdmissions[key] = pending
+        pending.task.cancel()
+        let error: Error = invalidated
+            ? GitPrefixControlEvidenceCacheError.invalidatedDuringCollection
+            : CancellationError()
+        waiters.values.forEach { $0.resume(throwing: error) }
+        if invalidated {
+            prefixControlCacheInvalidationCount &+= 1
+            #if DEBUG
+                WorktreeStartupPreparationInstrumentation.currentRecorder?
+                    .increment(.prefixCacheInvalidations)
+            #endif
+        }
+    }
+
+    private func takePendingUncachedPrefixControlFlight(
+        _ key: PrefixControlCacheKey,
+        flightID: UUID
+    ) -> PendingUncachedPrefixControlFlight? {
+        guard let pending = pendingUncachedPrefixControlFlights[key],
+              pending.id == flightID
+        else { return nil }
+        pendingUncachedPrefixControlFlights.removeValue(forKey: key)
+        pendingUncachedPrefixControlResidentBytes = max(
+            0,
+            pendingUncachedPrefixControlResidentBytes - pending.reservedResidentBytes
+        )
+        pendingUncachedPrefixControlArtifactBytes = pendingUncachedPrefixControlArtifactBytes >= pending.reservedArtifactBytes
+            ? pendingUncachedPrefixControlArtifactBytes - pending.reservedArtifactBytes
+            : 0
+        return pending
+    }
+
+    private func removePrefixControlCacheEntry(
+        _ key: PrefixControlCacheKey,
+        invalidated: Bool
+    ) async {
+        guard let removed = prefixControlCacheEntries.removeValue(forKey: key) else { return }
+        prefixControlCacheResidentBytes = max(0, prefixControlCacheResidentBytes - removed.residentBytes)
+        prefixControlCacheArtifactBytes = prefixControlCacheArtifactBytes >= removed.artifactBytes
+            ? prefixControlCacheArtifactBytes - removed.artifactBytes
+            : 0
+        if invalidated { prefixControlCacheInvalidationCount &+= 1 }
+        await metadataMonitor.release(removed.observationToken)
+    }
+
+    private func invalidatePrefixControlCache(
+        for repositoryKeys: Set<GitWorkspaceAuthorityRepositoryKey>
+    ) async {
+        let entryKeys = prefixControlCacheEntries.keys.filter {
+            repositoryKeys.contains($0.repositoryKey)
+        }
+        for key in entryKeys {
+            await removePrefixControlCacheEntry(key, invalidated: true)
+        }
+        let pendingKeys = pendingPrefixControlAdmissions.keys.filter {
+            repositoryKeys.contains($0.repositoryKey)
+        }
+        for key in pendingKeys {
+            await cancelPendingPrefixControlAdmission(key, invalidated: true)
+        }
+    }
+
+    private func evictPrefixControlCacheIfNeeded() async {
+        while prefixControlCacheEntries.count > prefixControlCacheLimits.maximumEntryCount
+            || prefixControlCacheResidentBytes > prefixControlCacheLimits.maximumResidentBytes
+            || prefixControlCacheArtifactBytes > prefixControlCacheLimits.maximumArtifactBytes
+            || prefixControlRepositoryEntryLimitExceeded()
+        {
+            let overfullRepositories = Set(
+                Dictionary(grouping: prefixControlCacheEntries.keys, by: \.repositoryKey)
+                    .filter { $0.value.count > prefixControlCacheLimits.maximumEntriesPerRepository }
+                    .map(\.key)
+            )
+            let candidates = prefixControlCacheEntries.filter {
+                overfullRepositories.isEmpty || overfullRepositories.contains($0.key.repositoryKey)
+            }
+            guard let candidate = candidates.min(by: {
+                if $0.value.lastAccessOrdinal != $1.value.lastAccessOrdinal {
+                    return $0.value.lastAccessOrdinal < $1.value.lastAccessOrdinal
+                }
+                return $0.value.id.uuidString < $1.value.id.uuidString
+            }) else { break }
+            prefixControlCacheEvictionCount &+= 1
+            #if DEBUG
+                WorktreeStartupPreparationInstrumentation.currentRecorder?
+                    .increment(.prefixCacheEvictions)
+                WorktreeStartupPreparationInstrumentation.currentRecorder?
+                    .recordReason(.capacityEviction)
+            #endif
+            await removePrefixControlCacheEntry(candidate.key, invalidated: false)
+        }
+    }
+
+    private func prefixControlRepositoryEntryLimitExceeded() -> Bool {
+        Dictionary(grouping: prefixControlCacheEntries.keys, by: \.repositoryKey)
+            .values
+            .contains { $0.count > prefixControlCacheLimits.maximumEntriesPerRepository }
+    }
+
+    private nonisolated static let maximumPrefixControlFooterResidentBytes = 512
+    private nonisolated static let maximumPendingUncachedPrefixControlFlightCount = 1
+    private nonisolated static let maximumPendingUncachedPrefixControlResidentBytes = maximumPrefixControlFooterResidentBytes
+    private nonisolated static let maximumPendingUncachedPrefixControlArtifactBytes: UInt64 = 0
+
+    private nonisolated static func prefixControlFooterResidentBytes(
+        _ footer: GitPrefixControlEvidenceManifestFooter
+    ) -> Int {
+        MemoryLayout<GitPrefixControlEvidenceManifestFooter>.stride
+            + footer.ignoreControlDigest.count
+            + footer.attributeControlDigest.count
+            + footer.artifactDigest.count
+    }
+
+    private nonisolated static func prefixControlFooterIsValid(
+        _ footer: GitPrefixControlEvidenceManifestFooter
+    ) -> Bool {
+        guard footer.ignoreControlDigest.count == 32,
+              footer.attributeControlDigest.count == 32,
+              footer.artifactDigest.count == 32,
+              prefixControlFooterResidentBytes(footer) <= maximumPrefixControlFooterResidentBytes
+        else { return false }
+        let (_, recordOverflow) = footer.recordPayloadByteCount.addingReportingOverflow(footer.recordCount)
+        let (_, pathOverflow) = footer.pathPayloadByteCount.addingReportingOverflow(footer.recordCount)
+        return !recordOverflow && !pathOverflow
+    }
+
+    private nonisolated static func prefixControlRootIdentity(
+        for root: URL
+    ) throws -> PrefixControlRootIdentity {
+        let canonicalRoot = root.resolvingSymlinksInPath().standardizedFileURL
+        guard canonicalRoot.isFileURL,
+              canonicalRoot.path.hasPrefix("/"),
+              !canonicalRoot.path.contains("\0")
+        else { throw GitPrefixControlEvidenceCacheError.rootIdentityChanged }
+        var value = stat()
+        guard lstat(canonicalRoot.path, &value) == 0,
+              value.st_mode & S_IFMT == S_IFDIR
+        else { throw GitPrefixControlEvidenceCacheError.rootIdentityChanged }
+        return PrefixControlRootIdentity(
+            canonicalPath: canonicalRoot.path,
+            device: UInt64(value.st_dev),
+            inode: UInt64(value.st_ino)
+        )
     }
 
     #if DEBUG
@@ -833,7 +1682,24 @@ actor GitWorkspaceStateAuthority {
                 pendingReusableSnapshotAdmissionCount: pendingReusableSnapshotAdmissions.count,
                 pendingReusableSnapshotArtifactBytes: pendingReusableSnapshotArtifactBytes,
                 reusableSnapshotArtifactBudgetRejectionCount: reusableSnapshotArtifactBudgetRejectionCount,
-                invalidationSubscriberCount: invalidationContinuations.count
+                invalidationSubscriberCount: invalidationContinuations.count,
+                prefixControlCacheEntryCount: prefixControlCacheEntries.count,
+                prefixControlCacheResidentBytes: prefixControlCacheResidentBytes,
+                prefixControlCacheArtifactBytes: prefixControlCacheArtifactBytes,
+                pendingPrefixControlAdmissionCount: pendingPrefixControlAdmissions.count
+                    + pendingUncachedPrefixControlFlights.count,
+                pendingPrefixControlResidentBytes: pendingPrefixControlResidentBytes
+                    + pendingUncachedPrefixControlResidentBytes,
+                pendingPrefixControlArtifactBytes: pendingPrefixControlArtifactBytes
+                    + pendingUncachedPrefixControlArtifactBytes,
+                prefixControlCacheHitCount: prefixControlCacheHitCount,
+                prefixControlCacheMissCount: prefixControlCacheMissCount,
+                prefixControlCacheCoalescedWaiterCount: prefixControlCacheCoalescedWaiterCount,
+                prefixControlCacheAdmissionCount: prefixControlCacheAdmissionCount,
+                prefixControlCacheEvictionCount: prefixControlCacheEvictionCount,
+                prefixControlCacheInvalidationCount: prefixControlCacheInvalidationCount,
+                prefixControlCacheBypassCount: prefixControlCacheBypassCount,
+                prefixControlPhysicalScanCount: prefixControlPhysicalScanCount
             )
         }
 

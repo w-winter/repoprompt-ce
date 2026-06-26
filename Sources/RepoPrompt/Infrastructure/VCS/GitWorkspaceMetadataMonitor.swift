@@ -60,9 +60,10 @@ actor GitWorkspaceMetadataMonitor {
     #endif
 
     fileprivate struct WatchTarget: Hashable {
-        fileprivate enum Scope: String, Hashable {
+        fileprivate enum Scope: Hashable {
             case exactFile
             case subtree
+            case prefixControl(repositoryRootPath: String, relativePrefix: String)
         }
 
         let targetURL: URL
@@ -71,15 +72,25 @@ actor GitWorkspaceMetadataMonitor {
         let eventKinds: Set<GitWorkspaceMetadataEventKind>
 
         var key: String {
-            "\(scope.rawValue):\(targetURL.standardizedFileURL.path)"
+            switch scope {
+            case .exactFile:
+                "exactFile:\(targetURL.standardizedFileURL.path)"
+            case .subtree:
+                "subtree:\(targetURL.standardizedFileURL.path)"
+            case let .prefixControl(repositoryRootPath, relativePrefix):
+                "prefixControl:\(repositoryRootPath):\(relativePrefix)"
+            }
         }
 
-        func matches(_ eventPath: String) -> Bool {
+        func matchingEventKinds(
+            _ eventPath: String,
+            flags: FSEventStreamEventFlags
+        ) -> Set<GitWorkspaceMetadataEventKind> {
             let targetPath = targetURL.standardizedFileURL.path
             let canonicalEventPath = URL(fileURLWithPath: eventPath)
                 .resolvingSymlinksInPath()
                 .standardizedFileURL.path
-            return switch scope {
+            let matches = switch scope {
             case .exactFile:
                 // Some replacement/deletion batches are reported at the
                 // watched parent even with file-level events enabled. Treat
@@ -89,7 +100,59 @@ actor GitWorkspaceMetadataMonitor {
                     || canonicalEventPath == targetURL.deletingLastPathComponent().path
             case .subtree:
                 canonicalEventPath == targetPath || canonicalEventPath.hasPrefix(targetPath + "/")
+            case let .prefixControl(repositoryRootPath, relativePrefix):
+                Self.prefixControlScopeMatches(
+                    canonicalEventPath: canonicalEventPath,
+                    repositoryRootPath: repositoryRootPath,
+                    relativePrefix: relativePrefix,
+                    flags: flags
+                )
             }
+            return matches ? eventKinds : []
+        }
+
+        private static func prefixControlScopeMatches(
+            canonicalEventPath: String,
+            repositoryRootPath: String,
+            relativePrefix: String,
+            flags: FSEventStreamEventFlags
+        ) -> Bool {
+            guard canonicalEventPath == repositoryRootPath
+                || canonicalEventPath.hasPrefix(repositoryRootPath + "/")
+            else { return false }
+            let relativePath = canonicalEventPath == repositoryRootPath
+                ? ""
+                : String(canonicalEventPath.dropFirst(repositoryRootPath.count + 1))
+            let components = relativePath.split(separator: "/", omittingEmptySubsequences: false)
+            // Repository metadata is covered by the ordinary typed metadata
+            // targets. A checkout-owned `.git` subtree can be enormous and is
+            // never part of prefix-control discovery.
+            guard !components.contains(".git") else { return false }
+
+            let isAtOrBelowPrefix = relativePrefix.isEmpty
+                || relativePath == relativePrefix
+                || relativePath.hasPrefix(relativePrefix + "/")
+            let isPrefixAncestor = relativePath.isEmpty
+                || relativePath == relativePrefix
+                || relativePrefix.hasPrefix(relativePath + "/")
+            let parent = relativePath.isEmpty
+                ? ""
+                : String(relativePath.split(separator: "/").dropLast().joined(separator: "/"))
+            let parentIsPrefixAncestor = parent.isEmpty
+                || parent == relativePrefix
+                || relativePrefix.hasPrefix(parent + "/")
+            let isControl = [".gitignore", ".repo_ignore", ".cursorignore", ".gitattributes"]
+                .contains(components.last.map(String.init) ?? "")
+                && (isAtOrBelowPrefix || parentIsPrefixAncestor)
+            if isControl { return true }
+
+            let itemIsDirectory = flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsDir) != 0
+            let itemIsSymlink = flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsSymlink) != 0
+            // Directory and symlink topology can move controls into or out of
+            // the physical traversal domain. Root/ancestor events are also a
+            // conservative topology cut even when FSEvents omits item flags.
+            return (itemIsDirectory || itemIsSymlink) && (isAtOrBelowPrefix || isPrefixAncestor)
+                || relativePath.isEmpty
         }
     }
 
@@ -167,6 +230,27 @@ actor GitWorkspaceMetadataMonitor {
         onEvent: @escaping @Sendable (Set<GitWorkspaceMetadataEventKind>) -> Void
     ) throws -> RetainToken {
         let requestedTargets = try Self.resolveWatchTargets(paths)
+        return try retain(repositoryKey: repositoryKey, targets: requestedTargets, onEvent: onEvent)
+    }
+
+    func retainPrefixControlScope(
+        repositoryKey: GitWorkspaceAuthorityRepositoryKey,
+        repositoryRoot: URL,
+        prefix: GitRepositoryRelativeRootPrefix,
+        onEvent: @escaping @Sendable (Set<GitWorkspaceMetadataEventKind>) -> Void
+    ) throws -> RetainToken {
+        let target = try Self.resolvePrefixControlWatchTarget(
+            repositoryRoot: repositoryRoot,
+            prefix: prefix
+        )
+        return try retain(repositoryKey: repositoryKey, targets: [target], onEvent: onEvent)
+    }
+
+    private func retain(
+        repositoryKey: GitWorkspaceAuthorityRepositoryKey,
+        targets requestedTargets: [WatchTarget],
+        onEvent: @escaping @Sendable (Set<GitWorkspaceMetadataEventKind>) -> Void
+    ) throws -> RetainToken {
         let token = RetainToken(
             id: UUID(),
             repositoryKey: repositoryKey,
@@ -217,6 +301,39 @@ actor GitWorkspaceMetadataMonitor {
         return token
     }
 
+    /// Flushes all sources retained by the exact typed prefix-control token,
+    /// crosses each source's private callback queue, and then checks the
+    /// callback-accepted watermark. This is the synchronous linearization cut
+    /// used by prefix evidence lookup and conditional admission.
+    func flushCoverageAndCheckCurrent(
+        _ token: RetainToken,
+        repositoryKey: GitWorkspaceAuthorityRepositoryKey,
+        repositoryRoot: URL,
+        prefix: GitRepositoryRelativeRootPrefix,
+        expectedAcceptedWatermark: UInt64
+    ) -> Bool {
+        guard token.repositoryKey == repositoryKey,
+              let requested = try? Self.resolvePrefixControlWatchTarget(
+                  repositoryRoot: repositoryRoot,
+                  prefix: prefix
+              ),
+              token.coveredTargetKeys == Set([requested.key]),
+              let record = records[repositoryKey],
+              record.targetKeysByTokenID[token.id] == token.coveredTargetKeys,
+              token.coveredTargetKeys.isSubset(of: Set(record.sourcesByTargetKey.keys))
+        else { return false }
+        for key in token.coveredTargetKeys.sorted() {
+            guard let source = record.sourcesByTargetKey[key] else { return false }
+            source.flushSync()
+        }
+        guard let currentRecord = records[repositoryKey],
+              currentRecord.targetKeysByTokenID[token.id] == token.coveredTargetKeys,
+              token.coveredTargetKeys.isSubset(of: Set(currentRecord.sourcesByTargetKey.keys)),
+              acceptedWatermark(for: repositoryKey) == expectedAcceptedWatermark
+        else { return false }
+        return true
+    }
+
     func coverageIsCurrent(
         _ token: RetainToken,
         repositoryKey: GitWorkspaceAuthorityRepositoryKey,
@@ -229,6 +346,34 @@ actor GitWorkspaceMetadataMonitor {
               let record = records[repositoryKey],
               record.targetKeysByTokenID[token.id] == token.coveredTargetKeys,
               token.coveredTargetKeys.isSubset(of: Set(record.sourcesByTargetKey.keys)),
+              acceptedWatermark(for: repositoryKey) == expectedAcceptedWatermark
+        else { return false }
+        return true
+    }
+
+    /// Flushes the complete typed metadata observation before allowing a
+    /// repository-wide monitor gap to recover. Narrow prefix-control coverage
+    /// is intentionally validated by the separate overload above.
+    func flushCoverageAndCheckCurrent(
+        _ token: RetainToken,
+        repositoryKey: GitWorkspaceAuthorityRepositoryKey,
+        paths: [URL],
+        expectedAcceptedWatermark: UInt64
+    ) -> Bool {
+        guard token.repositoryKey == repositoryKey,
+              let requestedTargets = try? Self.resolveWatchTargets(paths),
+              token.coveredTargetKeys == Set(requestedTargets.map(\.key)),
+              let record = records[repositoryKey],
+              record.targetKeysByTokenID[token.id] == token.coveredTargetKeys,
+              token.coveredTargetKeys.isSubset(of: Set(record.sourcesByTargetKey.keys))
+        else { return false }
+        for key in token.coveredTargetKeys.sorted() {
+            guard let source = record.sourcesByTargetKey[key] else { return false }
+            source.flushSync()
+        }
+        guard let currentRecord = records[repositoryKey],
+              currentRecord.targetKeysByTokenID[token.id] == token.coveredTargetKeys,
+              token.coveredTargetKeys.isSubset(of: Set(currentRecord.sourcesByTargetKey.keys)),
               acceptedWatermark(for: repositoryKey) == expectedAcceptedWatermark
         else { return false }
         return true
@@ -319,6 +464,19 @@ actor GitWorkspaceMetadataMonitor {
                 pollingCommandCount: 0
             )
         }
+
+        nonisolated static func prefixControlScopeMatchesForTesting(
+            repositoryRoot: URL,
+            prefix: GitRepositoryRelativeRootPrefix,
+            eventPath: String,
+            flags: FSEventStreamEventFlags
+        ) throws -> Bool {
+            let target = try resolvePrefixControlWatchTarget(
+                repositoryRoot: repositoryRoot,
+                prefix: prefix
+            )
+            return !target.matchingEventKinds(eventPath, flags: flags).isEmpty
+        }
     #endif
 
     private static func resolveWatchTargets(_ paths: [URL]) throws -> [WatchTarget] {
@@ -364,6 +522,30 @@ actor GitWorkspaceMetadataMonitor {
             result[target.key] = target
         }
         return result.values.sorted { $0.key < $1.key }
+    }
+
+    private static func resolvePrefixControlWatchTarget(
+        repositoryRoot: URL,
+        prefix: GitRepositoryRelativeRootPrefix
+    ) throws -> WatchTarget {
+        let root = repositoryRoot.resolvingSymlinksInPath().standardizedFileURL
+        guard root.isFileURL,
+              root.path.hasPrefix("/"),
+              !root.path.contains("\0")
+        else { throw GitWorkspaceMetadataMonitorError.invalidPath }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else { throw GitWorkspaceMetadataMonitorError.unwatchablePath }
+        return WatchTarget(
+            targetURL: root,
+            watchRootURL: root,
+            scope: .prefixControl(
+                repositoryRootPath: root.path,
+                relativePrefix: prefix.value
+            ),
+            eventKinds: [.ignoreAuthority, .attributeAuthority]
+        )
     }
 
     private static func eventKinds(for url: URL) -> Set<GitWorkspaceMetadataEventKind> {
@@ -446,7 +628,7 @@ private final class GitMetadataFSEventSource: @unchecked Sendable {
             label: "com.repoprompt.git-workspace-metadata.\(UUID().uuidString)",
             qos: .utility
         )
-        if target.scope == .exactFile {
+        if case .exactFile = target.scope {
             let descriptor = open(target.watchRootURL.path, O_EVTONLY | O_CLOEXEC)
             guard descriptor >= 0 else {
                 throw GitWorkspaceMetadataMonitorError.unwatchablePath
@@ -577,9 +759,7 @@ private final class GitMetadataFSEventSource: @unchecked Sendable {
             if entry.flags & gapMask != 0 {
                 kinds.insert(.monitorGap)
             }
-            if target.matches(entry.path) {
-                kinds.formUnion(target.eventKinds)
-            }
+            kinds.formUnion(target.matchingEventKinds(entry.path, flags: entry.flags))
         }
         if !kinds.isEmpty {
             onEvent(kinds)

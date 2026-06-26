@@ -144,6 +144,341 @@ enum GitProcessCommandFamily: String, Equatable {
     case mutation
 }
 
+#if DEBUG
+    enum WorktreeStartupPreparationInstrumentation {
+        enum Phase: String, CaseIterable, Equatable {
+            case scopeResolution = "scope_resolution"
+            case setFlagsTotal = "set_flags_total"
+            case loadedRootIngressFence = "loaded_root_ingress_fence"
+            case loadedRootPolicySnapshot = "loaded_root_policy_snapshot"
+            case discoveryObservation = "discovery_observation"
+            case discoveryAuthorityCapture = "discovery_authority_capture"
+            case replacementObservation = "replacement_observation"
+            case collectionFence = "collection_fence"
+            case capturedAuthorityCapture = "captured_authority_capture"
+            case capturedObservationValidation = "captured_observation_validation"
+            case authorityMetadataGit = "authority_metadata_git"
+            case prefixControlCacheLookup = "prefix_control_cache_lookup"
+            case prefixControlScan = "prefix_control_scan"
+            case prefixControlCacheAdmit = "prefix_control_cache_admit"
+            case treeInventorySpool = "tree_inventory_spool"
+            case catalogManifestBuild = "catalog_manifest_build"
+            case authorityInstall = "authority_install"
+            case snapshotMaterialization = "snapshot_materialization"
+            case admissionPrepare = "admission_prepare"
+            case preparedAdmissionCurrentness = "prepared_admission_currentness"
+            case admissionCommit = "admission_commit"
+            case committedAdmissionCurrentness = "committed_admission_currentness"
+            case finalLoadedRootCurrentness = "final_loaded_root_currentness"
+        }
+
+        enum Counter: String, CaseIterable, Equatable {
+            case authorityCaptures = "authority_captures"
+            case gitCommandCount = "git_command_count"
+            case gitQueueMicroseconds = "git_queue_us"
+            case gitDurationMicroseconds = "git_duration_us"
+            case prefixCacheHits = "prefix_cache_hits"
+            case prefixCacheMisses = "prefix_cache_misses"
+            case prefixCacheInvalidations = "prefix_cache_invalidations"
+            case prefixCacheAdmissions = "prefix_cache_admissions"
+            case prefixCacheEvictions = "prefix_cache_evictions"
+            case prefixCacheBypasses = "prefix_cache_bypasses"
+            case prefixCacheCoalesces = "prefix_cache_coalesces"
+            case prefixScanCount = "prefix_scan_count"
+            case enumeratedCandidates = "enumerated_candidates"
+            case enumeratedDirectories = "enumerated_directories"
+            case explicitlyPrunedDirectories = "explicitly_pruned_directories"
+            case controlRecordCount = "control_record_count"
+            case treeRecords = "tree_records"
+            case treeSpoolBytes = "tree_spool_bytes"
+            case inventoryRecords = "inventory_records"
+            case catalogBatches = "catalog_batches"
+            case catalogRegularPaths = "catalog_regular_paths"
+            case snapshotSearchablePaths = "snapshot_searchable_paths"
+        }
+
+        enum Reason: String, CaseIterable, Equatable {
+            case absent
+            case bypassed
+            case rootIdentityChanged = "root_identity_changed"
+            case authorityGenerationChanged = "authority_generation_changed"
+            case watermarkAdvanced = "watermark_advanced"
+            case coverageLost = "coverage_lost"
+            case monitorUnavailable = "monitor_unavailable"
+            case controlOrTopologyEvent = "control_or_topology_event"
+            case monitorGap = "monitor_gap"
+            case replacement
+            case capacityEviction = "capacity_eviction"
+            case staleCurrentness = "stale_currentness"
+            case fallback
+            case failure
+            case cancellation
+        }
+
+        enum TerminalState: String, Equatable {
+            case admitted
+            case failed
+            case cancelled
+        }
+
+        struct PhaseSnapshot: Equatable {
+            let count: UInt64
+            let completedCount: UInt64
+            let completedDurationNanoseconds: UInt64
+            let activeCount: UInt64
+            let activeElapsedNanoseconds: UInt64
+        }
+
+        struct RouteControlOwnership: Equatable {
+            let controlID: UUID
+            let windowID: Int
+            let workspaceID: UUID
+            let contextID: UUID
+            let rootID: UUID
+            let revoked: Bool
+        }
+
+        struct Snapshot: Equatable {
+            let preparationID: UUID
+            let startedAtNanoseconds: UInt64
+            let elapsedNanoseconds: UInt64
+            let terminalState: TerminalState?
+            let currentActivePhase: Phase?
+            let routeControlOwnership: RouteControlOwnership?
+            let phases: [Phase: PhaseSnapshot]
+            let counters: [Counter: UInt64]
+            let saturatedCounters: Set<Counter>
+            let reasons: [Reason: UInt64]
+        }
+
+        final class Span: @unchecked Sendable {
+            private let lock = NSLock()
+            private weak var recorder: Recorder?
+            private var token: UUID?
+
+            fileprivate init(recorder: Recorder?, token: UUID?) {
+                self.recorder = recorder
+                self.token = token
+            }
+
+            func end() {
+                lock.lock()
+                let finishingToken = token
+                token = nil
+                lock.unlock()
+                guard let finishingToken else { return }
+                recorder?.end(finishingToken)
+            }
+
+            deinit {
+                end()
+            }
+        }
+
+        final class Recorder: @unchecked Sendable {
+            private struct MutablePhase {
+                var count: UInt64 = 0
+                var completedCount: UInt64 = 0
+                var completedDurationNanoseconds: UInt64 = 0
+            }
+
+            private struct ActiveSpan {
+                let phase: Phase
+                let startedAtNanoseconds: UInt64
+                let ordinal: UInt64
+            }
+
+            let preparationID: UUID
+            let startedAtNanoseconds: UInt64
+
+            private let lock = NSLock()
+            private var phases: [Phase: MutablePhase] = [:]
+            private var activeSpans: [UUID: ActiveSpan] = [:]
+            private var counters: [Counter: UInt64] = [:]
+            private var saturatedCounters: Set<Counter> = []
+            private var reasons: [Reason: UInt64] = [:]
+            private var nextSpanOrdinal: UInt64 = 0
+            private var terminalState: TerminalState?
+            private var terminalAtNanoseconds: UInt64?
+            private var routeControlOwnership: RouteControlOwnership?
+
+            init(preparationID: UUID, startedAtNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds) {
+                self.preparationID = preparationID
+                self.startedAtNanoseconds = startedAtNanoseconds
+            }
+
+            func begin(_ phase: Phase) -> Span {
+                lock.lock()
+                guard terminalState == nil else {
+                    lock.unlock()
+                    return Span(recorder: nil, token: nil)
+                }
+                let now = DispatchTime.now().uptimeNanoseconds
+                let token = UUID()
+                nextSpanOrdinal = Self.saturatingAdd(nextSpanOrdinal, 1).value
+                var metric = phases[phase] ?? MutablePhase()
+                metric.count = Self.saturatingAdd(metric.count, 1).value
+                phases[phase] = metric
+                activeSpans[token] = ActiveSpan(
+                    phase: phase,
+                    startedAtNanoseconds: now,
+                    ordinal: nextSpanOrdinal
+                )
+                lock.unlock()
+                return Span(recorder: self, token: token)
+            }
+
+            func recordCompleted(_ phase: Phase, durationNanoseconds: UInt64) {
+                lock.lock()
+                guard terminalState == nil else {
+                    lock.unlock()
+                    return
+                }
+                var metric = phases[phase] ?? MutablePhase()
+                let count = Self.saturatingAdd(metric.count, 1)
+                metric.count = count.value
+                let completed = Self.saturatingAdd(metric.completedCount, 1)
+                metric.completedCount = completed.value
+                let duration = Self.saturatingAdd(metric.completedDurationNanoseconds, durationNanoseconds)
+                metric.completedDurationNanoseconds = duration.value
+                phases[phase] = metric
+                lock.unlock()
+            }
+
+            func increment(_ counter: Counter, by amount: UInt64 = 1) {
+                lock.lock()
+                let result = Self.saturatingAdd(counters[counter, default: 0], amount)
+                counters[counter] = result.value
+                if result.saturated {
+                    saturatedCounters.insert(counter)
+                }
+                lock.unlock()
+            }
+
+            func setAbsolute(_ counter: Counter, to value: UInt64) {
+                lock.lock()
+                counters[counter] = max(counters[counter, default: 0], value)
+                lock.unlock()
+            }
+
+            func recordReason(_ reason: Reason) {
+                lock.lock()
+                let result = Self.saturatingAdd(reasons[reason, default: 0], 1)
+                reasons[reason] = result.value
+                lock.unlock()
+            }
+
+            func recordRouteControlOwnership(
+                controlID: UUID,
+                scope: DebugWorktreeStartupBenchmarkScope
+            ) {
+                lock.lock()
+                if routeControlOwnership == nil {
+                    routeControlOwnership = RouteControlOwnership(
+                        controlID: controlID,
+                        windowID: scope.windowID,
+                        workspaceID: scope.workspaceID,
+                        contextID: scope.contextID,
+                        rootID: scope.rootID,
+                        revoked: false
+                    )
+                }
+                lock.unlock()
+            }
+
+            func recordRouteControlRevoked(controlID: UUID) {
+                lock.lock()
+                if let ownership = routeControlOwnership,
+                   ownership.controlID == controlID,
+                   !ownership.revoked
+                {
+                    routeControlOwnership = RouteControlOwnership(
+                        controlID: ownership.controlID,
+                        windowID: ownership.windowID,
+                        workspaceID: ownership.workspaceID,
+                        contextID: ownership.contextID,
+                        rootID: ownership.rootID,
+                        revoked: true
+                    )
+                }
+                lock.unlock()
+            }
+
+            @discardableResult
+            func terminalize(_ state: TerminalState) -> Bool {
+                lock.lock()
+                defer { lock.unlock() }
+                guard terminalState == nil else { return false }
+                terminalState = state
+                terminalAtNanoseconds = DispatchTime.now().uptimeNanoseconds
+                return true
+            }
+
+            func snapshot(now: UInt64 = DispatchTime.now().uptimeNanoseconds) -> Snapshot {
+                lock.lock()
+                defer { lock.unlock() }
+                var phaseSnapshots = Dictionary(uniqueKeysWithValues: Phase.allCases.map {
+                    ($0, PhaseSnapshot(
+                        count: phases[$0]?.count ?? 0,
+                        completedCount: phases[$0]?.completedCount ?? 0,
+                        completedDurationNanoseconds: phases[$0]?.completedDurationNanoseconds ?? 0,
+                        activeCount: 0,
+                        activeElapsedNanoseconds: 0
+                    ))
+                })
+                for active in activeSpans.values {
+                    let prior = phaseSnapshots[active.phase]!
+                    phaseSnapshots[active.phase] = PhaseSnapshot(
+                        count: prior.count,
+                        completedCount: prior.completedCount,
+                        completedDurationNanoseconds: prior.completedDurationNanoseconds,
+                        activeCount: Self.saturatingAdd(prior.activeCount, 1).value,
+                        activeElapsedNanoseconds: Self.saturatingAdd(
+                            prior.activeElapsedNanoseconds,
+                            now >= active.startedAtNanoseconds ? now - active.startedAtNanoseconds : 0
+                        ).value
+                    )
+                }
+                let currentActivePhase = activeSpans.values.max(by: { $0.ordinal < $1.ordinal })?.phase
+                let finishedAt = terminalAtNanoseconds ?? now
+                return Snapshot(
+                    preparationID: preparationID,
+                    startedAtNanoseconds: startedAtNanoseconds,
+                    elapsedNanoseconds: finishedAt >= startedAtNanoseconds ? finishedAt - startedAtNanoseconds : 0,
+                    terminalState: terminalState,
+                    currentActivePhase: currentActivePhase,
+                    routeControlOwnership: routeControlOwnership,
+                    phases: phaseSnapshots,
+                    counters: Dictionary(uniqueKeysWithValues: Counter.allCases.map { ($0, counters[$0] ?? 0) }),
+                    saturatedCounters: saturatedCounters,
+                    reasons: Dictionary(uniqueKeysWithValues: Reason.allCases.map { ($0, reasons[$0] ?? 0) })
+                )
+            }
+
+            fileprivate func end(_ token: UUID) {
+                lock.lock()
+                defer { lock.unlock() }
+                guard let active = activeSpans.removeValue(forKey: token) else { return }
+                let now = DispatchTime.now().uptimeNanoseconds
+                var metric = phases[active.phase] ?? MutablePhase()
+                let completed = Self.saturatingAdd(metric.completedCount, 1)
+                metric.completedCount = completed.value
+                let elapsed = now >= active.startedAtNanoseconds ? now - active.startedAtNanoseconds : 0
+                let duration = Self.saturatingAdd(metric.completedDurationNanoseconds, elapsed)
+                metric.completedDurationNanoseconds = duration.value
+                phases[active.phase] = metric
+            }
+
+            private static func saturatingAdd(_ lhs: UInt64, _ rhs: UInt64) -> (value: UInt64, saturated: Bool) {
+                guard lhs <= UInt64.max - rhs else { return (UInt64.max, true) }
+                return (lhs + rhs, false)
+            }
+        }
+
+        @TaskLocal static var currentRecorder: Recorder?
+    }
+#endif
+
 enum WorktreeStartupInstrumentation {
     #if DEBUG
         enum ReceiptSourceLayoutState: String, Equatable {
@@ -569,6 +904,17 @@ enum WorktreeStartupInstrumentation {
         outputByteCount: Int,
         cancelled: Bool
     ) {
+        #if DEBUG
+            WorktreeStartupPreparationInstrumentation.currentRecorder?.increment(.gitCommandCount)
+            WorktreeStartupPreparationInstrumentation.currentRecorder?.increment(
+                .gitQueueMicroseconds,
+                by: UInt64(max(0, queueWaitMicroseconds))
+            )
+            WorktreeStartupPreparationInstrumentation.currentRecorder?.increment(
+                .gitDurationMicroseconds,
+                by: UInt64(max(0, durationMicroseconds))
+            )
+        #endif
         lock.lock()
         defer { lock.unlock() }
         if gitCommands.count == maximumGitCommandMetricCount {

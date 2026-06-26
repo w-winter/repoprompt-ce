@@ -36,15 +36,21 @@ import MCP
                     ])
                 }
 
+                let scopeResolutionStarted = DispatchTime.now().uptimeNanoseconds
                 let resolved = try await debugResolveWorktreeStartupBenchmarkScope(
                     connectionID: connectionID,
                     arguments: arguments,
                     requireRootID: true
                 )
+                let scopeResolutionFinished = DispatchTime.now().uptimeNanoseconds
+                let scopeResolutionDuration = scopeResolutionFinished >= scopeResolutionStarted
+                    ? scopeResolutionFinished - scopeResolutionStarted
+                    : 0
                 let scope = resolved.scope
                 let diagnostics = WorktreeStartupBenchmarkDiagnostics.shared
                 switch action {
                 case "set_flags":
+                    let preparationID = try debugRequiredUUID(arguments, key: "preparation_id")
                     let expiry = try debugWorktreeStartupBenchmarkExpiry(arguments)
                     let observe = debugBool(arguments, "observe") ?? false
                     let serve = debugBool(arguments, "serve") ?? false
@@ -56,13 +62,20 @@ import MCP
                         forceFullCrawl: forceFullCrawl,
                         expiresSeconds: expiry,
                         store: resolved.store,
-                        expectedStandardizedRootPath: resolved.rootPath
+                        expectedStandardizedRootPath: resolved.rootPath,
+                        preparationID: preparationID,
+                        prefixControlEvidenceCacheMode: debugBool(arguments, "bypass_prefix_control_cache") == true
+                            ? .bypassReadAndAdmission
+                            : .automatic,
+                        scopeResolutionDurationNanoseconds: scopeResolutionDuration
                     )
                     let result = prepared.control
                     return debugDiagnosticsResult([
                         "ok": true,
                         "op": op,
                         "action": action,
+                        "preparation_id": preparationID.uuidString,
+                        "preparation": debugPreparationPayload(prepared.preparation),
                         "control_id": result.controlID.uuidString,
                         "previous_control_id": result.previousControlID.map { $0.uuidString as Any } ?? NSNull(),
                         "route": result.route.name,
@@ -73,6 +86,19 @@ import MCP
                         "base_snapshot_search_abi_projected_key_schema_version": prepared.baseSnapshotIdentity?.searchABI.projectedKeySchemaVersion ?? NSNull(),
                         "base_snapshot_search_abi_comparator_schema_version": prepared.baseSnapshotIdentity?.searchABI.comparatorSchemaVersion ?? NSNull(),
                         "base_snapshot_search_abi_path_normalization_schema_version": prepared.baseSnapshotIdentity?.searchABI.pathNormalizationSchemaVersion ?? NSNull()
+                    ])
+                case "preparation_snapshot":
+                    let preparationID = try debugRequiredUUID(arguments, key: "preparation_id")
+                    let snapshot = try diagnostics.preparationSnapshot(
+                        scope: scope,
+                        preparationID: preparationID
+                    )
+                    return debugDiagnosticsResult([
+                        "ok": true,
+                        "op": op,
+                        "action": action,
+                        "preparation_id": preparationID.uuidString,
+                        "preparation": debugPreparationPayload(snapshot)
                     ])
                 case "restore_flags":
                     let controlID = try debugRequiredUUID(arguments, key: "control_id")
@@ -465,6 +491,54 @@ import MCP
             }
             payload["queue_wait_ms"] = snapshot.queueWaitMilliseconds
             return payload
+        }
+
+        private nonisolated func debugPreparationPayload(
+            _ snapshot: WorktreeStartupPreparationInstrumentation.Snapshot
+        ) -> [String: Any] {
+            let phases = Dictionary(uniqueKeysWithValues: WorktreeStartupPreparationInstrumentation.Phase.allCases.map {
+                let metric = snapshot.phases[$0]!
+                return ($0.rawValue, [
+                    "count": metric.count,
+                    "completed_count": metric.completedCount,
+                    "completed_duration_us": metric.completedDurationNanoseconds / 1000,
+                    "active_count": metric.activeCount,
+                    "active_elapsed_us": metric.activeElapsedNanoseconds / 1000
+                ] as [String: Any])
+            })
+            let counters = Dictionary(uniqueKeysWithValues: WorktreeStartupPreparationInstrumentation.Counter.allCases.map {
+                ($0.rawValue, snapshot.counters[$0] ?? 0)
+            })
+            let saturation = Dictionary(uniqueKeysWithValues: WorktreeStartupPreparationInstrumentation.Counter.allCases.map {
+                ($0.rawValue, snapshot.saturatedCounters.contains($0))
+            })
+            let reasons = Dictionary(uniqueKeysWithValues: WorktreeStartupPreparationInstrumentation.Reason.allCases.map {
+                ($0.rawValue, snapshot.reasons[$0] ?? 0)
+            })
+            let routeControlOwnership: Any = snapshot.routeControlOwnership.map { ownership in
+                [
+                    "control_id": ownership.controlID.uuidString,
+                    "window_id": ownership.windowID,
+                    "workspace_id": ownership.workspaceID.uuidString,
+                    "context_id": ownership.contextID.uuidString,
+                    "root_id": ownership.rootID.uuidString,
+                    "revoked": ownership.revoked
+                ] as [String: Any]
+            } ?? NSNull()
+            return [
+                "schema_version": 1,
+                "path_free": true,
+                "preparation_id": snapshot.preparationID.uuidString,
+                "terminal_state": snapshot.terminalState?.rawValue ?? "active",
+                "current_active_phase": snapshot.currentActivePhase?.rawValue ?? NSNull(),
+                "route_control_ownership": routeControlOwnership,
+                "started_monotonic_ns": snapshot.startedAtNanoseconds,
+                "elapsed_us": snapshot.elapsedNanoseconds / 1000,
+                "phases": phases,
+                "counters": counters,
+                "counter_saturated": saturation,
+                "reasons": reasons
+            ]
         }
     }
 

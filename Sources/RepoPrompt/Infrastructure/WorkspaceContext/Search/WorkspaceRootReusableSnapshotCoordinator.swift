@@ -154,6 +154,7 @@ actor WorkspaceRootReusableSnapshotCoordinator {
     func observeStreamedAuthoritativeFullLoad(
         rootURL: URL,
         catalogPolicyIdentity: WorkspaceRootCatalogPolicyIdentity = .canonicalDefaults,
+        prefixControlEvidenceCacheMode: GitPrefixControlEvidenceCacheMode = .automatic,
         catalogBatchEvidenceProvider: @escaping CatalogBatchEvidenceProvider,
         currentnessValidator: @escaping CurrentnessValidator = { .current }
     ) async -> ObservationResult {
@@ -175,7 +176,14 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             // The base observation stays live until replacement coverage has been
             // installed. A policy-path change during either collection advances
             // the shared watermark and prevents conditional admission.
-            let discoveryToken = try await authority.retainMetadataObservation(for: layout)
+            let discoveryToken = try await {
+                #if DEBUG
+                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
+                        .begin(.discoveryObservation)
+                    defer { span?.end() }
+                #endif
+                return try await authority.retainMetadataObservation(for: layout)
+            }()
             discoveryObservation = discoveryToken
             if let failure = await Self.currentnessFailure(
                 stage: .discoveryObservation,
@@ -185,7 +193,19 @@ actor WorkspaceRootReusableSnapshotCoordinator {
                 return failure
             }
             activeStage = .discoveryAuthorityCapture
-            let discovery = try await gitService.workspaceAuthoritySnapshot(in: layout, prefix: prefix)
+            let discovery = try await {
+                #if DEBUG
+                    let recorder = WorktreeStartupPreparationInstrumentation.currentRecorder
+                    recorder?.increment(.authorityCaptures)
+                    let span = recorder?.begin(.discoveryAuthorityCapture)
+                    defer { span?.end() }
+                #endif
+                return try await gitService.workspaceAuthoritySnapshot(
+                    in: layout,
+                    prefix: prefix,
+                    cacheMode: prefixControlEvidenceCacheMode
+                )
+            }()
             if let failure = await Self.currentnessFailure(
                 stage: .discoveryAuthorityCapture,
                 validator: currentnessValidator
@@ -198,10 +218,17 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             )
 
             activeStage = .replacementObservation
-            let observation = try await authority.retainMetadataObservation(
-                for: layout,
-                additionalAuthorityPaths: discovery.metadata.resolvedExternalAuthorityPaths
-            )
+            let observation = try await {
+                #if DEBUG
+                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
+                        .begin(.replacementObservation)
+                    defer { span?.end() }
+                #endif
+                return try await authority.retainMetadataObservation(
+                    for: layout,
+                    additionalAuthorityPaths: discovery.metadata.resolvedExternalAuthorityPaths
+                )
+            }()
             replacementObservation = observation
             if let failure = await Self.currentnessFailure(
                 stage: .replacementObservation,
@@ -227,7 +254,15 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             )
             let captureToken: GitWorkspaceAuthorityCaptureToken
             activeStage = .collection
-            switch await authority.beginCollection(scopeKey: scope) {
+            let collectionResult = await {
+                #if DEBUG
+                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
+                        .begin(.collectionFence)
+                    defer { span?.end() }
+                #endif
+                return await authority.beginCollection(scopeKey: scope)
+            }()
+            switch collectionResult {
             case let .success(token):
                 captureToken = token
             case let .failure(reason):
@@ -243,7 +278,19 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             }
 
             activeStage = .capturedAuthority
-            let captured = try await gitService.workspaceAuthoritySnapshot(in: layout, prefix: prefix)
+            let captured = try await {
+                #if DEBUG
+                    let recorder = WorktreeStartupPreparationInstrumentation.currentRecorder
+                    recorder?.increment(.authorityCaptures)
+                    let span = recorder?.begin(.capturedAuthorityCapture)
+                    defer { span?.end() }
+                #endif
+                return try await gitService.workspaceAuthoritySnapshot(
+                    in: layout,
+                    prefix: prefix,
+                    cacheMode: prefixControlEvidenceCacheMode
+                )
+            }()
             if let failure = await Self.currentnessFailure(
                 stage: .capturedAuthority,
                 validator: currentnessValidator
@@ -258,12 +305,19 @@ actor WorkspaceRootReusableSnapshotCoordinator {
                     reason: .invalidatedDuringCollection
                 )
             }
-            let observationIsCurrent = await authority.metadataObservationIsCurrent(
-                observation,
-                for: layout,
-                additionalAuthorityPaths: captured.metadata.resolvedExternalAuthorityPaths,
-                expectedAcceptedWatermark: captureToken.acceptedMetadataWatermark
-            )
+            let observationIsCurrent = await {
+                #if DEBUG
+                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
+                        .begin(.capturedObservationValidation)
+                    defer { span?.end() }
+                #endif
+                return await authority.metadataObservationIsCurrent(
+                    observation,
+                    for: layout,
+                    additionalAuthorityPaths: captured.metadata.resolvedExternalAuthorityPaths,
+                    expectedAcceptedWatermark: captureToken.acceptedMetadataWatermark
+                )
+            }()
             guard observationIsCurrent else {
                 await authority.releaseMetadataObservation(observation)
                 return .authorityUnavailable(
@@ -279,11 +333,18 @@ actor WorkspaceRootReusableSnapshotCoordinator {
                 return failure
             }
             activeStage = .treeInventory
-            let treeSpool = try await gitService.spoolLoadedRootTreeInventory(
-                captured.snapshot.treeOID,
-                in: layout,
-                prefix: prefix
-            )
+            let treeSpool = try await {
+                #if DEBUG
+                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
+                        .begin(.treeInventorySpool)
+                    defer { span?.end() }
+                #endif
+                return try await gitService.spoolLoadedRootTreeInventory(
+                    captured.snapshot.treeOID,
+                    in: layout,
+                    prefix: prefix
+                )
+            }()
             if let failure = await Self.currentnessFailure(
                 stage: .treeInventory,
                 validator: currentnessValidator
@@ -294,13 +355,20 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             activeStage = .catalogClassification
             let inventoryManifest: WorkspaceRootReusableInventoryManifestLease
             do {
-                inventoryManifest = try await Self.buildInventoryManifest(
-                    spool: treeSpool,
-                    authority: captured.snapshot,
-                    catalogPolicyIdentity: catalogPolicyIdentity,
-                    catalogBatchEvidenceProvider: catalogBatchEvidenceProvider,
-                    currentnessValidator: currentnessValidator
-                )
+                inventoryManifest = try await {
+                    #if DEBUG
+                        let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
+                            .begin(.catalogManifestBuild)
+                        defer { span?.end() }
+                    #endif
+                    return try await Self.buildInventoryManifest(
+                        spool: treeSpool,
+                        authority: captured.snapshot,
+                        catalogPolicyIdentity: catalogPolicyIdentity,
+                        catalogBatchEvidenceProvider: catalogBatchEvidenceProvider,
+                        currentnessValidator: currentnessValidator
+                    )
+                }()
             } catch let error as WorkspaceRootReusableInventoryProjectionError {
                 await authority.releaseMetadataObservation(observation)
                 switch error {
@@ -311,7 +379,15 @@ actor WorkspaceRootReusableSnapshotCoordinator {
                 }
             }
             let lease: GitWorkspaceAuthorityLease
-            switch await authority.install(captured.snapshot, capturedUsing: captureToken) {
+            let installResult = await {
+                #if DEBUG
+                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
+                        .begin(.authorityInstall)
+                    defer { span?.end() }
+                #endif
+                return await authority.install(captured.snapshot, capturedUsing: captureToken)
+            }()
+            switch installResult {
             case let .success(installed):
                 lease = installed
             case let .failure(reason):
@@ -325,20 +401,35 @@ actor WorkspaceRootReusableSnapshotCoordinator {
                 await authority.releaseMetadataObservation(observation)
                 return failure
             }
-            guard let snapshot = WorkspaceRootReusableSnapshot.make(
-                authority: captured.snapshot,
-                inventoryManifest: inventoryManifest,
-                catalogPolicyIdentity: catalogPolicyIdentity
-            ) else {
+            let snapshot = {
+                #if DEBUG
+                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
+                        .begin(.snapshotMaterialization)
+                    defer { span?.end() }
+                #endif
+                return WorkspaceRootReusableSnapshot.make(
+                    authority: captured.snapshot,
+                    inventoryManifest: inventoryManifest,
+                    catalogPolicyIdentity: catalogPolicyIdentity
+                )
+            }()
+            guard let snapshot else {
                 await authority.releaseMetadataObservation(observation)
                 return .catalogMismatch
             }
             activeStage = .admissionPreparation
-            let preparedAdmission = await authority.prepareReusableSnapshotAdmission(
-                snapshot,
-                capturedUsing: lease,
-                observationToken: observation
-            )
+            let preparedAdmission = await {
+                #if DEBUG
+                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
+                        .begin(.admissionPrepare)
+                    defer { span?.end() }
+                #endif
+                return await authority.prepareReusableSnapshotAdmission(
+                    snapshot,
+                    capturedUsing: lease,
+                    observationToken: observation
+                )
+            }()
             replacementObservation = nil
             if Task.isCancelled {
                 if let preparedAdmission {
@@ -361,7 +452,15 @@ actor WorkspaceRootReusableSnapshotCoordinator {
                 await authority.cancelPreparedReusableSnapshotAdmission(prepared)
                 return failure
             }
-            guard await authority.preparedReusableSnapshotAdmissionIsCurrent(prepared) else {
+            let preparedAdmissionIsCurrent = await {
+                #if DEBUG
+                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
+                        .begin(.preparedAdmissionCurrentness)
+                    defer { span?.end() }
+                #endif
+                return await authority.preparedReusableSnapshotAdmissionIsCurrent(prepared)
+            }()
+            guard preparedAdmissionIsCurrent else {
                 await authority.cancelPreparedReusableSnapshotAdmission(prepared)
                 return .authorityUnavailable(
                     stage: .preparedAdmissionCurrentness,
@@ -376,7 +475,14 @@ actor WorkspaceRootReusableSnapshotCoordinator {
                 return failure
             }
             activeStage = .admissionCommit
-            let committedAdmission = await authority.admitPreparedReusableSnapshot(prepared)
+            let committedAdmission = await {
+                #if DEBUG
+                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
+                        .begin(.admissionCommit)
+                    defer { span?.end() }
+                #endif
+                return await authority.admitPreparedReusableSnapshot(prepared)
+            }()
             if Task.isCancelled {
                 if let committedAdmission {
                     await authority.revokeReusableSnapshotAdmission(committedAdmission)
@@ -393,7 +499,15 @@ actor WorkspaceRootReusableSnapshotCoordinator {
                 await authority.revokeReusableSnapshotAdmission(receipt)
                 return failure
             }
-            guard await authority.reusableSnapshotAdmissionIsCurrent(receipt) else {
+            let committedAdmissionIsCurrent = await {
+                #if DEBUG
+                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
+                        .begin(.committedAdmissionCurrentness)
+                    defer { span?.end() }
+                #endif
+                return await authority.reusableSnapshotAdmissionIsCurrent(receipt)
+            }()
+            guard committedAdmissionIsCurrent else {
                 await authority.revokeReusableSnapshotAdmission(receipt)
                 return .authorityUnavailable(
                     stage: .committedAdmissionCurrentness,

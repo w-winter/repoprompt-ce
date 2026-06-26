@@ -10,6 +10,8 @@
         case alreadyConsumed
         case invalidTransition
         case sampleNotFound
+        case invalidPreparation
+        case preparationCapacityExceeded
         case startIdentityMismatch
         case baseSnapshotUnavailable(BaseSnapshotFailure)
 
@@ -37,6 +39,8 @@
             case .alreadyConsumed: "already_consumed"
             case .invalidTransition: "invalid_transition"
             case .sampleNotFound: "sample_not_found"
+            case .invalidPreparation: "invalid_preparation"
+            case .preparationCapacityExceeded: "preparation_capacity_exceeded"
             case .startIdentityMismatch: "start_identity_mismatch"
             case .baseSnapshotUnavailable: "base_snapshot_unavailable"
             }
@@ -191,6 +195,7 @@
             let control: ControlResult
             let baseSnapshotPrepared: Bool
             let baseSnapshotIdentity: WorkspaceRootReusableSnapshotIdentity?
+            let preparation: WorktreeStartupPreparationInstrumentation.Snapshot
         }
 
         struct ArmResult: Equatable {
@@ -258,11 +263,34 @@
             }
         }
 
+        private struct PreparationRecord {
+            let scope: DebugWorktreeStartupBenchmarkScope
+            let recorder: WorktreeStartupPreparationInstrumentation.Recorder
+            let createdOrdinal: UInt64
+            var routeControlID: UUID?
+            var completedAtNanoseconds: UInt64?
+        }
+
         private let lock = NSLock()
+        private let maximumPreparationRecordCount: Int
+        private let completedPreparationTTLNanoseconds: UInt64
+        private let afterControlLeaseForTesting: (@Sendable () async -> Void)?
         private var currentControlIDByScope: [DebugWorktreeStartupBenchmarkScope: UUID] = [:]
         private var controlsByID: [UUID: ControlLease] = [:]
         private var tokensByID: [UUID: TokenLease] = [:]
         private var samplesByCorrelationID: [UUID: SampleState] = [:]
+        private var preparationsByID: [UUID: PreparationRecord] = [:]
+        private var nextPreparationOrdinal: UInt64 = 0
+
+        init(
+            maximumPreparationRecordCount: Int = 32,
+            completedPreparationTTLNanoseconds: UInt64 = 15 * 60 * 1_000_000_000,
+            afterControlLeaseForTesting: (@Sendable () async -> Void)? = nil
+        ) {
+            self.maximumPreparationRecordCount = max(1, maximumPreparationRecordCount)
+            self.completedPreparationTTLNanoseconds = completedPreparationTTLNanoseconds
+            self.afterControlLeaseForTesting = afterControlLeaseForTesting
+        }
 
         static func synchronizeGateFromDefaults(_ defaults: UserDefaults = .standard) {
             setGateEnabled(defaults.bool(forKey: enabledDefaultsKey))
@@ -279,7 +307,8 @@
             observe: Bool,
             serve: Bool,
             forceFullCrawl: Bool,
-            expiresSeconds: Int
+            expiresSeconds: Int,
+            preparationID: UUID? = nil
         ) throws -> ControlResult {
             try WorktreeStartupBenchmarkGate.shared.requireEnabled { _ in
                 let now = DispatchTime.now().uptimeNanoseconds
@@ -287,6 +316,17 @@
                 let route = RouteControl(observe: observe, serve: serve, forceFullCrawl: forceFullCrawl)
                 lock.lock()
                 purgeExpiredLocked(now: now)
+                var preparationRecord: PreparationRecord?
+                if let preparationID {
+                    guard let record = preparationsByID[preparationID],
+                          record.scope == scope,
+                          record.routeControlID == nil
+                    else {
+                        lock.unlock()
+                        throw DebugWorktreeStartupBenchmarkError.invalidPreparation
+                    }
+                    preparationRecord = record
+                }
                 let previous = currentControlIDByScope[scope].flatMap { controlsByID[$0] }
                 let lease = ControlLease(
                     id: UUID(),
@@ -297,6 +337,11 @@
                 )
                 controlsByID[lease.id] = lease
                 currentControlIDByScope[scope] = lease.id
+                if let preparationID, var preparationRecord {
+                    preparationRecord.routeControlID = lease.id
+                    preparationRecord.recorder.recordRouteControlOwnership(controlID: lease.id, scope: scope)
+                    preparationsByID[preparationID] = preparationRecord
+                }
                 lock.unlock()
                 scheduleControlExpiry(lease.id, expiresAtNanoseconds: expires)
                 return ControlResult(
@@ -315,63 +360,127 @@
             forceFullCrawl: Bool,
             expiresSeconds: Int,
             store: WorkspaceFileContextStore,
-            expectedStandardizedRootPath: String
+            expectedStandardizedRootPath: String,
+            preparationID: UUID = UUID(),
+            prefixControlEvidenceCacheMode: GitPrefixControlEvidenceCacheMode = .automatic,
+            scopeResolutionDurationNanoseconds: UInt64 = 0
         ) async throws -> PreparedControlResult {
             try WorktreeStartupBenchmarkGate.shared.requireEnabled { _ in }
-            let shouldPrepareBaseSnapshot = (observe || serve) && !forceFullCrawl
-            var baseSnapshotIdentity: WorkspaceRootReusableSnapshotIdentity?
-            if shouldPrepareBaseSnapshot {
-                let observation = try await store.admitReusableSnapshotForLoadedRoot(
-                    rootID: scope.rootID,
-                    expectedStandardizedPath: expectedStandardizedRootPath
-                )
-                switch observation {
-                case let .admitted(identity):
-                    baseSnapshotIdentity = identity
-                case .nonGit:
-                    throw DebugWorktreeStartupBenchmarkError.baseSnapshotUnavailable(.init(
-                        reason: .nonGit,
-                        stage: nil,
-                        cause: nil
-                    ))
-                case .unsupportedRoot:
-                    throw DebugWorktreeStartupBenchmarkError.baseSnapshotUnavailable(.init(
-                        reason: .unsupportedRoot,
-                        stage: nil,
-                        cause: nil
-                    ))
-                case let .authorityUnavailable(stage, reason):
-                    throw DebugWorktreeStartupBenchmarkError.baseSnapshotUnavailable(.init(
-                        reason: .authorityUnavailable,
-                        stage: stage,
-                        cause: reason.benchmarkDiagnosticCode
-                    ))
-                case .catalogMismatch:
-                    throw DebugWorktreeStartupBenchmarkError.baseSnapshotUnavailable(.init(
-                        reason: .catalogMismatch,
-                        stage: nil,
-                        cause: nil
-                    ))
-                case let .failed(failure):
-                    throw DebugWorktreeStartupBenchmarkError.baseSnapshotUnavailable(.init(
-                        reason: .failed,
-                        stage: failure.stage,
-                        cause: failure.cause.code
-                    ))
+            let recorder = try beginPreparation(preparationID: preparationID, scope: scope)
+            recorder.recordCompleted(.scopeResolution, durationNanoseconds: scopeResolutionDurationNanoseconds)
+            return try await withTaskCancellationHandler {
+                try await WorktreeStartupPreparationInstrumentation.$currentRecorder.withValue(recorder) {
+                    let totalSpan = recorder.begin(.setFlagsTotal)
+                    do {
+                        let shouldPrepareBaseSnapshot = (observe || serve) && !forceFullCrawl
+                        var baseSnapshotIdentity: WorkspaceRootReusableSnapshotIdentity?
+                        if shouldPrepareBaseSnapshot {
+                            let observation = try await store.admitReusableSnapshotForLoadedRoot(
+                                rootID: scope.rootID,
+                                expectedStandardizedPath: expectedStandardizedRootPath,
+                                prefixControlEvidenceCacheMode: prefixControlEvidenceCacheMode
+                            )
+                            switch observation {
+                            case let .admitted(identity):
+                                baseSnapshotIdentity = identity
+                            case .nonGit:
+                                throw DebugWorktreeStartupBenchmarkError.baseSnapshotUnavailable(.init(
+                                    reason: .nonGit,
+                                    stage: nil,
+                                    cause: nil
+                                ))
+                            case .unsupportedRoot:
+                                throw DebugWorktreeStartupBenchmarkError.baseSnapshotUnavailable(.init(
+                                    reason: .unsupportedRoot,
+                                    stage: nil,
+                                    cause: nil
+                                ))
+                            case let .authorityUnavailable(stage, reason):
+                                throw DebugWorktreeStartupBenchmarkError.baseSnapshotUnavailable(.init(
+                                    reason: .authorityUnavailable,
+                                    stage: stage,
+                                    cause: reason.benchmarkDiagnosticCode
+                                ))
+                            case .catalogMismatch:
+                                throw DebugWorktreeStartupBenchmarkError.baseSnapshotUnavailable(.init(
+                                    reason: .catalogMismatch,
+                                    stage: nil,
+                                    cause: nil
+                                ))
+                            case let .failed(failure):
+                                throw DebugWorktreeStartupBenchmarkError.baseSnapshotUnavailable(.init(
+                                    reason: .failed,
+                                    stage: failure.stage,
+                                    cause: failure.cause.code
+                                ))
+                            }
+                        }
+                        try Task.checkCancellation()
+                        let control = try setFlags(
+                            scope: scope,
+                            observe: observe,
+                            serve: serve,
+                            forceFullCrawl: forceFullCrawl,
+                            expiresSeconds: expiresSeconds,
+                            preparationID: preparationID
+                        )
+                        if let afterControlLeaseForTesting {
+                            await afterControlLeaseForTesting()
+                        }
+                        try Task.checkCancellation()
+                        totalSpan.end()
+                        terminalizePreparation(preparationID, state: .admitted)
+                        return PreparedControlResult(
+                            control: control,
+                            baseSnapshotPrepared: shouldPrepareBaseSnapshot,
+                            baseSnapshotIdentity: baseSnapshotIdentity,
+                            preparation: recorder.snapshot()
+                        )
+                    } catch is CancellationError {
+                        revokePreparationOwnedControl(preparationID: preparationID, scope: scope)
+                        totalSpan.end()
+                        recorder.recordReason(.cancellation)
+                        terminalizePreparation(preparationID, state: .cancelled)
+                        throw CancellationError()
+                    } catch {
+                        totalSpan.end()
+                        recorder.recordReason(.failure)
+                        terminalizePreparation(preparationID, state: .failed)
+                        throw error
+                    }
                 }
+            } onCancel: {
+                self.revokePreparationOwnedControl(preparationID: preparationID, scope: scope)
             }
-            let control = try setFlags(
-                scope: scope,
-                observe: observe,
-                serve: serve,
-                forceFullCrawl: forceFullCrawl,
-                expiresSeconds: expiresSeconds
-            )
-            return PreparedControlResult(
-                control: control,
-                baseSnapshotPrepared: shouldPrepareBaseSnapshot,
-                baseSnapshotIdentity: baseSnapshotIdentity
-            )
+        }
+
+        func preparationSnapshot(
+            scope: DebugWorktreeStartupBenchmarkScope,
+            preparationID: UUID
+        ) throws -> WorktreeStartupPreparationInstrumentation.Snapshot {
+            try WorktreeStartupBenchmarkGate.shared.requireEnabled { _ in
+                lock.lock()
+                defer { lock.unlock() }
+                purgeExpiredPreparationsLocked(now: DispatchTime.now().uptimeNanoseconds)
+                guard let record = preparationsByID[preparationID], record.scope == scope else {
+                    throw DebugWorktreeStartupBenchmarkError.invalidPreparation
+                }
+                return record.recorder.snapshot()
+            }
+        }
+
+        func beginPreparationForTesting(
+            preparationID: UUID,
+            scope: DebugWorktreeStartupBenchmarkScope
+        ) throws -> WorktreeStartupPreparationInstrumentation.Recorder {
+            try beginPreparation(preparationID: preparationID, scope: scope)
+        }
+
+        func terminalizePreparationForTesting(
+            preparationID: UUID,
+            state: WorktreeStartupPreparationInstrumentation.TerminalState
+        ) {
+            terminalizePreparation(preparationID, state: state)
         }
 
         @discardableResult
@@ -744,6 +853,9 @@
                 let controlIDs = controlsByID.values.filter { $0.scope == scope }.map(\.id)
                 let tokenIDs = tokensByID.values.filter { $0.expectedStart.rootIdentity.scope == scope }.map(\.token)
                 let samples = samplesByCorrelationID.values.filter { $0.scope == scope }
+                let preparationIDs = preparationsByID.compactMap { id, record in
+                    record.scope == scope ? id : nil
+                }
                 controlIDs.forEach { controlsByID.removeValue(forKey: $0) }
                 tokenIDs.forEach { tokensByID.removeValue(forKey: $0) }
                 for sample in samples {
@@ -751,10 +863,12 @@
                     WorktreeStartupInstrumentation.resetBenchmarkMetrics(correlationID: sample.correlationID)
                 }
                 currentControlIDByScope.removeValue(forKey: scope)
+                preparationIDs.forEach { preparationsByID.removeValue(forKey: $0) }
                 return [
                     "control_count": controlIDs.count,
                     "token_count": tokenIDs.count,
-                    "sample_count": samples.count
+                    "sample_count": samples.count,
+                    "preparation_count": preparationIDs.count
                 ]
             }
         }
@@ -765,8 +879,96 @@
             controlsByID.removeAll(keepingCapacity: true)
             tokensByID.removeAll(keepingCapacity: true)
             samplesByCorrelationID.removeAll(keepingCapacity: true)
+            preparationsByID.removeAll(keepingCapacity: true)
             lock.unlock()
             WorktreeStartupInstrumentation.resetBenchmarkMetrics()
+        }
+
+        private func beginPreparation(
+            preparationID: UUID,
+            scope: DebugWorktreeStartupBenchmarkScope
+        ) throws -> WorktreeStartupPreparationInstrumentation.Recorder {
+            let now = DispatchTime.now().uptimeNanoseconds
+            lock.lock()
+            defer { lock.unlock() }
+            purgeExpiredPreparationsLocked(now: now)
+            guard preparationsByID[preparationID] == nil else {
+                throw DebugWorktreeStartupBenchmarkError.invalidPreparation
+            }
+            if preparationsByID.count >= maximumPreparationRecordCount {
+                guard let eviction = preparationsByID.min(by: { lhs, rhs in
+                    switch (lhs.value.completedAtNanoseconds, rhs.value.completedAtNanoseconds) {
+                    case let (left?, right?):
+                        left == right ? lhs.value.createdOrdinal < rhs.value.createdOrdinal : left < right
+                    case (.some, .none): true
+                    case (.none, .some): false
+                    case (.none, .none): lhs.value.createdOrdinal < rhs.value.createdOrdinal
+                    }
+                }), eviction.value.completedAtNanoseconds != nil else {
+                    throw DebugWorktreeStartupBenchmarkError.preparationCapacityExceeded
+                }
+                preparationsByID.removeValue(forKey: eviction.key)
+            }
+            nextPreparationOrdinal = nextPreparationOrdinal == UInt64.max ? UInt64.max : nextPreparationOrdinal + 1
+            let recorder = WorktreeStartupPreparationInstrumentation.Recorder(
+                preparationID: preparationID,
+                startedAtNanoseconds: now
+            )
+            preparationsByID[preparationID] = PreparationRecord(
+                scope: scope,
+                recorder: recorder,
+                createdOrdinal: nextPreparationOrdinal,
+                routeControlID: nil,
+                completedAtNanoseconds: nil
+            )
+            return recorder
+        }
+
+        private func revokePreparationOwnedControl(
+            preparationID: UUID,
+            scope: DebugWorktreeStartupBenchmarkScope
+        ) {
+            lock.lock()
+            guard let record = preparationsByID[preparationID],
+                  record.scope == scope,
+                  let controlID = record.routeControlID
+            else {
+                lock.unlock()
+                return
+            }
+            if let lease = controlsByID.removeValue(forKey: controlID),
+               lease.scope == scope,
+               currentControlIDByScope[scope] == controlID
+            {
+                _ = restorePreviousLocked(for: lease, now: DispatchTime.now().uptimeNanoseconds)
+            }
+            record.recorder.recordRouteControlRevoked(controlID: controlID)
+            lock.unlock()
+        }
+
+        private func terminalizePreparation(
+            _ preparationID: UUID,
+            state: WorktreeStartupPreparationInstrumentation.TerminalState
+        ) {
+            lock.lock()
+            guard var record = preparationsByID[preparationID] else {
+                lock.unlock()
+                return
+            }
+            let changed = record.recorder.terminalize(state)
+            if changed {
+                record.completedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
+                preparationsByID[preparationID] = record
+            }
+            lock.unlock()
+        }
+
+        private func purgeExpiredPreparationsLocked(now: UInt64) {
+            preparationsByID = preparationsByID.filter { _, record in
+                guard let completedAt = record.completedAtNanoseconds else { return true }
+                guard now >= completedAt else { return true }
+                return now - completedAt < completedPreparationTTLNanoseconds
+            }
         }
 
         private func scheduleControlExpiry(_ id: UUID, expiresAtNanoseconds: UInt64) {

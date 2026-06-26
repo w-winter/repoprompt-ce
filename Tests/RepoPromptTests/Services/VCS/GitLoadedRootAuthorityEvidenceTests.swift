@@ -1,8 +1,536 @@
+import CoreServices
 import Foundation
 @testable import RepoPrompt
 import XCTest
 
 final class GitLoadedRootAuthorityEvidenceTests: XCTestCase {
+    func testAutomaticAuthorityCapturesShareOnePhysicalPrefixScanAndWarmCaptureHits() async throws {
+        let fixture = try AuthorityEvidenceFixture(makeCommit: true)
+        defer { fixture.cleanup() }
+        let authority = GitWorkspaceStateAuthority()
+        let git = GitService(workspaceStateAuthority: authority)
+        let prefix = try GitRepositoryRelativeRootPrefix("")
+        let scope = GitWorkspaceAuthorityScopeKey(
+            repositoryKey: GitWorkspaceAuthorityRepositoryKey(layout: fixture.layout),
+            repositoryRelativeRootPrefix: prefix
+        )
+
+        let discovery = try await git.workspaceAuthoritySnapshot(in: fixture.layout, prefix: prefix)
+        let captureToken = try await authority.beginCollection(scopeKey: scope).get()
+        let captured = try await git.workspaceAuthoritySnapshot(in: fixture.layout, prefix: prefix)
+        _ = try await authority.install(captured.snapshot, capturedUsing: captureToken).get()
+        var counters = await authority.snapshotForTesting()
+        XCTAssertEqual(counters.prefixControlPhysicalScanCount, 1)
+        XCTAssertEqual(counters.prefixControlCacheMissCount, 1)
+        XCTAssertEqual(counters.prefixControlCacheHitCount, 1)
+        XCTAssertEqual(counters.prefixControlCacheAdmissionCount, 1)
+        XCTAssertEqual(discovery.snapshot, captured.snapshot)
+
+        let warm = try await git.workspaceAuthoritySnapshot(in: fixture.layout, prefix: prefix)
+        counters = await authority.snapshotForTesting()
+        XCTAssertEqual(counters.prefixControlPhysicalScanCount, 1)
+        XCTAssertEqual(counters.prefixControlCacheHitCount, 2)
+        XCTAssertEqual(warm.snapshot, captured.snapshot)
+
+        let bypassAuthority = GitWorkspaceStateAuthority()
+        let bypassGit = GitService(workspaceStateAuthority: bypassAuthority)
+        let bypassA = try await bypassGit.workspaceAuthoritySnapshot(
+            in: fixture.layout,
+            prefix: prefix,
+            cacheMode: .bypassReadAndAdmission
+        )
+        let bypassB = try await bypassGit.workspaceAuthoritySnapshot(
+            in: fixture.layout,
+            prefix: prefix,
+            cacheMode: .bypassReadAndAdmission
+        )
+        let bypassCounters = await bypassAuthority.snapshotForTesting()
+        XCTAssertEqual(bypassCounters.prefixControlPhysicalScanCount, 2)
+        XCTAssertEqual(bypassCounters.prefixControlCacheBypassCount, 2)
+        XCTAssertEqual(bypassCounters.prefixControlCacheEntryCount, 0)
+        XCTAssertEqual(bypassA.snapshot, bypassB.snapshot)
+        XCTAssertEqual(bypassA.snapshot, captured.snapshot)
+    }
+
+    func testIdenticalPrefixCollectionCoalescesAndWaiterCancellationIsScoped() async throws {
+        let fixture = try AuthorityEvidenceFixture()
+        defer { fixture.cleanup() }
+        let authority = GitWorkspaceStateAuthority()
+        let prefix = try GitRepositoryRelativeRootPrefix("")
+        let gate = PrefixControlCollectorGate(footer: prefixFooter())
+
+        let first = Task {
+            try await authority.prefixControlEvidence(
+                in: fixture.layout,
+                prefix: prefix,
+                cacheMode: .automatic
+            ) { try await gate.collect() }
+        }
+        try await waitUntil { await authority.snapshotForTesting().pendingPrefixControlAdmissionCount == 1 }
+        let second = Task {
+            try await authority.prefixControlEvidence(
+                in: fixture.layout,
+                prefix: prefix,
+                cacheMode: .automatic
+            ) { try await gate.collect() }
+        }
+        try await waitUntil { await authority.snapshotForTesting().prefixControlCacheCoalescedWaiterCount == 1 }
+        first.cancel()
+        do {
+            _ = try await first.value
+            XCTFail("Expected cancelled waiter")
+        } catch is CancellationError {}
+        await gate.release()
+        let secondValue = try await second.value
+        let collectionCount = await gate.collectionCount()
+        XCTAssertEqual(secondValue, prefixFooter())
+        let counters = await authority.snapshotForTesting()
+        XCTAssertEqual(collectionCount, 1)
+        XCTAssertEqual(counters.prefixControlPhysicalScanCount, 1)
+        XCTAssertEqual(counters.prefixControlCacheEntryCount, 1)
+        XCTAssertEqual(counters.pendingPrefixControlAdmissionCount, 0)
+        XCTAssertEqual(counters.pendingPrefixControlResidentBytes, 0)
+        XCTAssertEqual(counters.pendingPrefixControlArtifactBytes, 0)
+    }
+
+    func testMonitorGapThenPrefixMissAndHitNeverRestoreRepositoryMetadataCoverage() async throws {
+        let fixture = try AuthorityEvidenceFixture()
+        defer { fixture.cleanup() }
+        let authority = GitWorkspaceStateAuthority()
+        let prefix = try GitRepositoryRelativeRootPrefix("")
+        let key = GitWorkspaceAuthorityRepositoryKey(layout: fixture.layout)
+        let scope = GitWorkspaceAuthorityScopeKey(
+            repositoryKey: key,
+            repositoryRelativeRootPrefix: prefix
+        )
+        let counter = PrefixControlCollectorCounter(footer: prefixFooter())
+
+        _ = try await authority.prefixControlEvidence(
+            in: fixture.layout,
+            prefix: prefix,
+            cacheMode: .automatic
+        ) { await counter.collect() }
+        await authority.metadataDidChange(repositoryKey: key, kinds: [.monitorGap])
+
+        _ = try await authority.prefixControlEvidence(
+            in: fixture.layout,
+            prefix: prefix,
+            cacheMode: .automatic
+        ) { await counter.collect() }
+        _ = try await authority.prefixControlEvidence(
+            in: fixture.layout,
+            prefix: prefix,
+            cacheMode: .automatic
+        ) { await counter.collect() }
+
+        let collectionCount = await counter.collectionCount()
+        let counters = await authority.snapshotForTesting()
+        XCTAssertEqual(collectionCount, 2)
+        XCTAssertEqual(counters.prefixControlCacheMissCount, 2)
+        XCTAssertEqual(counters.prefixControlCacheHitCount, 1)
+        switch await authority.beginCollection(scopeKey: scope) {
+        case .success:
+            XCTFail("Narrow prefix-control coverage must not restore repository metadata coverage")
+        case let .failure(reason):
+            XCTAssertEqual(reason, .monitorCoverageUnavailable)
+        }
+
+        let fullObservation = try await authority.retainMetadataObservation(for: fixture.layout)
+        switch await authority.beginCollection(scopeKey: scope) {
+        case .success:
+            break
+        case let .failure(reason):
+            XCTFail("Validated full metadata coverage must restore collection: \(reason)")
+        }
+        await authority.releaseMetadataObservation(fullObservation)
+    }
+
+    func testSaturatedAdmissionUsesOneBoundedUncachedFlightForIdenticalCalls() async throws {
+        let fixture = try AuthorityEvidenceFixture()
+        defer { fixture.cleanup() }
+        let authority = GitWorkspaceStateAuthority(prefixControlCacheLimits: .init(
+            maximumEntryCount: 2,
+            maximumEntriesPerRepository: 2,
+            maximumResidentBytes: 1024,
+            maximumArtifactBytes: 0,
+            maximumPendingAdmissionCount: 1,
+            maximumPendingResidentBytes: 512,
+            maximumPendingArtifactBytes: 0
+        ))
+        let firstGate = PrefixControlCollectorGate(footer: prefixFooter())
+        let saturatedGate = PrefixControlCollectorGate(footer: prefixFooter())
+
+        let first = Task {
+            try await authority.prefixControlEvidence(
+                in: fixture.layout,
+                prefix: GitRepositoryRelativeRootPrefix(""),
+                cacheMode: .automatic
+            ) { try await firstGate.collect() }
+        }
+        await firstGate.waitUntilCollectionStarts()
+
+        let saturatedA = Task {
+            try await authority.prefixControlEvidence(
+                in: fixture.layout,
+                prefix: GitRepositoryRelativeRootPrefix("Sources"),
+                cacheMode: .automatic
+            ) { try await saturatedGate.collect() }
+        }
+        await saturatedGate.waitUntilCollectionStarts()
+        let saturatedB = Task {
+            try await authority.prefixControlEvidence(
+                in: fixture.layout,
+                prefix: GitRepositoryRelativeRootPrefix("Sources"),
+                cacheMode: .automatic
+            ) { try await saturatedGate.collect() }
+        }
+        try await waitUntil {
+            await authority.snapshotForTesting().prefixControlCacheCoalescedWaiterCount == 1
+        }
+
+        var counters = await authority.snapshotForTesting()
+        let saturatedCollectionCount = await saturatedGate.collectionCount()
+        XCTAssertEqual(counters.pendingPrefixControlAdmissionCount, 2)
+        XCTAssertEqual(counters.pendingPrefixControlResidentBytes, 1024)
+        XCTAssertEqual(counters.prefixControlPhysicalScanCount, 2)
+        XCTAssertEqual(saturatedCollectionCount, 1)
+
+        await saturatedGate.release()
+        let saturatedAValue = try await saturatedA.value
+        let saturatedBValue = try await saturatedB.value
+        XCTAssertEqual(saturatedAValue, prefixFooter())
+        XCTAssertEqual(saturatedBValue, prefixFooter())
+        counters = await authority.snapshotForTesting()
+        XCTAssertEqual(counters.pendingPrefixControlAdmissionCount, 1)
+        XCTAssertEqual(counters.pendingPrefixControlResidentBytes, 512)
+
+        await firstGate.release()
+        _ = try await first.value
+        try await waitUntil { await authority.snapshotForTesting().pendingPrefixControlAdmissionCount == 0 }
+    }
+
+    func testSoleWaiterCancellationRetainsFlightResourcesUntilSlowCollectorCompletes() async throws {
+        let fixture = try AuthorityEvidenceFixture()
+        defer { fixture.cleanup() }
+        let monitor = GitWorkspaceMetadataMonitor()
+        let authority = GitWorkspaceStateAuthority(metadataMonitor: monitor)
+        let gate = PrefixControlCollectorGate(footer: prefixFooter())
+
+        let waiter = Task {
+            try await authority.prefixControlEvidence(
+                in: fixture.layout,
+                prefix: GitRepositoryRelativeRootPrefix(""),
+                cacheMode: .automatic
+            ) { try await gate.collect() }
+        }
+        await gate.waitUntilCollectionStarts()
+        waiter.cancel()
+        do {
+            _ = try await waiter.value
+            XCTFail("Expected waiter cancellation")
+        } catch is CancellationError {}
+
+        var counters = await authority.snapshotForTesting()
+        var monitorState = await monitor.snapshotForTesting()
+        XCTAssertEqual(counters.pendingPrefixControlAdmissionCount, 1)
+        XCTAssertEqual(counters.pendingPrefixControlResidentBytes, 512)
+        XCTAssertEqual(counters.prefixControlCacheEntryCount, 0)
+        XCTAssertEqual(monitorState.retainTokenCount, 1)
+
+        await gate.release()
+        try await waitUntil { await authority.snapshotForTesting().pendingPrefixControlAdmissionCount == 0 }
+        counters = await authority.snapshotForTesting()
+        monitorState = await monitor.snapshotForTesting()
+        XCTAssertEqual(counters.pendingPrefixControlResidentBytes, 0)
+        XCTAssertEqual(counters.pendingPrefixControlArtifactBytes, 0)
+        XCTAssertEqual(counters.prefixControlCacheEntryCount, 0)
+        XCTAssertEqual(monitorState.retainTokenCount, 0)
+    }
+
+    func testCancelledSameKeyFlightRemainsAuthoritativeUntilPhysicalCompletion() async throws {
+        let fixture = try AuthorityEvidenceFixture()
+        defer { fixture.cleanup() }
+        let monitor = GitWorkspaceMetadataMonitor()
+        let authority = GitWorkspaceStateAuthority(metadataMonitor: monitor)
+        let prefix = try GitRepositoryRelativeRootPrefix("")
+        let gate = PrefixControlCollectorGate(footer: prefixFooter())
+
+        let first = Task {
+            try await authority.prefixControlEvidence(
+                in: fixture.layout,
+                prefix: prefix,
+                cacheMode: .automatic
+            ) { try await gate.collect() }
+        }
+        await gate.waitUntilCollectionStarts()
+        first.cancel()
+        do {
+            _ = try await first.value
+            XCTFail("Expected first waiter cancellation")
+        } catch is CancellationError {}
+
+        do {
+            _ = try await authority.prefixControlEvidence(
+                in: fixture.layout,
+                prefix: prefix,
+                cacheMode: .automatic
+            ) { try await gate.collect() }
+            XCTFail("Expected bounded rejection while cancelled physical flight remains active")
+        } catch let error as GitPrefixControlEvidenceCacheError {
+            XCTAssertEqual(error, .resourceAdmission)
+        }
+
+        var counters = await authority.snapshotForTesting()
+        var monitorState = await monitor.snapshotForTesting()
+        var collectionCount = await gate.collectionCount()
+        XCTAssertEqual(collectionCount, 1)
+        XCTAssertEqual(counters.prefixControlPhysicalScanCount, 1)
+        XCTAssertEqual(counters.pendingPrefixControlAdmissionCount, 1)
+        XCTAssertEqual(counters.pendingPrefixControlResidentBytes, 512)
+        XCTAssertEqual(monitorState.retainTokenCount, 1)
+
+        await gate.release()
+        try await waitUntil { await authority.snapshotForTesting().pendingPrefixControlAdmissionCount == 0 }
+        counters = await authority.snapshotForTesting()
+        monitorState = await monitor.snapshotForTesting()
+        XCTAssertEqual(counters.pendingPrefixControlResidentBytes, 0)
+        XCTAssertEqual(counters.pendingPrefixControlArtifactBytes, 0)
+        XCTAssertEqual(monitorState.retainTokenCount, 0)
+
+        let retry = try await authority.prefixControlEvidence(
+            in: fixture.layout,
+            prefix: prefix,
+            cacheMode: .automatic
+        ) { try await gate.collect() }
+        XCTAssertEqual(retry, prefixFooter())
+        counters = await authority.snapshotForTesting()
+        collectionCount = await gate.collectionCount()
+        XCTAssertEqual(collectionCount, 2)
+        XCTAssertEqual(counters.prefixControlPhysicalScanCount, 2)
+
+        await authority.metadataDidChange(
+            repositoryKey: GitWorkspaceAuthorityRepositoryKey(layout: fixture.layout),
+            kinds: [.monitorGap]
+        )
+        monitorState = await monitor.snapshotForTesting()
+        XCTAssertEqual(monitorState.retainTokenCount, 0)
+    }
+
+    func testCancelledUncachedSameKeyFlightRemainsAuthoritativeUntilPhysicalCompletion() async throws {
+        let fixture = try AuthorityEvidenceFixture()
+        defer { fixture.cleanup() }
+        let monitor = GitWorkspaceMetadataMonitor()
+        let authority = GitWorkspaceStateAuthority(
+            metadataMonitor: monitor,
+            prefixControlCacheLimits: .init(
+                maximumEntryCount: 1,
+                maximumEntriesPerRepository: 1,
+                maximumResidentBytes: 512,
+                maximumArtifactBytes: 0,
+                maximumPendingAdmissionCount: 1,
+                maximumPendingResidentBytes: 1,
+                maximumPendingArtifactBytes: 0
+            )
+        )
+        let prefix = try GitRepositoryRelativeRootPrefix("")
+        let gate = PrefixControlCollectorGate(footer: prefixFooter())
+
+        let first = Task {
+            try await authority.prefixControlEvidence(
+                in: fixture.layout,
+                prefix: prefix,
+                cacheMode: .automatic
+            ) { try await gate.collect() }
+        }
+        await gate.waitUntilCollectionStarts()
+        first.cancel()
+        do {
+            _ = try await first.value
+            XCTFail("Expected first uncached waiter cancellation")
+        } catch is CancellationError {}
+
+        do {
+            _ = try await authority.prefixControlEvidence(
+                in: fixture.layout,
+                prefix: prefix,
+                cacheMode: .automatic
+            ) { try await gate.collect() }
+            XCTFail("Expected bounded rejection while cancelled uncached flight remains active")
+        } catch let error as GitPrefixControlEvidenceCacheError {
+            XCTAssertEqual(error, .resourceAdmission)
+        }
+
+        var counters = await authority.snapshotForTesting()
+        var monitorState = await monitor.snapshotForTesting()
+        var collectionCount = await gate.collectionCount()
+        XCTAssertEqual(collectionCount, 1)
+        XCTAssertEqual(counters.prefixControlPhysicalScanCount, 1)
+        XCTAssertEqual(counters.pendingPrefixControlAdmissionCount, 1)
+        XCTAssertEqual(counters.pendingPrefixControlResidentBytes, 512)
+        XCTAssertEqual(counters.prefixControlCacheEntryCount, 0)
+        XCTAssertEqual(monitorState.retainTokenCount, 0)
+
+        await gate.release()
+        try await waitUntil { await authority.snapshotForTesting().pendingPrefixControlAdmissionCount == 0 }
+        counters = await authority.snapshotForTesting()
+        monitorState = await monitor.snapshotForTesting()
+        XCTAssertEqual(counters.pendingPrefixControlResidentBytes, 0)
+        XCTAssertEqual(counters.pendingPrefixControlArtifactBytes, 0)
+        XCTAssertEqual(monitorState.retainTokenCount, 0)
+
+        let retry = try await authority.prefixControlEvidence(
+            in: fixture.layout,
+            prefix: prefix,
+            cacheMode: .automatic
+        ) { try await gate.collect() }
+        XCTAssertEqual(retry, prefixFooter())
+        counters = await authority.snapshotForTesting()
+        monitorState = await monitor.snapshotForTesting()
+        collectionCount = await gate.collectionCount()
+        XCTAssertEqual(collectionCount, 2)
+        XCTAssertEqual(counters.prefixControlPhysicalScanCount, 2)
+        XCTAssertEqual(counters.pendingPrefixControlAdmissionCount, 0)
+        XCTAssertEqual(counters.pendingPrefixControlResidentBytes, 0)
+        XCTAssertEqual(counters.prefixControlCacheEntryCount, 0)
+        XCTAssertEqual(monitorState.retainTokenCount, 0)
+    }
+
+    func testAcceptedWatermarkInvalidatesCachedFooterBeforeActorDelivery() async throws {
+        let fixture = try AuthorityEvidenceFixture()
+        defer { fixture.cleanup() }
+        let monitor = GitWorkspaceMetadataMonitor()
+        let authority = GitWorkspaceStateAuthority(metadataMonitor: monitor)
+        let prefix = try GitRepositoryRelativeRootPrefix("")
+        let counter = PrefixControlCollectorCounter(footer: prefixFooter())
+        _ = try await authority.prefixControlEvidence(
+            in: fixture.layout,
+            prefix: prefix,
+            cacheMode: .automatic
+        ) { await counter.collect() }
+        await monitor.acceptEventWithoutDeliveryForTesting(
+            repositoryKey: GitWorkspaceAuthorityRepositoryKey(layout: fixture.layout)
+        )
+        _ = try await authority.prefixControlEvidence(
+            in: fixture.layout,
+            prefix: prefix,
+            cacheMode: .automatic
+        ) { await counter.collect() }
+        let collectionCount = await counter.collectionCount()
+        XCTAssertEqual(collectionCount, 2)
+        let counters = await authority.snapshotForTesting()
+        XCTAssertEqual(counters.prefixControlPhysicalScanCount, 2)
+        XCTAssertGreaterThanOrEqual(counters.prefixControlCacheInvalidationCount, 1)
+    }
+
+    func testCorruptFooterAndResidentBudgetNeverRetainAdmissionOrArtifacts() async throws {
+        let fixture = try AuthorityEvidenceFixture()
+        defer { fixture.cleanup() }
+        let corruptAuthority = GitWorkspaceStateAuthority()
+        let corrupt = GitPrefixControlEvidenceManifestFooter(
+            recordCount: 0,
+            recordPayloadByteCount: 0,
+            pathPayloadByteCount: 0,
+            ignoreControlDigest: Data(),
+            attributeControlDigest: Data(repeating: 1, count: 32),
+            artifactDigest: Data(repeating: 2, count: 32)
+        )
+        do {
+            _ = try await corruptAuthority.prefixControlEvidence(
+                in: fixture.layout,
+                prefix: GitRepositoryRelativeRootPrefix(""),
+                cacheMode: .automatic
+            ) { corrupt }
+            XCTFail("Expected corrupt footer rejection")
+        } catch let error as GitPrefixControlEvidenceCacheError {
+            XCTAssertEqual(error, .corruptFooter)
+        }
+        var snapshot = await corruptAuthority.snapshotForTesting()
+        XCTAssertEqual(snapshot.prefixControlCacheEntryCount, 0)
+        XCTAssertEqual(snapshot.pendingPrefixControlAdmissionCount, 0)
+        XCTAssertEqual(snapshot.prefixControlCacheArtifactBytes, 0)
+
+        let bounded = GitWorkspaceStateAuthority(prefixControlCacheLimits: .init(
+            maximumEntryCount: 1,
+            maximumEntriesPerRepository: 1,
+            maximumResidentBytes: 1,
+            maximumArtifactBytes: 0,
+            maximumPendingAdmissionCount: 1,
+            maximumPendingResidentBytes: 512,
+            maximumPendingArtifactBytes: 0
+        ))
+        let counter = PrefixControlCollectorCounter(footer: prefixFooter())
+        for _ in 0 ..< 2 {
+            _ = try await bounded.prefixControlEvidence(
+                in: fixture.layout,
+                prefix: GitRepositoryRelativeRootPrefix(""),
+                cacheMode: .automatic
+            ) { await counter.collect() }
+        }
+        snapshot = await bounded.snapshotForTesting()
+        let boundedCollectionCount = await counter.collectionCount()
+        XCTAssertEqual(boundedCollectionCount, 2)
+        XCTAssertEqual(snapshot.prefixControlCacheEntryCount, 0)
+        XCTAssertEqual(snapshot.prefixControlCacheResidentBytes, 0)
+        XCTAssertEqual(snapshot.prefixControlCacheArtifactBytes, 0)
+        XCTAssertEqual(snapshot.pendingPrefixControlAdmissionCount, 0)
+        XCTAssertEqual(snapshot.prefixControlCacheEvictionCount, 2)
+    }
+
+    func testMonitorUnavailableFallsBackWithoutAdmissionAndTypedMatcherFailsClosed() async throws {
+        let fixture = try AuthorityEvidenceFixture()
+        defer { fixture.cleanup() }
+        let monitor = GitWorkspaceMetadataMonitor(maximumPathsPerRepository: 1)
+        let key = GitWorkspaceAuthorityRepositoryKey(layout: fixture.layout)
+        let retained = try await monitor.retain(
+            repositoryKey: key,
+            paths: [fixture.layout.gitDir.appendingPathComponent("HEAD")]
+        ) { _ in }
+        let authority = GitWorkspaceStateAuthority(metadataMonitor: monitor)
+        let counter = PrefixControlCollectorCounter(footer: prefixFooter())
+        for _ in 0 ..< 2 {
+            _ = try await authority.prefixControlEvidence(
+                in: fixture.layout,
+                prefix: GitRepositoryRelativeRootPrefix("Sources"),
+                cacheMode: .automatic
+            ) { await counter.collect() }
+        }
+        let snapshot = await authority.snapshotForTesting()
+        let collectionCount = await counter.collectionCount()
+        XCTAssertEqual(collectionCount, 2)
+        XCTAssertEqual(snapshot.prefixControlCacheEntryCount, 0)
+
+        let prefix = try GitRepositoryRelativeRootPrefix("Sources/Nested")
+        let fileFlag = FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsFile)
+        let directoryCreateFlags = FSEventStreamEventFlags(
+            kFSEventStreamEventFlagItemIsDir | kFSEventStreamEventFlagItemCreated
+        )
+        XCTAssertTrue(try GitWorkspaceMetadataMonitor.prefixControlScopeMatchesForTesting(
+            repositoryRoot: fixture.root,
+            prefix: prefix,
+            eventPath: fixture.root.appendingPathComponent(".gitignore").path,
+            flags: fileFlag
+        ))
+        XCTAssertTrue(try GitWorkspaceMetadataMonitor.prefixControlScopeMatchesForTesting(
+            repositoryRoot: fixture.root,
+            prefix: prefix,
+            eventPath: fixture.root.appendingPathComponent("Sources/Nested/NewDirectory").path,
+            flags: directoryCreateFlags
+        ))
+        XCTAssertFalse(try GitWorkspaceMetadataMonitor.prefixControlScopeMatchesForTesting(
+            repositoryRoot: fixture.root,
+            prefix: prefix,
+            eventPath: fixture.root.appendingPathComponent(".git/objects/.gitignore").path,
+            flags: fileFlag
+        ))
+        XCTAssertFalse(try GitWorkspaceMetadataMonitor.prefixControlScopeMatchesForTesting(
+            repositoryRoot: fixture.root,
+            prefix: prefix,
+            eventPath: fixture.root.appendingPathComponent("Sources/ordinary.swift").path,
+            flags: fileFlag
+        ))
+        await monitor.release(retained)
+    }
+
     func testLazyPrefixCollectorCrossesLegacyTenThousandBoundaryAndFindsLateControl() async throws {
         let fixture = try AuthorityEvidenceFixture()
         defer { fixture.cleanup() }
@@ -189,9 +717,9 @@ final class GitLoadedRootAuthorityEvidenceTests: XCTestCase {
             authoritativeRelativeFilePaths: ["A.swift"]
         ) else { return XCTFail("Expected source snapshot admission") }
         let sourceLease: GitWorkspaceAuthorityLease
-        switch await sourceAuthority.currentLease(
+        switch try await sourceAuthority.currentLease(
             for: GitWorkspaceAuthorityRepositoryKey(layout: fixture.layout),
-            prefix: try GitRepositoryRelativeRootPrefix("")
+            prefix: GitRepositoryRelativeRootPrefix("")
         ) {
         case let .success(value): sourceLease = value
         case let .failure(reason): return XCTFail("Missing source authority: \(reason)")
@@ -245,6 +773,29 @@ final class GitLoadedRootAuthorityEvidenceTests: XCTestCase {
         await authority.revokeReusableSnapshotAdmission(receipt)
         counters = await authority.snapshotForTesting()
         XCTAssertEqual(counters.reusableSnapshotArtifactBytes, 0)
+    }
+
+    private func prefixFooter() -> GitPrefixControlEvidenceManifestFooter {
+        GitPrefixControlEvidenceManifestFooter(
+            recordCount: 1,
+            recordPayloadByteCount: 32,
+            pathPayloadByteCount: 10,
+            ignoreControlDigest: Data(repeating: 1, count: 32),
+            attributeControlDigest: Data(repeating: 2, count: 32),
+            artifactDigest: Data(repeating: 3, count: 32)
+        )
+    }
+
+    private func waitUntil(
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ predicate: @escaping () async -> Bool
+    ) async throws {
+        for _ in 0 ..< 1000 {
+            if await predicate() { return }
+            await Task.yield()
+        }
+        XCTFail("Timed out waiting for deterministic cache state", file: file, line: line)
     }
 
     func testStaleCatalogBatchFailsClosedAndLeavesNoReusableAdmission() async throws {
@@ -390,6 +941,63 @@ final class GitLoadedRootAuthorityEvidenceTests: XCTestCase {
             objectID: GitObjectID(objectFormat: .sha1, lowercaseHex: String(repeating: "1", count: 40)),
             catalogProjection: .searchableRegularFile
         )
+    }
+}
+
+private actor PrefixControlCollectorGate {
+    private let footer: GitPrefixControlEvidenceManifestFooter
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var collectionStartWaiters: [CheckedContinuation<Void, Never>] = []
+    private var released = false
+    private var count = 0
+
+    init(footer: GitPrefixControlEvidenceManifestFooter) {
+        self.footer = footer
+    }
+
+    func collect() async throws -> GitPrefixControlEvidenceManifestFooter {
+        count += 1
+        let waiters = collectionStartWaiters
+        collectionStartWaiters.removeAll(keepingCapacity: false)
+        waiters.forEach { $0.resume() }
+        if !released {
+            await withCheckedContinuation { continuation = $0 }
+        }
+        try Task.checkCancellation()
+        return footer
+    }
+
+    func release() {
+        released = true
+        continuation?.resume()
+        continuation = nil
+    }
+
+    func collectionCount() -> Int {
+        count
+    }
+
+    func waitUntilCollectionStarts() async {
+        if count > 0 { return }
+        await withCheckedContinuation { collectionStartWaiters.append($0) }
+    }
+}
+
+private actor PrefixControlCollectorCounter {
+    private let footer: GitPrefixControlEvidenceManifestFooter
+    private var count = 0
+
+    init(footer: GitPrefixControlEvidenceManifestFooter) {
+        self.footer = footer
+    }
+
+    func collect() -> GitPrefixControlEvidenceManifestFooter {
+        count += 1
+        return footer
+    }
+
+    func collectionCount() -> Int {
+        count
     }
 }
 

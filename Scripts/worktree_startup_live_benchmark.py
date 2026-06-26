@@ -1363,7 +1363,40 @@ class CLIRunner:
             str(self.cli), "--raw-json", "-w", str(self.window_id), "-e", command_text,
         ]
         started_ns = time.monotonic_ns()
-        process = subprocess.run(command, cwd=self.cwd, text=True, capture_output=True, timeout=timeout)
+        try:
+            process = subprocess.run(command, cwd=self.cwd, text=True, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            finished_ns = time.monotonic_ns()
+
+            def partial_text(value: str | bytes | None) -> str:
+                if value is None:
+                    return ""
+                return value.decode(errors="replace") if isinstance(value, bytes) else value
+
+            record = {
+                "label": label,
+                "tool": tool,
+                "started_at": utc_now(),
+                "started_monotonic_ns": started_ns,
+                "finished_monotonic_ns": finished_ns,
+                "timed_out": True,
+                "timeout_seconds": timeout,
+                "preparation_id": routed.get("preparation_id"),
+                "returncode": None,
+                "stdout": partial_text(error.stdout),
+                "stderr": partial_text(error.stderr),
+            }
+            if self.artifact:
+                with self.lock:
+                    ordinal = self.ordinal
+                    self.ordinal += 1
+                    save_json(
+                        self.artifact / "raw" / f"{ordinal:04d}-{safe_name(label)}.json",
+                        record,
+                        exclusive=True,
+                    )
+                    append_ndjson(self.artifact / "raw-cli-calls.ndjson", record)
+            raise
         finished_ns = time.monotonic_ns()
         record = {
             "label": label,
@@ -1371,6 +1404,9 @@ class CLIRunner:
             "started_at": utc_now(),
             "started_monotonic_ns": started_ns,
             "finished_monotonic_ns": finished_ns,
+            "timed_out": False,
+            "timeout_seconds": timeout,
+            "preparation_id": routed.get("preparation_id"),
             "returncode": process.returncode,
             "stdout": process.stdout,
             "stderr": process.stderr,
@@ -3261,6 +3297,85 @@ def self_test_command(_args: argparse.Namespace) -> int:
         {"control_p95": 100, "candidate_p95": 70, "control_cv": 0.51, "candidate_cv": 0.10},
         {"control_p95": 200, "candidate_p95": 150}, minimum_improvement=0.30,
     )["status"] == "high-variance/inconclusive"
+    with tempfile.TemporaryDirectory(prefix="rpce-worktree-timeout-self-test-") as timeout_raw:
+        timeout_root = Path(timeout_raw)
+        timeout_artifact = timeout_root / "artifact"
+        (timeout_artifact / "raw").mkdir(parents=True)
+        timeout_cli = timeout_root / "timeout-cli"
+        timeout_cli.write_text("#!/bin/sh\nsleep 1\n", encoding="utf-8")
+        timeout_cli.chmod(0o700)
+        preparation_id = str(uuid.uuid4())
+        timeout_runner = CLIRunner(
+            timeout_cli,
+            1,
+            str(uuid.uuid4()),
+            timeout_root,
+            timeout_artifact,
+        )
+        try:
+            timeout_runner.timed_call(
+                "timeout-contract",
+                DEBUG_TOOL,
+                {"preparation_id": preparation_id},
+                timeout=0.01,
+            )
+            checks["timed_call_timeout_raw_record"] = False
+        except subprocess.TimeoutExpired:
+            raw_records = sorted((timeout_artifact / "raw").glob("*.json"))
+            timeout_record = json.loads(raw_records[0].read_text(encoding="utf-8")) if raw_records else {}
+            checks["timed_call_timeout_raw_record"] = (
+                timeout_record.get("timed_out") is True
+                and timeout_record.get("timeout_seconds") == 0.01
+                and timeout_record.get("preparation_id") == preparation_id
+                and isinstance(timeout_record.get("started_monotonic_ns"), int)
+                and isinstance(timeout_record.get("finished_monotonic_ns"), int)
+                and "stdout" in timeout_record
+                and "stderr" in timeout_record
+            )
+
+    class TimeoutQueryRunner:
+        artifact = None
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any], float]] = []
+
+        def timed_call(
+            self,
+            label: str,
+            _tool: str,
+            payload: dict[str, Any],
+            *,
+            timeout: float = 300,
+            check: bool = True,
+            context_id: str | None = None,
+        ) -> TimedCall:
+            del check, context_id
+            self.calls.append((label, payload, timeout))
+            if len(self.calls) == 1:
+                raise subprocess.TimeoutExpired(["debug-cli"], timeout)
+            return TimedCall({"ok": True}, 1, 2, 0)
+
+    query_runner = TimeoutQueryRunner()
+    query_plan = {
+        "scope": {
+            "window_id": 1,
+            "workspace_id": str(uuid.uuid4()),
+            "context_id": str(uuid.uuid4()),
+            "root_id": str(uuid.uuid4()),
+        }
+    }
+    try:
+        set_route(query_runner, query_plan, "projected")  # type: ignore[arg-type]
+        checks["set_route_timeout_queries_preparation"] = False
+    except BenchmarkError:
+        checks["set_route_timeout_queries_preparation"] = (
+            len(query_runner.calls) == 2
+            and query_runner.calls[0][2] == 300
+            and query_runner.calls[1][1].get("action") == "preparation_snapshot"
+            and query_runner.calls[1][2] == 15
+            and query_runner.calls[0][1].get("preparation_id")
+            == query_runner.calls[1][1].get("preparation_id")
+        )
     if not all(checks.values()):
         raise BenchmarkError(f"self-test failed: {[name for name, ok in checks.items() if not ok]}")
     print(json.dumps({"status": "completed", "checks": checks}, indent=2, sort_keys=True))
@@ -3441,12 +3556,90 @@ def diagnostic_payload(plan: dict[str, Any], action: str, **extra: Any) -> dict[
     return {"op": "worktree_startup_benchmark", "action": action, **exact_scope(plan), **extra}
 
 
-def set_route(runner: CLIRunner, plan: dict[str, Any], route: str) -> tuple[str, Any]:
-    config = ROUTES[route]
-    response = runner.call(
-        f"set-route-{route}", DEBUG_TOOL,
-        diagnostic_payload(plan, "set_flags", expires_seconds=900, **{key: config[key] for key in ("observe", "serve", "force_full")}),
+def validate_preparation_snapshot(value: Any, preparation_id: str, terminal: str) -> dict[str, Any]:
+    preparation = find_value(value, "preparation")
+    if not isinstance(preparation, dict):
+        raise BenchmarkError("set_flags omitted the preparation snapshot")
+    required_phases = {
+        "scope_resolution", "set_flags_total", "loaded_root_ingress_fence",
+        "loaded_root_policy_snapshot", "discovery_observation", "discovery_authority_capture",
+        "replacement_observation", "collection_fence", "captured_authority_capture",
+        "captured_observation_validation", "authority_metadata_git", "prefix_control_cache_lookup",
+        "prefix_control_scan", "prefix_control_cache_admit", "tree_inventory_spool",
+        "catalog_manifest_build", "authority_install", "snapshot_materialization",
+        "admission_prepare", "prepared_admission_currentness", "admission_commit",
+        "committed_admission_currentness", "final_loaded_root_currentness",
+    }
+    required_counters = {
+        "authority_captures", "git_command_count", "git_queue_us", "git_duration_us",
+        "prefix_cache_hits", "prefix_cache_misses", "prefix_cache_invalidations",
+        "prefix_cache_admissions", "prefix_cache_evictions", "prefix_cache_bypasses",
+        "prefix_cache_coalesces",
+        "prefix_scan_count", "enumerated_candidates", "enumerated_directories",
+        "explicitly_pruned_directories", "control_record_count", "tree_records",
+        "tree_spool_bytes", "inventory_records", "catalog_batches", "catalog_regular_paths",
+        "snapshot_searchable_paths",
+    }
+    phases, counters, saturation = (
+        preparation.get("phases"), preparation.get("counters"), preparation.get("counter_saturated")
     )
+    if preparation.get("preparation_id", "").upper() != preparation_id.upper():
+        raise BenchmarkError("preparation snapshot ID mismatch")
+    if preparation.get("terminal_state") != terminal or preparation.get("path_free") is not True:
+        raise BenchmarkError("preparation snapshot terminal/privacy contract mismatch")
+    if not isinstance(phases, dict) or set(phases) != required_phases:
+        raise BenchmarkError("preparation snapshot phase schema mismatch")
+    if not isinstance(counters, dict) or set(counters) != required_counters:
+        raise BenchmarkError("preparation snapshot counter schema mismatch")
+    if not isinstance(saturation, dict) or set(saturation) != required_counters:
+        raise BenchmarkError("preparation snapshot saturation schema mismatch")
+    return preparation
+
+
+def set_route(
+    runner: CLIRunner,
+    plan: dict[str, Any],
+    route: str,
+    *,
+    bypass_prefix_control_cache: bool = False,
+) -> tuple[str, Any]:
+    config = ROUTES[route]
+    preparation_id = str(uuid.uuid4())
+    payload = diagnostic_payload(
+        plan,
+        "set_flags",
+        preparation_id=preparation_id,
+        bypass_prefix_control_cache=bypass_prefix_control_cache,
+        expires_seconds=900,
+        **{key: config[key] for key in ("observe", "serve", "force_full")},
+    )
+    try:
+        response = runner.timed_call(f"set-route-{route}", DEBUG_TOOL, payload).response
+    except subprocess.TimeoutExpired as error:
+        snapshot_response: Any = None
+        snapshot_error: str | None = None
+        try:
+            snapshot_response = runner.timed_call(
+                f"set-route-{route}-preparation-snapshot-after-timeout",
+                DEBUG_TOOL,
+                diagnostic_payload(plan, "preparation_snapshot", preparation_id=preparation_id),
+                timeout=15,
+                check=False,
+            ).response
+        except Exception as snapshot_exception:  # Preserve the original fixed-deadline failure.
+            snapshot_error = f"{type(snapshot_exception).__name__}: {snapshot_exception}"
+        timeout_record = {
+            "preparation_id": preparation_id,
+            "timeout_seconds": error.timeout,
+            "preparation_snapshot": snapshot_response,
+            "preparation_snapshot_error": snapshot_error,
+        }
+        if runner.artifact:
+            save_json(runner.artifact / "preparation-timeout.json", timeout_record, exclusive=True)
+        raise BenchmarkError(
+            f"{route} set_flags timed out after {error.timeout}s; preparation_id={preparation_id}"
+        ) from error
+    validate_preparation_snapshot(response, preparation_id, "admitted")
     control_id = find_value(response, "control_id")
     if not isinstance(control_id, str):
         raise BenchmarkError(f"{route} control omitted control_id")
@@ -4751,7 +4944,12 @@ def run_command(args: argparse.Namespace) -> int:
     operational_error: str | None = None
     cleanup: list[dict[str, Any]] = []
     try:
-        control_id, control_response = set_route(runner, plan, args.route)
+        control_id, control_response = set_route(
+            runner,
+            plan,
+            args.route,
+            bypass_prefix_control_cache=args.bypass_prefix_control_cache,
+        )
         state["control_id"] = control_id
         state["control_response"] = control_response
         save_json(artifact / "state.json", state)
@@ -9982,6 +10180,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--minimum-aged-sessions", type=int, default=32)
     run.add_argument("--confirm-process-state", action="store_true")
     run.add_argument("--confirm-dedicated-workspace", action="store_true")
+    run.add_argument(
+        "--bypass-prefix-control-cache",
+        action="store_true",
+        help="DEBUG attribution only: bypass reusable prefix-control evidence reads and admission",
+    )
     run.set_defaults(func=run_command)
 
     smoke = sub.add_parser("smoke", help="run correctness, watcher, inheritance, and root-churn checks")
