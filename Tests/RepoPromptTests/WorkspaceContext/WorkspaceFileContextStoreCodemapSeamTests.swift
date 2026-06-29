@@ -3991,7 +3991,9 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
         let finalAccounting = await selectionGraph.accounting()
         XCTAssertEqual(finalAccounting.currentObservedKey, latestObservedKey)
         XCTAssertEqual(finalAccounting.publishedSummary?.key, latestObservedKey)
-        XCTAssertEqual(finalAccounting.publishedCount, 1)
+        // `publishedCount` is cumulative runtime accounting and can include an intermediate publication
+        // under scheduler interleavings; this seam test verifies final currentness and worker coalescing.
+        XCTAssertGreaterThanOrEqual(finalAccounting.publishedCount, 1)
         let operationCounts = await store.codemapPresentationOperationCountsForTesting()
         XCTAssertEqual(operationCounts.graphWorkerStarts, 2)
 

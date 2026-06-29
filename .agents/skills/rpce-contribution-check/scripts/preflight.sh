@@ -122,6 +122,7 @@ run_pr_ready_path_validations() {
   write_range_files "$files"
 
   local control_plane_paths_pattern='^(Scripts/conductor\.py|Scripts/test_conductor_(lifecycle|output)\.py|Scripts/test_contribution_preflight\.py|\.agents/skills/rpce-contribution-check/scripts/preflight\.sh|Makefile)$'
+  local ci_app_test_runner_paths_pattern='^(Scripts/ci_app_test_runner\.py|Scripts/test_ci_app_test_runner\.py|\.github/workflows/ci\.yml)$'
   local swift_paths_pattern='\.swift$'
   local root_test_paths_pattern='^(Sources/RepoPrompt/|Tests/RepoPromptTests/)'
   local provider_package_paths_pattern='^Packages/RepoPromptAgentProviders/'
@@ -132,6 +133,8 @@ run_pr_ready_path_validations() {
 
   run_pr_ready_validation_if_range_contains "$files" "$control_plane_paths_pattern" "Run conductor self-tests" \
     make conductor-selftest
+  run_pr_ready_validation_if_range_contains "$files" "$ci_app_test_runner_paths_pattern" "Run CI app-test runner self-tests" \
+    make ci-app-test-runner-selftest
   run_pr_ready_validation_if_range_contains "$files" "$swift_paths_pattern" "Run coordinated Swift lint" \
     make dev-lint
   run_pr_ready_validation_if_range_contains "$files" "$root_test_paths_pattern" "Run coordinated root tests" \

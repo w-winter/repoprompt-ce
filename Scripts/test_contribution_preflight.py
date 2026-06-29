@@ -16,6 +16,7 @@ PREFLIGHT_SOURCE = REPO_ROOT / ".agents/skills/rpce-contribution-check/scripts/p
 
 GUARDRAILS_TARGET = "guardrails"
 CONDUCTOR_SELFTEST_TARGET = "conductor-selftest"
+CI_APP_TEST_RUNNER_SELFTEST_TARGET = "ci-app-test-runner-selftest"
 SWIFT_LINT_TARGET = "dev-lint"
 ROOT_TEST_TARGET = "dev-test"
 PROVIDER_TEST_TARGET = "dev-provider-test"
@@ -25,6 +26,7 @@ XCODE_GENERATOR_TEST_TARGET = "xcode-generator-test"
 XCODE_VALIDATE_TARGET = "xcode-validate"
 HEAVYWEIGHT_MAKE_TARGETS = [
     CONDUCTOR_SELFTEST_TARGET,
+    CI_APP_TEST_RUNNER_SELFTEST_TARGET,
     SWIFT_LINT_TARGET,
     ROOT_TEST_TARGET,
     PROVIDER_TEST_TARGET,
@@ -162,6 +164,24 @@ class ContributionPreflightTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             self.assert_make_lines_equal(env, [GUARDRAILS_TARGET, CONDUCTOR_SELFTEST_TARGET])
+
+    def test_pr_ready_runs_ci_app_test_runner_selftest_for_hosted_ci_runner_changes(self) -> None:
+        cases = [
+            ("runner", "Scripts/ci_app_test_runner.py"),
+            ("runner tests", "Scripts/test_ci_app_test_runner.py"),
+            ("hosted workflow", ".github/workflows/ci.yml"),
+        ]
+
+        for name, outgoing_path in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo, preflight, env = self.create_repo(Path(tmp), outgoing_path=outgoing_path)
+
+                    result = self.run_preflight(repo, preflight, env, "pr-ready")
+
+                    self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                    self.assert_make_lines_equal(env, [GUARDRAILS_TARGET, CI_APP_TEST_RUNNER_SELFTEST_TARGET])
+                    self.assertIn("PR-ready preflight passed", result.stdout)
 
     def test_pr_ready_runs_xcode_validation_for_workspace_boundary_changes(self) -> None:
         cases = [
