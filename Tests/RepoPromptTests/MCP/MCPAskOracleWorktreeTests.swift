@@ -455,6 +455,110 @@ import XCTest
             }
         }
 
+        func testGitDiffSelectedArtifactsAutoSelectPatchForBoundLinkedWorktreeWithoutSessionRootCatalog() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let gitFixture = try ReviewGitRepositoryFixture(name: "OracleSelectedArtifactNoCatalog")
+                defer { gitFixture.cleanup() }
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let logicalRoot = try gitFixture.makeRepository(
+                        named: "logical",
+                        files: ["Sources/Feature.swift": "let value = \"initial\"\n"]
+                    )
+                    let worktreeRoot = try gitFixture.makeLinkedWorktree(
+                        from: logicalRoot,
+                        named: "worktree",
+                        branch: "feature/artifact-no-catalog"
+                    )
+                    let logicalFile = logicalRoot.appendingPathComponent("Sources/Feature.swift")
+                    let worktreeFile = worktreeRoot.appendingPathComponent("Sources/Feature.swift")
+                    try write("let value = \"canonical_artifact_leak\"\n", to: logicalFile)
+                    try write("let value = \"linked_artifact_source\"\n", to: worktreeFile)
+                    _ = try await fixture.contextA.window.workspaceFileContextStore.loadRoot(
+                        path: logicalRoot.path,
+                        kind: .primaryWorkspace
+                    )
+                    let layout = try XCTUnwrap(
+                        GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: worktreeRoot)
+                    )
+                    let repositoryIdentity = GitWorktreeIdentity.repositoryIdentity(
+                        commonGitDir: layout.commonDir,
+                        mainWorktreeRoot: layout.knownMainWorktreeRoot
+                    )
+                    let worktreeID = GitWorktreeIdentity.worktreeID(
+                        repositoryID: repositoryIdentity.repositoryID,
+                        gitDir: layout.gitDir,
+                        isMain: false,
+                        path: layout.workTreeRoot
+                    )
+                    let binding = AgentSessionWorktreeBinding(
+                        id: "binding-artifact-no-catalog",
+                        repositoryID: repositoryIdentity.repositoryID,
+                        repoKey: GitRepoDescriptor(rootURL: logicalRoot).repoKey,
+                        logicalRootPath: logicalRoot.path,
+                        logicalRootName: "ArtifactNoCatalogRepo",
+                        worktreeID: worktreeID,
+                        worktreeRootPath: worktreeRoot.path,
+                        worktreeName: "worktree",
+                        branch: "feature/artifact-no-catalog",
+                        source: "test"
+                    )
+
+                    let sourceSelection = StoredSelection(
+                        selectedPaths: [logicalFile.path],
+                        codemapAutoEnabled: false
+                    )
+                    let context = makeFrozenContext(
+                        fixture: fixture,
+                        selection: sourceSelection,
+                        bindings: [binding]
+                    )
+                    let endpoint = try fixture.endpointA()
+                    try await configureAgentModeEndpoint(endpoint, context: context, fixture: fixture)
+
+                    let gitResponse = try await endpoint.callTool(
+                        name: MCPWindowToolName.git,
+                        arguments: [
+                            "op": "diff",
+                            "repo_root": logicalRoot.path,
+                            "scope": "selected",
+                            "detail": "patches",
+                            "artifacts": true,
+                            "mode": "deep"
+                        ],
+                        timeoutSeconds: 30
+                    )
+                    XCTAssertFalse(gitResponse.rawJSON.contains("\"isError\":true"), gitResponse.rawJSON)
+                    let gitText = try toolResultText(gitResponse)
+                    let publishedSelection = try XCTUnwrap(
+                        fixture.contextA.window.workspaceManager.composeTab(with: fixture.contextA.tabID)
+                    ).selection
+                    XCTAssertTrue(publishedSelection.selectedPaths.contains(logicalFile.path))
+                    _ = try requireSelectedPath(
+                        suffix: "/MAP.txt",
+                        in: publishedSelection,
+                        context: "selected linked-worktree artifact publication without session root catalog",
+                        toolOutput: gitText
+                    )
+                    let patchPath = try requireSelectedPath(
+                        suffix: "/diff/all.patch",
+                        in: publishedSelection,
+                        context: "selected linked-worktree artifact publication without session root catalog",
+                        toolOutput: gitText
+                    )
+                    let patchText = try String(contentsOfFile: patchPath, encoding: .utf8)
+                    XCTAssertTrue(patchText.contains("linked_artifact_source"), patchText)
+                    XCTAssertFalse(patchText.contains("canonical_artifact_leak"), patchText)
+
+                    await fixture.cleanup()
+                } catch {
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testAskOracleReviewUsesAuthorizedSelectedArtifactAndKeepsMapAsContext() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)

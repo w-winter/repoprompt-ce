@@ -218,19 +218,81 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         return parts.joined(separator: " ")
     }
 
-    private static func selectedGitDiffPaths(from selection: StoredSelection) -> [String] {
+    nonisolated static func selectedGitDiffPathsForPublication(
+        logicalSelection: StoredSelection,
+        physicalSelection: StoredSelection,
+        worktreeBindings: [AgentSessionWorktreeBinding]
+    ) -> [String] {
+        let boundRoots = worktreeBindings.compactMap { binding -> (logical: String, physical: String)? in
+            guard let logical = standardizedAbsoluteSelectionPath(binding.logicalRootPath),
+                  let physical = standardizedAbsoluteSelectionPath(binding.worktreeRootPath)
+            else { return nil }
+            return (logical, physical)
+        }
+
         var seen = Set<String>()
         var paths: [String] = []
-        func append(_ rawPath: String) {
-            let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard trimmed.hasPrefix("/") else { return }
-            let standardized = StandardizedPath.absolute((trimmed as NSString).expandingTildeInPath)
-            guard seen.insert(standardized).inserted else { return }
-            paths.append(standardized)
+
+        func append(_ path: String) {
+            guard seen.insert(path).inserted else { return }
+            paths.append(path)
         }
-        selection.selectedPaths.forEach(append)
-        selection.slices.keys.forEach(append)
+
+        func longestLogicalBinding(for path: String) -> (logical: String, physical: String)? {
+            boundRoots
+                .filter { pathIsEqualToOrDescendant(path, of: $0.logical) }
+                .max { lhs, rhs in lhs.logical.count < rhs.logical.count }
+        }
+
+        func underAnyPhysicalRoot(_ path: String) -> Bool {
+            boundRoots.contains { pathIsEqualToOrDescendant(path, of: $0.physical) }
+        }
+
+        for candidate in WorkspaceGitDiffSelectionResolver.candidates(from: logicalSelection) {
+            guard let path = standardizedAbsoluteSelectionPath(candidate) else { continue }
+            if let binding = longestLogicalBinding(for: path) {
+                append(translatedPath(path, from: binding.logical, to: binding.physical))
+            } else {
+                append(path)
+            }
+        }
+
+        for candidate in WorkspaceGitDiffSelectionResolver.candidates(from: physicalSelection) {
+            guard let path = standardizedAbsoluteSelectionPath(candidate) else { continue }
+            if longestLogicalBinding(for: path) != nil, !underAnyPhysicalRoot(path) {
+                continue
+            }
+            append(path)
+        }
+
         return paths
+    }
+
+    private nonisolated static func standardizedAbsoluteSelectionPath(_ rawPath: String) -> String? {
+        guard !rawPath.isEmpty,
+              !rawPath.contains("\0")
+        else { return nil }
+        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed.hasPrefix("/"),
+              !trimmed.split(separator: "/").contains("_git_data")
+        else { return nil }
+        return StandardizedPath.absolute((trimmed as NSString).expandingTildeInPath)
+    }
+
+    private nonisolated static func selectionHasPublishableGitDiffCandidates(_ selection: StoredSelection) -> Bool {
+        WorkspaceGitDiffSelectionResolver.candidates(from: selection).contains {
+            standardizedAbsoluteSelectionPath($0) != nil
+        }
+    }
+
+    private nonisolated static func pathIsEqualToOrDescendant(_ path: String, of root: String) -> Bool {
+        path == root || path.hasPrefix(root + "/")
+    }
+
+    private nonisolated static func translatedPath(_ path: String, from root: String, to replacementRoot: String) -> String {
+        guard path != root else { return replacementRoot }
+        return replacementRoot + String(path.dropFirst(root.count))
     }
 
     nonisolated static func makeStatusDTO(
@@ -446,6 +508,18 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         // Generic callers retain first-root compatibility. Exact Agent Context Builder Discover
         // runs instead use the immutable selected-repository target carried by their tab snapshot.
         let metadata = await dependencies.captureRequestMetadata()
+        let preLookupSelectedPublicationContext: MCPServerViewModel.ResolvedTabContextSnapshot? = if op == .diff,
+                                                                                                     args["artifacts"]?.boolValue == true,
+                                                                                                     (args["scope"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "all") == "selected"
+        {
+            try dependencies.resolveTabContextSnapshot(
+                metadata,
+                MCPWindowToolName.git,
+                .allowLegacyImplicitRouting
+            )
+        } else {
+            nil
+        }
         let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
         let visibleRoots = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
         let requestContext = MCPGitRequestContext(rootRefs: visibleRoots, vcsService: vcsService)
@@ -1041,18 +1115,39 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                 let inlineMode = inlineObj?["mode"]?.stringValue?.lowercased() ?? "brief"
                 let inlineMaxLines = max(1, inlineObj?["max_lines"]?.intValue ?? 120)
 
-                // Derive selected diff pathspecs directly from the stabilized tab selection
-                // using the same worktree-aware lookup context used for repo_root translation.
-                // This avoids a race with store-backed worktree record availability while still
-                // letting GitDiffEngine fail closed when paths are not under the target repo.
+                // Derive selected diff pathspecs from a stabilized logical selection plus its
+                // physical projection. Bound logical-root descendants are translated to their
+                // worktree roots for snapshot publication, while the source selection committed
+                // back to the tab remains logical.
                 let allSelectedAbsolutePaths: [String]
                 if scope == .selected {
-                    let physicalSelection = try await dependencies.physicalSelectionForCurrentTabContext(
-                        metadata,
-                        lookupContext
+                    let resolvedContext = try preLookupSelectedPublicationContext
+                        ?? dependencies.resolveTabContextSnapshot(
+                            metadata,
+                            MCPWindowToolName.git,
+                            .allowLegacyImplicitRouting
+                        )
+                    let snapshotSelection = resolvedContext.snapshot.selection
+                    let stabilizedSelection: StoredSelection = if resolvedContext.usesActiveTabCompatibility {
+                        snapshotSelection
+                    } else {
+                        await dependencies.stabilizedVirtualSelection(
+                            resolvedContext.snapshot
+                        )
+                    }
+                    let logicalSelection = Self.selectionHasPublishableGitDiffCandidates(stabilizedSelection)
+                        ? stabilizedSelection
+                        : snapshotSelection
+                    let physicalSelection = lookupContext.physicalizeSelection(logicalSelection)
+                    let worktreeBindings = resolvedContext.snapshot.worktreeBindings.isEmpty
+                        ? lookupContext.bindingProjection?.boundRootsForMetadata.map(\.binding) ?? []
+                        : resolvedContext.snapshot.worktreeBindings
+                    allSelectedAbsolutePaths = Self.selectedGitDiffPathsForPublication(
+                        logicalSelection: logicalSelection,
+                        physicalSelection: physicalSelection,
+                        worktreeBindings: worktreeBindings
                     )
-                    allSelectedAbsolutePaths = Self.selectedGitDiffPaths(from: physicalSelection)
-                    sourceSelectionForArtifactCommit = lookupContext.logicalizeSelection(physicalSelection)
+                    sourceSelectionForArtifactCommit = logicalSelection
                 } else {
                     sourceSelectionForArtifactCommit = nil
                     allSelectedAbsolutePaths = []
