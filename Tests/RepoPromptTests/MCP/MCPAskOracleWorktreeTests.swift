@@ -1280,6 +1280,163 @@ import XCTest
             }
         }
 
+        func testAgentRunOracleReviewSourceCaptureAllowsEquivalentSelectionRevisionDriftButRejectsIdentityChange() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease,
+                    contextASearchFileCount: 3
+                )
+                addTeardownBlock {
+                    await fixture.cleanup()
+                }
+                let window = fixture.contextA.window
+                defer {
+                    window.mcpServer.setRequestMetadataOverrideForTesting(nil)
+                }
+
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let sourceTabID = UUID()
+                    guard let workspaceIndex = window.workspaceManager.workspaces.firstIndex(where: {
+                        $0.id == fixture.contextA.workspaceID
+                    }) else {
+                        return XCTFail("Expected active fixture workspace")
+                    }
+                    window.workspaceManager.workspaces[workspaceIndex].composeTabs.append(
+                        ComposeTabState(
+                            id: sourceTabID,
+                            name: "Oracle revision drift source",
+                            selection: StoredSelection(),
+                            promptText: "Frozen launch source"
+                        )
+                    )
+                    let sourceIdentity = WorkspaceSelectionIdentity(
+                        workspaceID: fixture.contextA.workspaceID,
+                        tabID: sourceTabID
+                    )
+                    let searchPaths = Array(fixture.contextA.searchFileURLs.prefix(3).map(\.path))
+                    XCTAssertEqual(searchPaths.count, 3)
+                    let sourcePaths = Array(searchPaths.prefix(2))
+                    let manualCodemapPath = searchPaths[2]
+                    let sourceSelection = StoredSelection(
+                        selectedPaths: sourcePaths,
+                        codemapAutoEnabled: false
+                    )
+                    _ = await window.selectionCoordinator.persistSelection(
+                        sourceSelection,
+                        for: sourceIdentity,
+                        source: .runtimeMutation,
+                        mirrorToUIIfActive: false
+                    )
+                    let sourceRevision = window.workspaceManager.selectionRevisionForMCP(
+                        workspaceID: fixture.contextA.workspaceID,
+                        tabID: sourceTabID
+                    )
+                    let committedSource = try XCTUnwrap(
+                        window.workspaceManager.composeTab(with: sourceTabID)
+                    )
+                    XCTAssertEqual(Set(committedSource.selection.selectedPaths), Set(sourcePaths))
+                    let snapshot = AgentRunOracleReviewLaunchSnapshot(
+                        route: .explicitTabContext,
+                        windowID: window.windowID,
+                        workspaceID: fixture.contextA.workspaceID,
+                        tabID: sourceTabID,
+                        selectionRevision: sourceRevision,
+                        promptText: committedSource.promptText,
+                        selection: committedSource.selection,
+                        sourceAgentSessionID: nil,
+                        routedRunID: nil
+                    )
+
+                    let equivalentSelection = StoredSelection(
+                        selectedPaths: Array(sourcePaths.reversed()),
+                        codemapAutoEnabled: false
+                    )
+                    _ = await window.selectionCoordinator.persistSelection(
+                        equivalentSelection,
+                        for: sourceIdentity,
+                        source: .runtimeMutation,
+                        mirrorToUIIfActive: false
+                    )
+                    XCTAssertNotEqual(
+                        window.workspaceManager.selectionRevisionForMCP(
+                            workspaceID: fixture.contextA.workspaceID,
+                            tabID: sourceTabID
+                        ),
+                        sourceRevision
+                    )
+                    let equivalentCapture = await window.mcpServer.testCaptureAgentRunOracleReviewSource(
+                        snapshot: snapshot,
+                        targetWindow: window
+                    )
+                    let liveAfterEquivalentCapture = window.workspaceManager.composeTab(
+                        with: sourceTabID
+                    )?.selection
+                    guard case let .captured(captured) = equivalentCapture else {
+                        return XCTFail(
+                            "Expected equivalent selection identity drift to preserve captured source, " +
+                                "got \(equivalentCapture); " +
+                                "liveSelection=\(String(describing: liveAfterEquivalentCapture))"
+                        )
+                    }
+                    XCTAssertEqual(captured.sourceSelectionRevision, sourceRevision)
+                    XCTAssertEqual(captured.selection, committedSource.selection)
+                    XCTAssertEqual(
+                        captured.exactSelectedIdentities,
+                        AgentRunOracleReviewSelectionIdentity.normalizedSelectedArtifactIdentities(
+                            snapshot.selection
+                        )
+                    )
+
+                    let manualCodemapChangedSelection = StoredSelection(
+                        selectedPaths: sourcePaths,
+                        manualCodemapPaths: [manualCodemapPath],
+                        codemapAutoEnabled: false
+                    )
+                    _ = await window.selectionCoordinator.persistSelection(
+                        manualCodemapChangedSelection,
+                        for: sourceIdentity,
+                        source: .runtimeMutation,
+                        mirrorToUIIfActive: false
+                    )
+                    let manualCodemapChangedCapture = await window.mcpServer.testCaptureAgentRunOracleReviewSource(
+                        snapshot: snapshot,
+                        targetWindow: window
+                    )
+                    guard case let .unavailable(manualCodemapUnavailable) = manualCodemapChangedCapture else {
+                        return XCTFail("Expected manual codemap identity drift to fail closed")
+                    }
+                    guard case .sourceCaptureFailed = manualCodemapUnavailable.reason else {
+                        return XCTFail(
+                            "Expected manual codemap source capture failure, got \(manualCodemapUnavailable.reason)"
+                        )
+                    }
+
+                    let changedSelection = StoredSelection(
+                        selectedPaths: [sourcePaths[0]],
+                        codemapAutoEnabled: false
+                    )
+                    _ = await window.selectionCoordinator.persistSelection(
+                        changedSelection,
+                        for: sourceIdentity,
+                        source: .runtimeMutation,
+                        mirrorToUIIfActive: false
+                    )
+                    let changedCapture = await window.mcpServer.testCaptureAgentRunOracleReviewSource(
+                        snapshot: snapshot,
+                        targetWindow: window
+                    )
+                    guard case let .unavailable(unavailable) = changedCapture else {
+                        return XCTFail("Expected real selection identity drift to fail closed")
+                    }
+                    guard case let .sourceCaptureFailed(message) = unavailable.reason else {
+                        return XCTFail("Expected source capture failure, got \(unavailable.reason)")
+                    }
+                    XCTAssertTrue(message.contains("selection") || message.contains("tab changed"))
+                }
+            }
+        }
+
         func testAgentRunExplicitContextCapturesInactiveSourceInsteadOfActiveTab() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)

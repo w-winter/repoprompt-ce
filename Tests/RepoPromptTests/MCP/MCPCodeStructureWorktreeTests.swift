@@ -832,13 +832,17 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         )
         defer { repositories.cleanup() }
 
-        let store = WorkspaceFileContextStore()
+        let codemapFixture = try MCPCodeStructureCodemapRuntimeFixture(name: #function)
+        addTeardownBlock {
+            await codemapFixture.shutdown()
+        }
+        let store = codemapFixture.makeStore()
         let root = try await store.loadRoot(path: worktreeRootURL.path, kind: .sessionWorktree)
         let content = try await store.readContent(rootID: root.id, relativePath: "App.swift", workloadClass: .codemap)
         XCTAssertTrue(content?.contains("DirectSessionWorktreeType") == true)
         let loadedFile = await store.file(rootID: root.id, relativePath: "App.swift")
         let file = try XCTUnwrap(loadedFile)
-        let ticket = try await readyTicket(store: store, fileID: file.id)
+        let ticket = try await readyTicket(store: store, fileID: file.id, timeout: .seconds(30))
         defer { Task { _ = await store.cancelCodemapArtifactDemand(ticket) } }
 
         let presentation = try await WorkspaceCodemapPresentationCoordinator(store: store)
@@ -1174,44 +1178,59 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         fileID: UUID,
         timeout: Duration = .seconds(8)
     ) async throws -> WorkspaceCodemapArtifactDemandTicket {
-        var result = await store.requestCodemapArtifact(forFileID: fileID)
         var activeTicket: WorkspaceCodemapArtifactDemandTicket?
-        var lastResultDescription = String(describing: result)
-        let timeoutDescription = String(describing: timeout)
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while clock.now < deadline {
-            lastResultDescription = String(describing: result)
-            switch result {
-            case let .ready(ready):
-                return ready.ticket
-            case let .pending(ticket):
-                activeTicket = ticket
-                try await Task.sleep(for: .milliseconds(25))
-                result = await store.codemapArtifactDemandStatus(ticket)
-            case let .unavailable(.busy(retryAfterMilliseconds)):
-                let delayMilliseconds = min(max(retryAfterMilliseconds ?? 100, 25), 1000)
-                try await Task.sleep(for: .milliseconds(delayMilliseconds))
-                if let activeTicket {
-                    result = await store.retryBusyCodemapArtifactDemand(activeTicket, priority: .demand)
-                } else {
-                    result = await store.requestCodemapArtifact(forFileID: fileID)
-                }
+
+        do {
+            var result = await store.requestCodemapArtifact(forFileID: fileID)
+            var lastResultDescription = String(describing: result)
+            let timeoutDescription = String(describing: timeout)
+            let deadline = clock.now.advanced(by: timeout)
+            while clock.now < deadline {
+                try Task.checkCancellation()
+                lastResultDescription = String(describing: result)
                 switch result {
                 case let .ready(ready):
-                    activeTicket = ready.ticket
+                    return ready.ticket
                 case let .pending(ticket):
                     activeTicket = ticket
-                case .unavailable:
-                    break
+                    try await Task.sleep(for: .milliseconds(25))
+                    result = await store.codemapArtifactDemandStatus(ticket)
+                case let .unavailable(.busy(retryAfterMilliseconds)):
+                    let delayMilliseconds = min(max(retryAfterMilliseconds ?? 100, 25), 1000)
+                    try await Task.sleep(for: .milliseconds(delayMilliseconds))
+                    if let activeTicket {
+                        result = await store.retryBusyCodemapArtifactDemand(activeTicket, priority: .demand)
+                    } else {
+                        result = await store.requestCodemapArtifact(forFileID: fileID)
+                    }
+                    switch result {
+                    case let .ready(ready):
+                        return ready.ticket
+                    case let .pending(ticket):
+                        activeTicket = ticket
+                    case .unavailable:
+                        break
+                    }
+                case let .unavailable(reason):
+                    XCTFail("Expected ready codemap demand, got \(reason)")
+                    throw NSError(domain: "MCPCodeStructureWorktreeTests", code: 2)
                 }
-            case let .unavailable(reason):
-                XCTFail("Expected ready codemap demand, got \(reason)")
-                throw NSError(domain: "MCPCodeStructureWorktreeTests", code: 2)
             }
+            XCTFail(
+                "Timed out waiting for ready codemap demand after \(timeoutDescription); last result: \(lastResultDescription)"
+            )
+            throw NSError(domain: "MCPCodeStructureWorktreeTests", code: 3)
+        } catch {
+            if let ticket = activeTicket {
+                activeTicket = nil
+                _ = await store.cancelCodemapArtifactDemand(
+                    ticket,
+                    deadline: clock.now.advanced(by: .seconds(5))
+                )
+            }
+            throw error
         }
-        XCTFail("Timed out waiting for ready codemap demand after \(timeoutDescription); last result: \(lastResultDescription)")
-        throw NSError(domain: "MCPCodeStructureWorktreeTests", code: 3)
     }
 
     private func makeWindow(root: URL) async throws -> WindowState {

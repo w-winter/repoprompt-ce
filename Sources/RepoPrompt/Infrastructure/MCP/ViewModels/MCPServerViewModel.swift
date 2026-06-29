@@ -637,6 +637,14 @@ final class MCPServerViewModel: ObservableObject {
         return ResolvedAgentRunOracleReviewLaunchSource(snapshot: snapshot, source: source)
     }
 
+    private func agentRunOracleReviewLaunchSelectionStillMatches(
+        snapshot: AgentRunOracleReviewLaunchSnapshot,
+        liveSelection: StoredSelection
+    ) -> Bool {
+        AgentRunOracleReviewSelectionIdentity.normalizedSourceSelectionIdentities(liveSelection)
+            == snapshot.normalizedSourceSelectionIdentities
+    }
+
     private func captureAgentRunOracleReviewSource(
         snapshot: AgentRunOracleReviewLaunchSnapshot,
         targetWindow: WindowState
@@ -700,12 +708,16 @@ final class MCPServerViewModel: ObservableObject {
         }
         let bindings = bindingState.bindings ?? []
         let sourceRunID = sourceSession?.runID
-        guard initial.snapshot.activeAgentSessionID == sourceSessionID,
-              manager.selectionRevisionForMCP(
-                  workspaceID: snapshot.workspaceID,
-                  tabID: sourceTabID
-              ) == snapshot.selectionRevision
-        else {
+        guard initial.snapshot.activeAgentSessionID == sourceSessionID else {
+            return unavailable(
+                "The launching tab changed after its review selection was frozen.",
+                sourceRunID
+            )
+        }
+        guard agentRunOracleReviewLaunchSelectionStillMatches(
+            snapshot: snapshot,
+            liveSelection: initial.snapshot.selection
+        ) else {
             return unavailable(
                 "The launching tab changed after its review selection was frozen.",
                 sourceRunID
@@ -764,10 +776,10 @@ final class MCPServerViewModel: ObservableObject {
                     sourceRunID
                 )
             }
-            guard manager.selectionRevisionForMCP(
-                workspaceID: snapshot.workspaceID,
-                tabID: sourceTabID
-            ) == snapshot.selectionRevision else {
+            guard agentRunOracleReviewLaunchSelectionStillMatches(
+                snapshot: snapshot,
+                liveSelection: latest.snapshot.selection
+            ) else {
                 return unavailable(
                     "The launching selection changed while its frozen review capability was being created.",
                     sourceRunID
