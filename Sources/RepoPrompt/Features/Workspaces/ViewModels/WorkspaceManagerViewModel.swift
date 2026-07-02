@@ -1186,6 +1186,78 @@ class WorkspaceManagerViewModel: ObservableObject {
             WorkspaceRestorePerfLog.event("workspaceSwitch.loadWorkspaceFolders.rootVisibilitySummary", fields: summaryFields)
         }
 
+        private func debugSearchIndexBuildDiagnosticFields(
+            storeBefore: WorkspaceFileContextStore.StoreWorkDiagnosticsSnapshot,
+            storeAfter: WorkspaceFileContextStore.StoreWorkDiagnosticsSnapshot,
+            searchBefore: WorkspaceSearchService.RebuildWorkDiagnosticsSnapshot,
+            searchAfter: WorkspaceSearchService.RebuildWorkDiagnosticsSnapshot,
+            snapshot: WorkspaceSearchCatalogSnapshot,
+            requestedCapability: WorkspaceSearchCatalogAccessRequirement
+        ) -> [String: String] {
+            let beforeShards = storeBefore.rootCatalogShards
+            let afterShards = storeAfter.rootCatalogShards
+            let beforeAuthoritative = beforeShards.roots.reduce(0) { $0 + $1.authoritativeRebuildCount }
+            let afterAuthoritative = afterShards.roots.reduce(0) { $0 + $1.authoritativeRebuildCount }
+            let beforeFallback = beforeShards.roots.reduce(0) { $0 + $1.fallbackCount }
+            let afterFallback = afterShards.roots.reduce(0) { $0 + $1.fallbackCount }
+            let beforePathIndex = beforeShards.roots.reduce(0) { $0 + $1.pathIndexBuildCount }
+            let afterPathIndex = afterShards.roots.reduce(0) { $0 + $1.pathIndexBuildCount }
+            let beforeOverlayPathIndex = beforeShards.roots.reduce(0) { $0 + $1.overlayPathIndexBuildCount }
+            let afterOverlayPathIndex = afterShards.roots.reduce(0) { $0 + $1.overlayPathIndexBuildCount }
+            let beforeFallbackReasons = debugFallbackReasonCounts(beforeShards)
+            let afterFallbackReasons = debugFallbackReasonCounts(afterShards)
+            return [
+                "requestedCapability": debugSearchCatalogRequirementDescription(requestedCapability),
+                "snapshotPathIndexes": "\(snapshot.rootPathIndexes.count)",
+                "catalogRebuildWorkDelta": "\(storeAfter.catalogRebuild.rebuildCount - storeBefore.catalogRebuild.rebuildCount)",
+                "searchRebuildWorkDelta": "\(searchAfter.rebuildCount - searchBefore.rebuildCount)",
+                "searchStaleDiscardedDelta": "\(searchAfter.staleDiscardedCount - searchBefore.staleDiscardedCount)",
+                "searchDebounceCancellationDelta": "\(searchAfter.debounceCancellationCount - searchBefore.debounceCancellationCount)",
+                "searchLastEntryCount": "\(searchAfter.lastEntryCount)",
+                "shardBuildDelta": "\(afterShards.totalBuildCount - beforeShards.totalBuildCount)",
+                "authoritativeRebuildDelta": "\(afterAuthoritative - beforeAuthoritative)",
+                "pathIndexBuildDelta": "\(afterPathIndex - beforePathIndex)",
+                "overlayPathIndexBuildDelta": "\(afterOverlayPathIndex - beforeOverlayPathIndex)",
+                "fallbackDelta": "\(afterFallback - beforeFallback)",
+                "fallbackReasonDeltas": debugFallbackReasonDeltas(before: beforeFallbackReasons, after: afterFallbackReasons),
+                "publishedShardCount": "\(afterShards.publishedShardCount)",
+                "totalShardBuildCount": "\(afterShards.totalBuildCount)",
+                "totalShardFallbackCount": "\(afterFallback)",
+                "totalAuthoritativeRebuildCount": "\(afterAuthoritative)"
+            ]
+        }
+
+        private func debugSearchCatalogRequirementDescription(_ requirement: WorkspaceSearchCatalogAccessRequirement) -> String {
+            switch requirement {
+            case .recordsOnly:
+                "recordsOnly"
+            case .recordsAndPathIndexes:
+                "recordsAndPathIndexes"
+            }
+        }
+
+        private func debugFallbackReasonCounts(
+            _ snapshot: WorkspaceFileContextStore.RootCatalogShardDebugSnapshot
+        ) -> [String: Int] {
+            var counts: [String: Int] = [:]
+            for root in snapshot.roots {
+                for (reason, count) in root.fallbackReasonCounts {
+                    counts[reason.rawValue, default: 0] += count
+                }
+            }
+            return counts
+        }
+
+        private func debugFallbackReasonDeltas(before: [String: Int], after: [String: Int]) -> String {
+            let reasons = Set(before.keys).union(after.keys).sorted()
+            let deltas = reasons.compactMap { reason -> String? in
+                let delta = (after[reason] ?? 0) - (before[reason] ?? 0)
+                guard delta != 0 else { return nil }
+                return "\(reason):\(delta)"
+            }
+            return deltas.isEmpty ? "none" : deltas.joined(separator: ",")
+        }
+
         private func debugRebuildSearchIndex(
             from snapshot: WorkspaceSearchCatalogSnapshot,
             workspace: WorkspaceModel,
@@ -2951,7 +3023,13 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
         let restoreStart = Date()
         logWorkspaceSwitch("restore state BEGIN workspace=\"\(activeWS.name)\"")
-        await restoreWorkspaceState(activeWS)
+        // If roots were already unloaded during save/unload, this restore-time refresh is
+        // a harmless no-op. Otherwise, defer it until after target root hydration so we
+        // do not walk outgoing roots that `loadWorkspaceFolders` will immediately unload.
+        await restoreWorkspaceState(
+            activeWS,
+            refreshExistingRootFolderState: rootsUnloadedBeforeFolderLoad
+        )
         let restoreDuration = Date().timeIntervalSince(restoreStart)
         logWorkspaceSwitch("restore state END workspace=\"\(activeWS.name)\" duration=\(String(format: "%.3f", restoreDuration))s")
         #if DEBUG
@@ -3036,6 +3114,23 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: activeWS.id) else {
             return .cancelled("Workspace switch to \"\(newWorkspace.name)\" was superseded while replaying hydrated selection.")
         }
+
+        #if DEBUG
+            let postHydrationRefreshStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+        #endif
+        fileManager.refreshRootFolderState()
+        #if DEBUG
+            WorkspaceRestorePerfLog.event(
+                "workspaceSwitch.postHydration.refreshRootFolderState",
+                fields: debugWorkspaceOpenTraceFields().merging([
+                    "workspaceID": WorkspaceRestorePerfLog.shortID(activeWS.id),
+                    "generation": "\(hydrationGeneration)",
+                    "rootCount": "\(fileManager.rootFolders.count)",
+                    "selectedFiles": "\(fileManager.selectedFiles.count)",
+                    "duration": postHydrationRefreshStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                ], uniquingKeysWith: { _, new in new })
+            )
+        #endif
 
         // Another yield after state restoration
         advanceWorkspaceSwitchOperation(operationID, to: .notifyingListeners)
@@ -4635,7 +4730,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         lastSavedVersionByWorkspaceID[wsID] = cur
     }
 
-    func restoreWorkspaceState(_ workspace: WorkspaceModel) async {
+    func restoreWorkspaceState(
+        _ workspace: WorkspaceModel,
+        refreshExistingRootFolderState: Bool = true
+    ) async {
         let wsID = workspace.id
         #if DEBUG
             let restoreStateStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
@@ -4925,17 +5023,22 @@ class WorkspaceManagerViewModel: ObservableObject {
             return
         }
 
-        // 4️⃣ Ensure folder checkbox state is consistent
+        // 4️⃣ Ensure folder checkbox state is consistent for roots that remain loaded.
+        // Workspace switches that are about to unload the outgoing roots defer this
+        // reconciliation until the target workspace has hydrated.
         #if DEBUG
             let refreshRootFolderStateStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
-        fileManager.refreshRootFolderState()
+        if refreshExistingRootFolderState {
+            fileManager.refreshRootFolderState()
+        }
         #if DEBUG
             WorkspaceRestorePerfLog.event(
                 "workspaceSwitch.restoreState.refreshRootFolderState",
                 fields: [
                     "workspaceID": WorkspaceRestorePerfLog.shortID(wsID),
                     "rootCount": "\(fileManager.rootFolders.count)",
+                    "skipped": "\(!refreshExistingRootFolderState)",
                     "duration": refreshRootFolderStateStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
@@ -6081,14 +6184,37 @@ class WorkspaceManagerViewModel: ObservableObject {
         if allPrimaryRootsVisibleSuccessfully, !Task.isCancelled {
             onAllPrimaryRootsVisible?()
         }
-        await failures.append(contentsOf: awaitPostCatalogRootWorkFailures(generation: hydrationGeneration))
+        #if DEBUG
+            let postCatalogRootWorkTaskCount = postCatalogRootWorkTasks[hydrationGeneration]?.count ?? 0
+            let postCatalogRootWorkStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+        #endif
+        let postCatalogRootWorkFailures = await awaitPostCatalogRootWorkFailures(generation: hydrationGeneration)
+        failures.append(contentsOf: postCatalogRootWorkFailures)
+        #if DEBUG
+            WorkspaceRestorePerfLog.event(
+                "workspaceSwitch.loadWorkspaceFolders.postCatalogRootWorkAwait.end",
+                fields: debugWorkspaceOpenTraceFields().merging([
+                    "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                    "generation": "\(hydrationGeneration)",
+                    "taskCount": "\(postCatalogRootWorkTaskCount)",
+                    "failureCount": "\(postCatalogRootWorkFailures.count)",
+                    "duration": postCatalogRootWorkStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                ], uniquingKeysWith: { _, new in new })
+            )
+        #endif
         guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
         await workspaceSearchService.startKeepingFresh(with: fileManager.workspaceFileContextStore)
         guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
+        let searchCatalogRequirement: WorkspaceSearchCatalogAccessRequirement = .recordsAndPathIndexes
         #if DEBUG
+            let searchIndexBuildStoreWorkBefore = await fileManager.workspaceFileContextStore.storeWorkDiagnosticsSnapshot()
+            let searchIndexBuildSearchWorkBefore = await workspaceSearchService.workDiagnosticsSnapshot()
             let searchCatalogSnapshotStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
-        var snapshot = await fileManager.workspaceFileContextStore.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        var snapshot = await fileManager.workspaceFileContextStore.searchCatalogSnapshot(
+            rootScope: .visibleWorkspace,
+            requirement: searchCatalogRequirement
+        )
         guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
         #if DEBUG
             let initialSearchCatalogSnapshotDurationMS = searchCatalogSnapshotStartMS.map { WorkspaceRestorePerfLog.elapsedMS(since: $0) }
@@ -6151,7 +6277,10 @@ class WorkspaceManagerViewModel: ObservableObject {
             #if DEBUG
                 let loopSearchCatalogSnapshotStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             #endif
-            snapshot = await fileManager.workspaceFileContextStore.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+            snapshot = await fileManager.workspaceFileContextStore.searchCatalogSnapshot(
+                rootScope: .visibleWorkspace,
+                requirement: searchCatalogRequirement
+            )
             guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
             #if DEBUG
                 if let loopSearchCatalogSnapshotStartMS {
@@ -6194,25 +6323,33 @@ class WorkspaceManagerViewModel: ObservableObject {
             guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
         }
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
-                "workspaceSwitch.searchIndexBuild.end",
-                fields: [
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
-                    "generation": "\(hydrationGeneration)",
-                    "catalogGeneration": "\(snapshot.generation)",
-                    "indexedGeneration": "\(indexGeneration)",
-                    "catalogRoots": "\(snapshot.diagnostics.rootCount)",
-                    "catalogFolders": "\(snapshot.diagnostics.folderCount)",
-                    "catalogFiles": "\(snapshot.diagnostics.fileCount)",
-                    "rebuildCount": "\(searchIndexRebuildCount)",
-                    "failureCount": "\(failures.count)",
-                    "catalogSnapshotDuration": WorkspaceRestorePerfLog.formatMS(totalSearchCatalogSnapshotDurationMS),
-                    "searchRebuildDuration": WorkspaceRestorePerfLog.formatMS(totalSearchIndexRebuildDurationMS),
-                    "pathLookupWarmDuration": WorkspaceRestorePerfLog.formatMS(totalPathLookupWarmDurationMS),
-                    "barrierDuration": searchIndexBuildStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured",
-                    "duration": searchIndexBuildStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
-                ].merging(debugWorkspaceOpenTraceFields(), uniquingKeysWith: { current, _ in current })
-            )
+            let searchIndexBuildStoreWorkAfter = await fileManager.workspaceFileContextStore.storeWorkDiagnosticsSnapshot()
+            let searchIndexBuildSearchWorkAfter = await workspaceSearchService.workDiagnosticsSnapshot()
+            var fields = [
+                "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                "generation": "\(hydrationGeneration)",
+                "catalogGeneration": "\(snapshot.generation)",
+                "indexedGeneration": "\(indexGeneration)",
+                "catalogRoots": "\(snapshot.diagnostics.rootCount)",
+                "catalogFolders": "\(snapshot.diagnostics.folderCount)",
+                "catalogFiles": "\(snapshot.diagnostics.fileCount)",
+                "rebuildCount": "\(searchIndexRebuildCount)",
+                "failureCount": "\(failures.count)",
+                "catalogSnapshotDuration": WorkspaceRestorePerfLog.formatMS(totalSearchCatalogSnapshotDurationMS),
+                "searchRebuildDuration": WorkspaceRestorePerfLog.formatMS(totalSearchIndexRebuildDurationMS),
+                "pathLookupWarmDuration": WorkspaceRestorePerfLog.formatMS(totalPathLookupWarmDurationMS),
+                "barrierDuration": searchIndexBuildStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured",
+                "duration": searchIndexBuildStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+            ].merging(debugWorkspaceOpenTraceFields(), uniquingKeysWith: { current, _ in current })
+            fields.merge(debugSearchIndexBuildDiagnosticFields(
+                storeBefore: searchIndexBuildStoreWorkBefore,
+                storeAfter: searchIndexBuildStoreWorkAfter,
+                searchBefore: searchIndexBuildSearchWorkBefore,
+                searchAfter: searchIndexBuildSearchWorkAfter,
+                snapshot: snapshot,
+                requestedCapability: searchCatalogRequirement
+            ), uniquingKeysWith: { current, _ in current })
+            WorkspaceRestorePerfLog.event("workspaceSwitch.searchIndexBuild.end", fields: fields)
         #endif
         guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
         if failures.isEmpty {
