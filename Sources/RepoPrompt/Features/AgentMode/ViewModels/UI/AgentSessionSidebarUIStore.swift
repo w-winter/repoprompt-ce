@@ -155,8 +155,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
                     "revision": String(snapshot.revision),
                     "visibleSessionCount": String(snapshot.visibleSessionCount),
                     "collapsedThreadCount": String(snapshot.collapsedThreadKeys.count),
-                    "attentionCount": String(snapshot.attentionRunStateByTabID.count),
-                    "attentionTimestampCount": String(snapshot.attentionMarkedAtByTabID.count)
+                    "attentionCount": String(snapshot.attentionRunStateByTabID.count)
                 ]
             )
         #endif

@@ -2,14 +2,16 @@
 import XCTest
 
 final class AgentNavigationHUDSnapshotBuilderTests: XCTestCase {
-    func testCurrentWindowItemsPreserveSidebarOrderAndIncludeChildren() throws {
+    func testCurrentWindowItemsPreserveHierarchyStatusAndRollUpSubagents() throws {
         let workspaceID = try XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111"))
         let root = UUID()
         let child = UUID()
+        let grandchild = UUID()
         let other = UUID()
         let rows = [
             row(tabID: root, depth: 0, title: "Root"),
             row(tabID: child, depth: 1, title: "Child"),
+            row(tabID: grandchild, depth: 2, title: "Grandchild"),
             row(tabID: other, depth: 0, title: "Other")
         ]
         let attentionTime = Date(timeIntervalSince1970: 500)
@@ -22,51 +24,24 @@ final class AgentNavigationHUDSnapshotBuilderTests: XCTestCase {
             workspaceTitle: "Workspace",
             windowTitle: "Window",
             runStateByTabID: [child: .running],
-            attentionRunStateByTabID: [other: .completed],
+            attentionRunStateByTabID: [grandchild: .completed, other: .failed],
             attentionMarkedAtByTabID: [other: attentionTime]
         )
 
-        XCTAssertEqual(items.map(\.tabID), [root, child, other])
-        XCTAssertEqual(items.map(\.depth), [0, 1, 0])
+        XCTAssertEqual(items.map(\.tabID), [root, child, grandchild, other])
+        XCTAssertEqual(items.map(\.depth), [0, 1, 2, 0])
+        XCTAssertEqual(items.map(\.displayDepth), [0, 1, 2, 0])
         XCTAssertFalse(items[0].isActiveTab)
         XCTAssertTrue(items[1].isActiveTab)
         XCTAssertEqual(items[1].statusLabel, "Running")
-        XCTAssertEqual(items[2].attentionMarkedAt, attentionTime)
-        XCTAssertEqual(items[2].statusLabel, "Done")
-    }
-
-    func testCurrentWindowItemsRollUpSubagentCountsOntoRoot() throws {
-        let workspaceID = try XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111"))
-        let root = UUID()
-        let child = UUID()
-        let grandchild = UUID()
-        let other = UUID()
-        let rows = [
-            row(tabID: root, depth: 0, title: "Root"),
-            row(tabID: child, depth: 1, title: "Child"),
-            row(tabID: grandchild, depth: 2, title: "Grandchild"),
-            row(tabID: other, depth: 0, title: "Other")
-        ]
-
-        let items = AgentNavigationHUDSnapshotBuilder.currentWindowItems(
-            rows: rows,
-            currentTabID: root,
-            windowID: 3,
-            workspaceID: workspaceID,
-            workspaceTitle: "Workspace",
-            windowTitle: "Window",
-            attentionRunStateByTabID: [grandchild: .completed]
-        )
-
-        XCTAssertEqual(items[0].tabID, root)
         XCTAssertEqual(items[0].subagentCount, 2)
         XCTAssertEqual(items[0].subagentAttentionCount, 1)
-        XCTAssertEqual(items[1].subagentCount, 0)
-        XCTAssertEqual(items[2].displayDepth, 2)
-        XCTAssertEqual(items[3].subagentCount, 0)
+        XCTAssertEqual(items[2].subagentCount, 0)
+        XCTAssertEqual(items[3].attentionMarkedAt, attentionTime)
+        XCTAssertEqual(items[3].statusLabel, "Failed")
     }
 
-    func testAllAgentsFilteringSortingAndCapAreDeterministic() throws {
+    func testAllAgentsSortingCapAndSearchCorpusAreDeterministic() throws {
         let workspaceID = try XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111"))
         let now = Date(timeIntervalSince1970: 10000)
         let stale = item(
@@ -103,41 +78,23 @@ final class AgentNavigationHUDSnapshotBuilderTests: XCTestCase {
             item(
                 tabID: UUID(),
                 workspaceID: workspaceID,
-                title: "Filler \(index)",
-                activityDate: now.addingTimeInterval(TimeInterval(-120 - index)),
-                runState: .idle
-            )
-        }
-
-        let sorted = AgentNavigationHUDSnapshotBuilder.allAgentsSortedAndCapped(
-            [stale, recent, activeOlder, attentionNewest] + filler,
-            now: now
-        )
-
-        XCTAssertEqual(sorted.count, AgentNavigationHUDSnapshotBuilder.allAgentsCap)
-        XCTAssertEqual(sorted.first?.title, "Attention newest")
-        XCTAssertTrue(sorted.contains { $0.title == "Recent" })
-        XCTAssertTrue(sorted.contains { $0.title == "Active older" })
-        XCTAssertFalse(sorted.contains { $0.title == "Stale" })
-    }
-
-    func testAllAgentsSortedReturnsUncappedSearchCorpus() throws {
-        let workspaceID = try XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111"))
-        let now = Date(timeIntervalSince1970: 10000)
-        let items = (0 ..< 60).map { index in
-            item(
-                tabID: UUID(),
-                workspaceID: workspaceID,
                 title: "Searchable older session \(index)",
                 activityDate: now.addingTimeInterval(TimeInterval(-120 - index)),
                 runState: .idle
             )
         }
+        let allItems = [stale, recent, activeOlder, attentionNewest] + filler
 
-        let sorted = AgentNavigationHUDSnapshotBuilder.allAgentsSorted(items, now: now)
+        let sorted = AgentNavigationHUDSnapshotBuilder.allAgentsSorted(allItems, now: now)
+        let capped = AgentNavigationHUDSnapshotBuilder.allAgentsSortedAndCapped(allItems, now: now)
 
         XCTAssertGreaterThan(sorted.count, AgentNavigationHUDSnapshotBuilder.allAgentsCap)
         XCTAssertTrue(sorted.contains { $0.title == "Searchable older session 59" })
+        XCTAssertEqual(capped.count, AgentNavigationHUDSnapshotBuilder.allAgentsCap)
+        XCTAssertEqual(capped.first?.title, "Attention newest")
+        XCTAssertTrue(capped.contains { $0.title == "Recent" })
+        XCTAssertTrue(capped.contains { $0.title == "Active older" })
+        XCTAssertFalse(capped.contains { $0.title == "Stale" })
     }
 
     func testSearchTokensSplitWhitespaceAndPreserveQuotedPhrases() {
