@@ -137,7 +137,7 @@ actor HistorySessionScanner: HistorySessionScanning {
     func scanAllWorkspaces() async throws -> [HistoryWorkspaceScanResult] {
         let now = Date()
         // History queries are usually iterative model investigations, not live tailing.
-        // Keep the expensive cross-workspace inventory warm for several minutes so
+        // Keep the expensive cross-workspace inventory warm briefly so
         // list/search/time calls in the same reasoning loop do not repeatedly reopen
         // thousands of tiny stale index files.
         if let cachedScanResults,

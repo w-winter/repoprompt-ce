@@ -1,8 +1,3 @@
-## Scenarios
-issue: 123
-status: implemented
-- Invalid `session_id` filter values (non-UUID strings) return a validation error.
-
 # History Query Tools
 
 ## Problem
@@ -44,7 +39,7 @@ This spec proposes a new MCP tool group — **`history`** — that queries past 
 - Compacted turns retain summary text but discard individual activities. Tools must work with both live and compacted data.
 - MCP response size is capped; all tools must truncate and report.
 - Tool group is named `history` (not `session_history`).
-- Single MCP tool named `history` with `op` dispatch: `list_sessions` | `search` | `time`. Follows the established convention used by `prompt`, `git`, `manage_worktree`, `agent_manage`.
+- Single MCP tool named `history` with `op` dispatch: `list_sessions` | `search` | `time` | `get_session`. Follows the established convention used by `prompt`, `git`, `manage_worktree`, `agent_manage`.
 - Registered as a window-scoped MCP tool (in `MCPWindowToolGroup.history`) that queries across all workspaces. Follows the `agent_manage.list_sessions` precedent — window tool registration with cross-workspace behavior.
 - Parameter naming follows existing RP-CE conventions (descriptive snake_case: `date_from`, `agent_kind`, `touched_file`, `session_id`).
 - Active duration is derived at query time from stored, threshold-independent interval primitives (the union of merged turn-active intervals and the positive gaps between those intervals). The idle threshold is an integer in the inclusive range 0–1440 minutes. An omitted or null value uses the settings-backed app default (`history.idle_threshold_minutes`, currently 10 minutes when unset), while an out-of-range or non-integer value is a validation error (not clamped). A gap strictly greater than the threshold is idle and excluded; a gap less than or equal is active. A threshold of 0 means every positive gap is idle, so `active_duration_seconds` equals the merged-interval duration. The same threshold applies to every active-duration field an operation returns (`total_active_duration_seconds`, per-group, and per-detail). The gap between merged active intervals is an approximation of idle time — it conflates user think-time, agent pauses, and time away from the app; it is not strictly "time waiting for user input."
@@ -192,12 +187,35 @@ Aggregate time-in-session analytics.
 | `date_from` | `string?` | ISO 8601 lower bound |
 | `date_to` | `string?` | ISO 8601 upper bound |
 | `include_details` | `bool?` | Include per-session breakdowns (default: false) |
+| `limit` | `int?` | Max groups (default: 30, max: 100) |
 | `idle_threshold_minutes` | `int?` | Gaps longer than this count as idle (settings-backed default, currently 10; range: 0–1440) |
 | `max_sessions_scanned` | `int?` | Bound on transcript/hydration sessions scanned (default: 200, hard cap: 1000) |
 
 **Returns:** `total_sessions`, `total_active_duration_seconds`, `truncated`, `sessions_scanned`, `scan_truncated`, `skipped_workspaces`, and array of `groups` keyed by the `group_by` value. Each group has `sessions`, `active_duration_seconds`, `turn_count`, `tool_call_count`, and optional `details` array with per-session breakdowns.
 
 **Duration:** Computed at query time from stored interval primitives: turn-active intervals (`completedAt ?? lastActivityAt ?? startedAt` per turn, merged to remove overlap) plus the positive gaps between them. `idle_threshold_minutes` (settings-backed default, currently 10) splits gaps — gaps greater than the threshold are idle and excluded; gaps less than or equal are active and included. `active_duration_seconds` / `total_active_duration_seconds` reflect the requested threshold.
+
+---
+
+### `history.get_session`
+
+Read a bounded, noise-reduced transcript window for one session. Intended follow-up flow: run `history.search`, then call `history.get_session` with the returned `session_id` and `turn_index`.
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | `string` | Required session UUID |
+| `around_turn` | `int?` | Turn index to inspect, usually copied from a search result |
+| `context_turns` | `int?` | Turns before/after `around_turn` (default: 1, max: 5; use 0 for cheapest target-turn-only follow-up) |
+| `turn_start` | `int?` | Inclusive start turn for a bounded range; used when `around_turn` is omitted |
+| `turn_end` | `int?` | Inclusive end turn for a bounded range; max returned span is 20 turns |
+| `roles` | `[string]?` | Included roles. Default: user, assistant, errors, summaries. Tool calls are summarized per turn unless role `tool` is included |
+| `max_chars` | `int?` | Hard cap on returned text (default: 6000, max: 20000) |
+
+**Returns:** `session_id`, `session_name`, `workspace_name`, `total_turns`, `returned_turn_start`, `returned_turn_end`, `truncated`, and `turns`. Each returned turn includes `turn_index`, `started_at`, optional `request_text`, optional `tool_call_summary`, `entries`, `truncated`, and optional `entries_omitted`.
+
+**Bounds:** Whole-session dumps are intentionally unsupported. Callers must provide either `around_turn` (with optional `context_turns`) or a bounded `turn_start`/`turn_end` range.
 
 ## Implementation Notes
 
@@ -220,7 +238,6 @@ The search operation prioritizes `conclusionText` (the full, non-truncated concl
 - `request_previews` omitted from `list_sessions` response.
 - `files_touched` depends on persisted summary key paths or persisted `toolExecution.keyPaths`; older sanitized sessions whose tool args were stripped before key path extraction may still have empty file lists.
 - `had_errors` maps to `hasUnknownConversationContent` (semantically broader than "had errors").
-- `time` response `truncated` is always `false` (no limit parameter in v1).
 - **Duration precision**: gaps and coverage are stored as whole seconds (truncated), so a gap within ~1 second of the threshold may be classified by the truncated value. This matches the prior algorithm's precision and is immaterial at minute granularity.
 - **Point turns split gaps**: a zero-duration turn (e.g. a `startedAt`-only turn from a provider that omits completion timestamps) is retained as a point interval and can split one idle gap into two, which can change classification at a given threshold. Providers that emit completion timestamps (the common case) are unaffected.
 

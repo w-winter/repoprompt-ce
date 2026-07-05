@@ -1680,8 +1680,23 @@ final class HistoryMCPToolServiceTests: XCTestCase {
     // MARK: - resolveIdleThreshold
 
     func testResolveIdleThreshold_defaultsAndValidation() throws {
+        let defaults = UserDefaults.standard
+        let key = HistoryMCPToolService.idleThresholdSettingsKey
+        let previousValue = defaults.object(forKey: key)
+        defaults.removeObject(forKey: key)
+        defer {
+            if let previousValue {
+                defaults.set(previousValue, forKey: key)
+            } else {
+                defaults.removeObject(forKey: key)
+            }
+        }
+
         // Omitted -> default threshold.
-        XCTAssertEqual(try HistoryMCPToolService.resolveIdleThreshold(nil), 10)
+        XCTAssertEqual(
+            try HistoryMCPToolService.resolveIdleThreshold(nil),
+            AgentSessionMetadataRecord.defaultIdleThresholdMinutes
+        )
 
         // Valid integers within range accepted.
         for valid in [0, 1, 10, 1440] {

@@ -71,8 +71,33 @@ final class HistorySessionScannerTests: XCTestCase {
         XCTAssertEqual(totalRecords, 3)
     }
 
+    func testScanAllWorkspaces_cacheInvalidatesChangedIndexAfterTTL() async throws {
+        scanner = HistorySessionScanner(applicationSupportRoot: tempDir, scanCacheTTL: 0)
+        let wsDir = try createWorkspaceDir(name: "Project", uuid: UUID())
+        let first = makeMinimalRecord(name: "First")
+        try createAgentSessionsIndex(in: wsDir, records: [first])
+
+        var results = try await scanner.scanAllWorkspaces()
+        XCTAssertEqual(results.count, 1)
+        XCTAssertEqual(results.first?.records.map(\.name), ["First"])
+
+        let second = makeMinimalRecord(name: "Second")
+        try createAgentSessionsIndex(in: wsDir, records: [first, second])
+        let indexFile = wsDir
+            .appendingPathComponent("AgentSessions", isDirectory: true)
+            .appendingPathComponent("AgentSessionIndex.json")
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 1_800_000_000)],
+            ofItemAtPath: indexFile.path
+        )
+
+        results = try await scanner.scanAllWorkspaces()
+        XCTAssertEqual(results.count, 1)
+        XCTAssertEqual(results.first?.records.map(\.name), ["First", "Second"])
+    }
+
     func testScanAllWorkspaces_workspaceWithoutAgentSessionsDir() async throws {
-        let wsDir = try createWorkspaceDir(name: "EmptyProject", uuid: UUID())
+        _ = try createWorkspaceDir(name: "EmptyProject", uuid: UUID())
         // No AgentSessions directory created
 
         let results = try await scanner.scanAllWorkspaces()
@@ -503,7 +528,7 @@ final class HistorySessionScannerTests: XCTestCase {
         let wsDir = try createWorkspaceDir(name: "StaleProject", uuid: UUID())
         let record = makeMinimalRecord(name: "OldSession")
 
-        // Write an index with schemaVersion 3 (current is 4).
+        // Write an index with schemaVersion 3 (current is 5).
         let agentSessions = wsDir.appendingPathComponent("AgentSessions", isDirectory: true)
         try FileManager.default.createDirectory(at: agentSessions, withIntermediateDirectories: true)
         let staleIndex = AgentSessionMetadataIndex(
