@@ -40,7 +40,7 @@ final class MCPHistoryToolProvider: MCPWindowToolProviding {
             **Scope**: Window routing does not imply workspace scope; history scans all saved workspaces by default. Use `workspace` to filter by saved name, UUID, or `Workspace-*` storage directory. Stale indexes are skipped and reported in `skipped_workspaces`.
 
             **Truncation**: `truncated` means `limit` capped returned results; `scan_truncated` means `max_sessions_scanned` capped work.
-            **Caching**: The cross-workspace session inventory is cached for ~90 seconds for query-loop performance. A session saved within that window may not appear in `list_sessions`/`search`/`time`, and a freshly-saved `session_id` may not resolve in `get_session`, until the cache expires. Transcript text is always read fresh once a session is resolved.
+            **Caching**: The cross-workspace session inventory is cached for ~90 seconds for query-loop performance. A session saved within that window may not appear in `list_sessions`/`search`/`time` until the cache expires. `get_session` retries once with a cache-bypassed scan on `session_id` miss so freshly-saved sessions can resolve immediately; transcript content is signature-checked and cache-invalidated when the session file changes.
             """,
             annotations: .repoPromptLocalReadOnly,
             inputSchema: .object(

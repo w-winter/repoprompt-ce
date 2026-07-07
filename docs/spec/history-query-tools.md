@@ -233,7 +233,7 @@ The search operation prioritizes `conclusionText` (the full, non-truncated concl
 
 ### Scan caching
 
-`HistorySessionScanner` caches the cross-workspace session inventory for ~90 seconds (`scanCacheTTL`, default 90) so iterative `list_sessions`/`search`/`time` queries in one reasoning loop do not repeatedly reopen the per-workspace indexes. Within that window a newly-saved session may not appear, and a freshly-saved `session_id` may not resolve in `get_session`, until the cache expires; transcript text is always read fresh once a session is resolved. A per-index file-signature cache (size + mtime) invalidates a workspace's entry as soon as its `AgentSessionIndex.json` changes, independent of the TTL.
+`HistorySessionScanner` caches the cross-workspace session inventory for ~90 seconds (`scanCacheTTL`, default 90) so iterative `list_sessions`/`search`/`time` queries in one reasoning loop do not repeatedly reopen the per-workspace indexes. Within that window a newly-saved session may not appear in cached inventory queries until the cache expires. `get_session` performs one cache-bypassed rescan on `session_id` miss, while preserving the per-index file-signature cache, so a freshly-saved session can resolve immediately without forcing unchanged indexes to re-decode. A per-index file-signature cache (size + mtime) invalidates a workspace's entry as soon as its `AgentSessionIndex.json` changes, independent of the TTL; decoded transcript content is likewise signature-checked and invalidated when the session file changes.
 
 ### Known gaps (v1)
 
