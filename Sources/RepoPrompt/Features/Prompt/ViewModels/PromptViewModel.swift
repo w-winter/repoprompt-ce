@@ -2092,7 +2092,7 @@ class PromptViewModel: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 guard let self, !self.isSyncingSettings else { return }
-                self.syncGlobalDerivedSettingsFromStore()
+                syncGlobalDerivedSettingsFromStore()
             }
             .store(in: &cancellables)
 
