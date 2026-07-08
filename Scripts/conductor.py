@@ -1727,7 +1727,7 @@ class DaemonState:
         lock_path = self._global_heavy_slot_path()
         lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         lock_file = lock_path.open("a+", encoding="utf-8")
-        should_log_wait = True
+        did_log_wait = False
         while True:
             with self.condition:
                 job = self.jobs.get(ticket)
@@ -1743,15 +1743,17 @@ class DaemonState:
                     self.condition.notify_all()
                     lock_file.close()
                     return None
-                if should_log_wait:
-                    job.global_heavy_slot_path = str(lock_path)
-                    self._append_system_line_locked(job, f"waiting for global heavy slot: {lock_path}\n")
-                    self.condition.notify_all()
-                    should_log_wait = False
             try:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
+                with self.condition:
+                    job = self.jobs.get(ticket)
+                    if job and job.state == "running" and not did_log_wait:
+                        job.global_heavy_slot_path = str(lock_path)
+                        self._append_system_line_locked(job, f"waiting for global heavy slot: {lock_path}\n")
+                        self.condition.notify_all()
+                        did_log_wait = True
                 time.sleep(GLOBAL_HEAVY_SLOT_POLL_SECONDS)
             except OSError as exc:
                 if exc.errno == errno.EINTR:
@@ -3444,10 +3446,9 @@ def wait_for_terminal(
                 for blocker in blockers:
                     lanes = ",".join(blocker.get("conflictingLanes") or [])
                     cancellation = " (cancellation requested)" if blocker.get("cancelRequested") else ""
-                    blocker_detail = f"blocked by {blocker.get('operationLabel')} {blocker.get('ticket')} on {lanes}{cancellation}"
                     print(
                         f"Waiting to begin {payload.get('operationLabel') or payload.get('operation')}; "
-                        f"{blocker_detail}."
+                        f"blocked by {blocker.get('operationLabel')} {blocker.get('ticket')} on {lanes}{cancellation}."
                     )
                 last_blockers = blocker_signature
             if tail != last_tail and state not in TERMINAL_STATES:

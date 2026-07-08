@@ -242,8 +242,9 @@ final actor ClaudeNativeProcessSessionController {
     ///
     /// Normal owners must call async `shutdown()`, which can reap the process and
     /// clear expected PID registrations. `deinit` cannot await that path, so this
-    /// method releases file-handle callbacks, closes stdin, schedules group-aware
-    /// child process termination/reaping, and schedules expected-PID cleanup on the MCP actor.
+    /// method releases file-handle callbacks, closes stdin, sends SIGTERM to the
+    /// child process family, schedules group-aware termination/reaping, and schedules
+    /// expected-PID cleanup on the MCP actor.
     ///
     /// The non-blocking `waitpid(WNOHANG)` here will usually return before the
     /// child exits, leaving a zombie. A detached `Task` is scheduled to reap the
@@ -256,6 +257,11 @@ final actor ClaudeNativeProcessSessionController {
         if let process {
             let pid = process.pid
             let processGroupID = process.processGroupID
+            ProcessTermination.signalProcessGroupOrPID(
+                pid: pid,
+                processGroupID: processGroupID,
+                signal: SIGTERM
+            )
             var status: Int32 = 0
             _ = Darwin.waitpid(pid, &status, WNOHANG)
             // Schedule an async reap so the child is collected even if the

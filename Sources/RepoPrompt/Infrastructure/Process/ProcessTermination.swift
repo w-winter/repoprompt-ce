@@ -99,6 +99,9 @@ enum ProcessTermination {
         guard let processGroupID, processGroupID > 0 else { return nil }
         // Never signal our own group; provider cleanup must not be able to take down
         // RepoPrompt or the test runner if metadata is wrong or a PID/PGID was reused.
+        // A stale PGID could theoretically be reused by an unrelated process family
+        // after the original group exits; cleanup callers keep the TERM→KILL window
+        // short and only pass PGIDs returned from ProcessLauncher.spawn.
         guard processGroupID != getpgrp() else { return nil }
         return processGroupID
     }
@@ -180,7 +183,7 @@ enum ProcessTermination {
         if signalProcessGroupOrPID(pid: pid, processGroupID: processGroupID, signal: SIGTERM, logger: logger) {
             lastSignal = SIGTERM
         } else {
-            return normalizedExitCode(status)
+            logger("Process \(pid) could not be signaled with SIGTERM; waiting for exit/reap")
         }
 
         let waitForProcessGroupExit = safeProcessGroupID(processGroupID) != nil
@@ -201,7 +204,7 @@ enum ProcessTermination {
         if signalProcessGroupOrPID(pid: pid, processGroupID: processGroupID, signal: SIGKILL, logger: logger) {
             lastSignal = SIGKILL
         } else {
-            return normalizedExitCode(status)
+            logger("Process \(pid) could not be signaled with SIGKILL; waiting for exit/reap")
         }
 
         let sigkillDeadline = ProcessInfo.processInfo.systemUptime + max(sigkillGrace, 0)
