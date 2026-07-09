@@ -462,6 +462,7 @@
         }
 
         private var temporaryRoots = FileSystemTemporaryRoots()
+        private var cancellables = Set<AnyCancellable>()
 
         override func tearDown() {
             if let originalMCPAutoStart {
@@ -471,6 +472,7 @@
             EditFlowPerf.resetDebugCaptureForTesting()
             MCPApplyEditsRebaseProbeRecorder.resetForTesting()
             MCPResponseDeliveryTracer.resetDebugEvents()
+            cancellables.removeAll()
             temporaryRoots.removeAll()
             super.tearDown()
         }
@@ -1849,7 +1851,7 @@
             XCTAssertTrue(snapshot.lifecycleEvents.contains {
                 $0.eventName == "FileSystem.ServicePublish" && $0.correlationID == sinkID.uuidString
             })
-            withExtendedLifetime(cancellable) {}
+            cancellables.insert(cancellable)
             await service.stopWatchingForChanges()
         }
 
