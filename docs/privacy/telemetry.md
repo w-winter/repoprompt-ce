@@ -75,7 +75,7 @@ RepoPrompt CE does not intentionally send:
 Native crash reports may include SDK-provided crash context such as stack traces, exception messages,
 app/OS versions, device model, locale, and memory values. RepoPrompt disables default PII, disables
 Sentry's automatic failed-request and release-health session capture, and applies its own scrubber
-before events are sent. RepoPrompt does not set Sentry `dist` for new events; older cached crashes from
+before events are sent. RepoPrompt explicitly clears Sentry `dist` at SDK startup for new events; older cached crashes from
 previous builds may retain the distribution value originally attached by those builds.
 
 ## Processor

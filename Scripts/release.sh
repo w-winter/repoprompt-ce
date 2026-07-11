@@ -209,10 +209,20 @@ prepare_sentry_release() {
     local source_repository="${SOURCE_GITHUB_REPOSITORY:-$GITHUB_REPOSITORY}"
     [[ -n "$source_repository" ]] || fail "Missing SOURCE_GITHUB_REPOSITORY for Sentry commit association"
     printf 'Preparing Sentry release %s for %s/%s.\n' "$SENTRY_RELEASE_NAME" "$REPOPROMPT_SENTRY_ORG" "$REPOPROMPT_SENTRY_PROJECT"
-    if ! sentry-cli --org "$REPOPROMPT_SENTRY_ORG" releases info "$SENTRY_RELEASE_NAME" >/dev/null 2>&1; then
-        sentry-cli --org "$REPOPROMPT_SENTRY_ORG" releases new \
-            --project "$REPOPROMPT_SENTRY_PROJECT" \
-            "$SENTRY_RELEASE_NAME"
+    local lookup_error=""
+    if lookup_error="$(sentry-cli --org "$REPOPROMPT_SENTRY_ORG" releases info "$SENTRY_RELEASE_NAME" 2>&1 >/dev/null)"; then
+        :
+    else
+        local normalized_lookup_error="${lookup_error,,}"
+        if [[ "$normalized_lookup_error" == *"release not found"* ||
+            "$normalized_lookup_error" == *"release does not exist"* ||
+            "$normalized_lookup_error" =~ (^|[^0-9])404([^0-9]|$) ]]; then
+            sentry-cli --org "$REPOPROMPT_SENTRY_ORG" releases new \
+                --project "$REPOPROMPT_SENTRY_PROJECT" \
+                "$SENTRY_RELEASE_NAME"
+        else
+            fail "Unable to look up Sentry release $SENTRY_RELEASE_NAME; refusing to create it after an authentication, authorization, or network failure."
+        fi
     fi
     sentry-cli --org "$REPOPROMPT_SENTRY_ORG" releases set-commits \
         "$SENTRY_RELEASE_NAME" \
@@ -396,8 +406,6 @@ publish_staged_release() {
             > "$(basename "$CHECKSUMS")"
     )
 
-    finalize_sentry_release
-    record_sentry_production_deploy
     "$CONTROL_PLANE_SCRIPTS_DIR/verify_remote_release_commit.sh" "$RELEASE_TAG" "$RELEASE_COMMIT"
     local release_args=(
         "$RELEASE_TAG"
@@ -414,15 +422,24 @@ publish_staged_release() {
         --draft
         --target "$RELEASE_COMMIT"
     )
+    local existing_release_state=""
+    if existing_release_state="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
+        fail "GitHub release $RELEASE_TAG already exists (isDraft=$existing_release_state). Refusing to repeat Sentry finalization or deploy publication; inspect the existing draft and Sentry release before manual recovery."
+    fi
     gh release create "${release_args[@]}"
     printf 'Created draft GitHub release assets for %s.\n' "$RELEASE_TAG"
+
+    finalize_sentry_release
+    record_sentry_production_deploy
 }
 
-case "$MODE" in
-    sync-cli-version) sync_mcp_cli_version ;;
-    preflight) run_preflight ;;
-    artifact) package_release_candidate ;;
-    stage-publish) stage_publish_release ;;
-    publish-staged) publish_staged_release ;;
-    *) fail "Usage: $0 sync-cli-version|preflight|artifact|stage-publish|publish-staged" ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "$MODE" in
+        sync-cli-version) sync_mcp_cli_version ;;
+        preflight) run_preflight ;;
+        artifact) package_release_candidate ;;
+        stage-publish) stage_publish_release ;;
+        publish-staged) publish_staged_release ;;
+        *) fail "Usage: $0 sync-cli-version|preflight|artifact|stage-publish|publish-staged" ;;
+    esac
+fi

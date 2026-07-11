@@ -38,6 +38,8 @@ enum SentryTelemetryBootstrap {
                     options.debug = false
                 #endif
                 options.tracesSampleRate = performanceTracingEnabled ? 0.05 : 0
+                // Do not let SDK defaults or future configuration attach distribution metadata.
+                options.dist = nil
                 options.add(inAppInclude: "RepoPrompt")
                 options.add(inAppInclude: "RepoPromptMCP")
                 options.add(inAppInclude: "RepoPromptShared")
@@ -325,9 +327,10 @@ enum SentryTelemetryBootstrap {
             }
             event.context = event.context?.reduce(into: [:]) { result, entry in
                 guard !shouldDropValue(at: [entry.key]) else { return }
-                let context = entry.value.reduce(into: [:]) { contextResult, contextEntry in
-                    if let value = scrubValue(contextEntry.value, keyPath: [entry.key, contextEntry.key]) {
-                        contextResult[contextEntry.key] = value
+                let context: [String: Any] = entry.value.reduce(into: [:]) { contextResult, contextEntry in
+                    guard let contextKey = contextEntry.key as? String else { return }
+                    if let value = scrubValue(contextEntry.value, keyPath: [entry.key, contextKey]) {
+                        contextResult[contextKey] = value
                     }
                 }
                 if !context.isEmpty {
