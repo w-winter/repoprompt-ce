@@ -18489,26 +18489,31 @@ actor WorkspaceFileContextStore {
             rootID: rootID,
             rootLifetimeID: initialState.lifetimeID
         )
-        guard await waitForCodemapRootMutationFenceIfNeeded(rootEpoch: rootEpoch) else {
-            return nil
+        let token: CodemapRootMutationFenceToken
+        while true {
+            guard await waitForCodemapRootMutationFenceIfNeeded(rootEpoch: rootEpoch),
+                  !Task.isCancelled,
+                  rootStatesByID[rootID]?.lifetimeID == rootEpoch.rootLifetimeID
+            else {
+                return nil
+            }
+            if codemapPathInvalidationFlightsByRootEpoch[rootEpoch] == nil,
+               !codemapPathFenceTokensByID.values.contains(where: { $0.rootEpoch == rootEpoch })
+            {
+                token = CodemapRootMutationFenceToken(id: UUID(), rootEpoch: rootEpoch)
+                codemapRootMutationFenceTokensByRootEpoch[rootEpoch] = token
+                break
+            }
+            // Drain path work before acquiring the root fence. Retained path flights wait on an
+            // already-held root fence, so installing the root fence first would make each side
+            // wait for the other. Recheck the root-fence lane after every suspension so competing
+            // root mutations remain serialized.
+            await Task.yield()
         }
-
-        let token = CodemapRootMutationFenceToken(id: UUID(), rootEpoch: rootEpoch)
-        codemapRootMutationFenceTokensByRootEpoch[rootEpoch] = token
         var didTransferFenceOwnership = false
         defer {
             if !didTransferFenceOwnership {
                 finishCodemapRootMutationFence(token, didCommitMutation: false)
-            }
-        }
-        while codemapPathInvalidationFlightsByRootEpoch[rootEpoch] != nil ||
-            codemapPathFenceTokensByID.values.contains(where: { $0.rootEpoch == rootEpoch })
-        {
-            await Task.yield()
-            guard !Task.isCancelled,
-                  rootStatesByID[rootID]?.lifetimeID == rootEpoch.rootLifetimeID
-            else {
-                return nil
             }
         }
         await fenceCodemapRootAuthority(rootIDs: [rootID], command: command)

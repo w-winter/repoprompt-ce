@@ -4,7 +4,7 @@ import Foundation
 import XCTest
 
 final class CodemapStoreMutationTests: WorkspaceFileContextStoreCodemapSeamTestSupport {
-    func testStoreEditRenameAndDeleteAwaitCodemapAuthorityFenceBeforeReturning() async throws {
+    func testStoreEditRenameAndDeleteRevokeAuthorityBeforeReturningAndRecoverAfterRetainedInvalidation() async throws {
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
@@ -43,8 +43,8 @@ final class CodemapStoreMutationTests: WorkspaceFileContextStoreCodemapSeamTestS
             relativePath: mutable.standardizedRelativePath
         )
         let editedFile = try XCTUnwrap(editedFileValue)
-        let editedTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: editedFile.id))
-        _ = try await readyResult(settledResult(store: store, ticket: editedTicket))
+        let editedDemand = try await readyArtifactDemand(store: store, forFileID: editedFile.id)
+        let editedTicket = editedDemand.ticket
         try await store.moveFile(
             rootID: loaded.id,
             from: mutable.standardizedRelativePath,
@@ -58,8 +58,8 @@ final class CodemapStoreMutationTests: WorkspaceFileContextStoreCodemapSeamTestS
             relativePath: "Sources/Renamed.swift"
         )
         let renamedFile = try XCTUnwrap(renamedFileValue)
-        let renamedTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: renamedFile.id))
-        _ = try await readyResult(settledResult(store: store, ticket: renamedTicket))
+        let renamedDemand = try await readyArtifactDemand(store: store, forFileID: renamedFile.id)
+        let renamedTicket = renamedDemand.ticket
         try await store.deleteFile(rootID: loaded.id, relativePath: "Sources/Renamed.swift")
         await assertStale(store.codemapArtifactDemandStatus(renamedTicket))
         XCTAssertEqual(try unrelatedReady.handle.artifactKey(), unrelatedReady.snapshot.artifactKey)
