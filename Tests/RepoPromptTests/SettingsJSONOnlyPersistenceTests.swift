@@ -235,11 +235,12 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
     }
 
     func testSentryScrubStringRedactsSensitiveValues() {
-        let raw = "token=abcdef password:sekret /Users/\(NSUserName())/project 192.168.1.42"
+        let raw = "token=abcdef password:sekret /Users/alice/project 192.168.1.42"
         let scrubbed = SentryTelemetryBootstrap.scrubStringForTesting(raw)
 
         XCTAssertFalse(scrubbed.contains("abcdef"))
         XCTAssertFalse(scrubbed.contains("sekret"))
+        XCTAssertFalse(scrubbed.contains("/Users/alice"))
         XCTAssertFalse(scrubbed.contains("192.168.1.42"))
         XCTAssertFalse(scrubbed.contains("/Users/\(NSUserName())"))
         XCTAssertTrue(scrubbed.contains("token=[redacted]"))
