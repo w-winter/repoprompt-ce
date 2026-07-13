@@ -169,8 +169,8 @@ import XCTest
                 // timeout; the timeout must fire right after spawn returns.
                 usleep(300_000)
                 let spawned = try ProcessLauncher.spawn(
-                    command: "/bin/sleep",
-                    arguments: ["30"],
+                    command: "/usr/bin/true",
+                    arguments: [],
                     environment: environment,
                     workingDirectory: workingDirectory
                 )
@@ -190,6 +190,85 @@ import XCTest
                 XCTAssertEqual(error, .timedOut)
             }
             try await waitForProcessExit(pidBox.pid)
+        }
+
+        func testSpoolingSpawnFailureMapsToTargetEvidenceLaunchClassification() async throws {
+            let repo = try makeRepository()
+            let spawner: GitService.ProcessSpawner = { _, _, _, _ in
+                throw ProcessLauncherError.spawnFailed(errno: ENOENT)
+            }
+            let service = makeGitService(spawner: spawner)
+
+            do {
+                _ = try await service.runGitSpoolingForTesting(["status"], at: repo)
+                XCTFail("expected spooling spawn failure")
+            } catch {
+                XCTAssertEqual(
+                    GitService.targetEvidenceCollectionError(error) as? GitTargetEvidenceCollectionError,
+                    .processLaunch(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
+                )
+            }
+        }
+
+        func testSpoolingExpiredSpawnBudgetBeatsFastChildCompletion() async throws {
+            let repo = try makeRepository()
+            let spawner: GitService.ProcessSpawner = { _, _, environment, workingDirectory in
+                usleep(300_000)
+                return try ProcessLauncher.spawn(
+                    command: "/usr/bin/true",
+                    arguments: [],
+                    environment: environment,
+                    workingDirectory: workingDirectory
+                )
+            }
+            let service = makeGitService(spawner: spawner, terminationGrace: .milliseconds(100))
+
+            do {
+                _ = try await service.runGitSpoolingForTesting(
+                    ["status"],
+                    at: repo,
+                    activityTimeout: .milliseconds(100)
+                )
+                XCTFail("expected expired spawn budget to win")
+            } catch let error as GitService.GitProcessCaptureError {
+                XCTAssertEqual(error, .timedOut)
+            }
+        }
+
+        func testSpoolingCancellationCleansTermResistantProcessFamily() async throws {
+            let repo = try makeRepository()
+            let marker = FileManager.default.temporaryDirectory
+                .appendingPathComponent("GitProcessSpawnMigrationTests-spool-pid-\(UUID().uuidString)")
+            let readiness = FileManager.default.temporaryDirectory
+                .appendingPathComponent("GitProcessSpawnMigrationTests-spool-ready-\(UUID().uuidString)")
+            defer {
+                try? FileManager.default.removeItem(at: marker)
+                try? FileManager.default.removeItem(at: readiness)
+            }
+            let script = "(trap '' TERM; : > '\(readiness.path)'; sleep 30) & echo $! > '\(marker.path)'; wait"
+            let spawner: GitService.ProcessSpawner = { _, _, environment, workingDirectory in
+                try ProcessLauncher.spawn(
+                    command: "/bin/sh",
+                    arguments: ["-c", script],
+                    environment: environment,
+                    workingDirectory: workingDirectory
+                )
+            }
+            let service = makeGitService(spawner: spawner, terminationGrace: .milliseconds(200))
+            let task = Task {
+                try await service.runGitSpoolingForTesting(["status"], at: repo)
+            }
+            let descendantPID = try await waitForMarkerPID(at: marker)
+            try await waitForMarker(at: readiness)
+            task.cancel()
+
+            switch await task.result {
+            case .success:
+                XCTFail("expected cancellation")
+            case let .failure(error):
+                XCTAssertTrue(error is CancellationError, "unexpected error: \(error)")
+            }
+            try await waitForProcessExit(descendantPID, timeoutSeconds: 3)
         }
 
         func testStdoutByteLimitExceededTerminatesChildAndThrows() async throws {
@@ -294,12 +373,17 @@ import XCTest
             let repo = try makeRepository()
             let marker = FileManager.default.temporaryDirectory
                 .appendingPathComponent("GitProcessSpawnMigrationTests-resistant-\(UUID().uuidString)")
-            defer { try? FileManager.default.removeItem(at: marker) }
+            let readiness = FileManager.default.temporaryDirectory
+                .appendingPathComponent("GitProcessSpawnMigrationTests-resistant-ready-\(UUID().uuidString)")
+            defer {
+                try? FileManager.default.removeItem(at: marker)
+                try? FileManager.default.removeItem(at: readiness)
+            }
             // The subshell ignores SIGTERM (and hands that disposition to its
             // sleep), while the direct /bin/sh exits promptly on the first
             // group SIGTERM -- reproducing a reaped direct child with a live
             // TERM-resistant descendant.
-            let script = "(trap '' TERM; sleep 30) & echo $! > '\(marker.path)'; wait"
+            let script = "(trap '' TERM; : > '\(readiness.path)'; sleep 30) & echo $! > '\(marker.path)'; wait"
             let spawner: GitService.ProcessSpawner = { _, _, environment, workingDirectory in
                 try ProcessLauncher.spawn(
                     command: "/bin/sh",
@@ -318,6 +402,7 @@ import XCTest
                 )
             }
             let descendantPID = try await waitForMarkerPID(at: marker)
+            try await waitForMarker(at: readiness)
             task.cancel()
 
             switch await task.result {
@@ -381,6 +466,18 @@ import XCTest
                 try await Task.sleep(for: .milliseconds(50))
             }
             XCTFail("process \(pid) still alive after \(timeoutSeconds)s")
+        }
+
+        private func waitForMarker(at url: URL, timeoutSeconds: Double = 5) async throws {
+            let deadline = Date().addingTimeInterval(timeoutSeconds)
+            while Date() < deadline {
+                if FileManager.default.fileExists(atPath: url.path) {
+                    return
+                }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            struct MarkerTimeout: Error {}
+            throw MarkerTimeout()
         }
 
         private func waitForMarkerPID(at url: URL, timeoutSeconds: Double = 5) async throws -> pid_t {

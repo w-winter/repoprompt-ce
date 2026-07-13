@@ -3,58 +3,74 @@ import Foundation
 
 /// Minimal PID/process-group signal surface for one spawned git child.
 ///
-/// Replaces Foundation `Process` in the git lifecycle and timeout controllers
-/// so that launch, cancellation, and reaping never depend on NSTask state.
-/// `posix_spawn` returns a fully valid PID synchronously, so a target is only
-/// ever constructed for a child that actually exists.
+/// A target with a launcher-supplied process group is group-only for its entire
+/// lifetime: an ESRCH from killpg can never fall back to the direct PID. A PID
+/// is signalable only when no process group was ever supplied and the root has
+/// not been reaped. Finalization deactivates both routes.
 final class GitProcessLifecycleTarget: @unchecked Sendable {
     let processIdentifier: pid_t
     let processGroupID: pid_t?
 
     private let lock = NSLock()
-    private var terminated = false
+    private var rootReaped = false
+    private var active = true
 
     init(processIdentifier: pid_t, processGroupID: pid_t?) {
         self.processIdentifier = processIdentifier
         self.processGroupID = processGroupID
     }
 
-    /// True until the reaper observes termination. A child that has exited but
-    /// is not yet reaped still counts as running; signaling a zombie is a
-    /// harmless no-op, matching the previous `Process.isRunning` usage where
-    /// signals raced with termination.
+    /// True until the sole reaper observes direct-child termination.
     var isRunning: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return !terminated && processIdentifier > 0
+        return active && !rootReaped && processIdentifier > 0
     }
 
-    /// Marks the child as reaped. Later `terminate()`/`forceKill()` calls
-    /// become no-ops so a reused PID can never be signaled.
+    /// Marks the direct child as reaped. Later lifecycle signals are restricted
+    /// to the process group and can never fall back to the now-reusable PID.
     func markTerminated() {
         lock.lock()
-        terminated = true
+        rootReaped = true
         lock.unlock()
     }
 
-    /// Cooperative termination request (SIGTERM), process-group first.
-    func terminate() {
+    /// Closes the signaling lifetime at the finalization commit point.
+    func deactivate() {
+        lock.lock()
+        active = false
+        lock.unlock()
+    }
+
+    @discardableResult
+    func terminate() -> Bool {
         sendSignal(SIGTERM)
     }
 
-    /// Forced termination (SIGKILL), process-group first.
-    func forceKill() {
+    @discardableResult
+    func forceKill() -> Bool {
         sendSignal(SIGKILL)
     }
 
-    private func sendSignal(_ signalValue: Int32) {
+    /// The target lock covers both the lifecycle check and signal syscall. This
+    /// makes deactivation atomic with signaling instead of leaving a PID/PGID
+    /// reuse window between an unlocked check and `kill`.
+    private func sendSignal(_ signalValue: Int32) -> Bool {
         lock.lock()
-        let shouldSignal = !terminated && processIdentifier > 0
-        lock.unlock()
-        guard shouldSignal else { return }
-        ProcessTermination.signalProcessGroupOrPID(
+        defer { lock.unlock() }
+        guard active else { return false }
+
+        if let processGroupID {
+            return ProcessTermination.signalProcessGroupOnly(
+                processGroupID: processGroupID,
+                signal: signalValue
+            )
+        }
+
+        guard !rootReaped, processIdentifier > 0 else { return false }
+        return ProcessTermination.signalProcessGroupOrPID(
             pid: processIdentifier,
-            processGroupID: processGroupID,
+            processGroupID: nil,
             signal: signalValue
         )
     }

@@ -1,12 +1,8 @@
 import Foundation
 
-/// Tracks one git child's spawn/cancellation/termination lifecycle.
-///
-/// Cancellation intent may arrive before, during, or after the synchronous
-/// spawn call. Intent that accrues while the launch call is in flight is
-/// applied by `didSpawn` immediately after the spawn returns: the child is
-/// terminated cooperatively and SIGKILL escalation is armed, so a cancelled
-/// caller never waits on an unkillable child.
+/// Linearizes one Git child's spawn, termination, cancellation, and result
+/// finalization. Cancellation is accepted until `commitFinalization()` wins the
+/// lock; requests after that commit are consistently too late and inert.
 final class GitProcessLifecycleController: @unchecked Sendable {
     enum SpawnState: Equatable {
         case running
@@ -14,15 +10,30 @@ final class GitProcessLifecycleController: @unchecked Sendable {
         case terminated
     }
 
+    struct FinalizationState: Equatable, Sendable {
+        let cancellationRequested: Bool
+        let internalTerminationRequested: Bool
+
+        var requiresProcessGroupCleanup: Bool {
+            cancellationRequested || internalTerminationRequested
+        }
+
+        var cancellationError: CancellationError? {
+            cancellationRequested ? CancellationError() : nil
+        }
+    }
+
     private let lock = NSLock()
     private var cancellationRequested = false
+    private var internalTerminationRequested = false
     private var target: GitProcessLifecycleTarget?
-    private var terminated = false
-    private var cancellationEscalationTask: Task<Void, Never>?
+    private var finalized = false
+    private var committedState: FinalizationState?
+    private var terminationEscalationTask: Task<Void, Never>?
 
     func checkCancellationBeforeSpawn() throws {
         lock.lock()
-        let shouldCancel = cancellationRequested
+        let shouldCancel = cancellationRequested && !finalized
         lock.unlock()
         if shouldCancel {
             throw CancellationError()
@@ -34,49 +45,54 @@ final class GitProcessLifecycleController: @unchecked Sendable {
         terminationGrace: Duration
     ) -> SpawnState {
         lock.lock()
-        if terminated {
+        if finalized {
             let wasCancelled = cancellationRequested
             lock.unlock()
+            target.deactivate()
             return wasCancelled ? .cancellationRequested : .terminated
         }
 
         self.target = target
-        let shouldTerminate = cancellationRequested
+        let shouldTerminate = cancellationRequested || internalTerminationRequested
         if shouldTerminate {
-            armCancellationEscalationLocked(
+            armTerminationEscalationLocked(
                 target: target,
                 terminationGrace: terminationGrace
             )
         }
+        let wasCancelled = cancellationRequested
         lock.unlock()
 
-        if shouldTerminate, target.isRunning {
+        if shouldTerminate {
             target.terminate()
         }
-        return shouldTerminate ? .cancellationRequested : .running
+        return wasCancelled ? .cancellationRequested : .running
     }
 
+    /// Records caller cancellation only while finalization is still open.
     func requestCancellation(terminationGrace: Duration) {
-        lock.lock()
-        cancellationRequested = true
-        let target = terminated ? nil : self.target
-        if let target {
-            armCancellationEscalationLocked(
-                target: target,
-                terminationGrace: terminationGrace
-            )
-        }
-        lock.unlock()
+        requestTermination(terminationGrace: terminationGrace, isCancellation: true)
+    }
 
-        if let target, target.isRunning {
-            target.terminate()
-        }
+    /// Stops a child for an internal capture/spool failure without converting
+    /// that failure into caller cancellation.
+    func requestInternalTermination(terminationGrace: Duration) {
+        requestTermination(terminationGrace: terminationGrace, isCancellation: false)
     }
 
     func shouldKeepNormalTimeout() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return !cancellationRequested && !terminated
+        return !cancellationRequested && !internalTerminationRequested && !finalized
+    }
+
+    /// Serializes timer installation with cancellation/internal termination so
+    /// a callback can never revive a timeout after lifecycle termination wins.
+    func installNormalTimeoutIfActive(_ install: () -> Void) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !cancellationRequested, !internalTerminationRequested, !finalized else { return }
+        install()
     }
 
     func cancellationErrorIfRequested() -> CancellationError? {
@@ -85,41 +101,80 @@ final class GitProcessLifecycleController: @unchecked Sendable {
         return cancellationRequested ? CancellationError() : nil
     }
 
-    func didTerminate() {
+    /// Atomic result commit. Its snapshot is authoritative for post-reap family
+    /// cleanup and cancellation result selection. Later cancellation is ignored.
+    func commitFinalization() -> FinalizationState {
         lock.lock()
-        terminated = true
-        target = nil
-        let escalationTask = cancellationEscalationTask
-        cancellationEscalationTask = nil
+        if let committedState {
+            lock.unlock()
+            return committedState
+        }
+        let state = FinalizationState(
+            cancellationRequested: cancellationRequested,
+            internalTerminationRequested: internalTerminationRequested
+        )
+        finalized = true
+        committedState = state
+        let target = self.target
+        self.target = nil
+        let escalationTask = terminationEscalationTask
+        terminationEscalationTask = nil
         lock.unlock()
+
+        target?.deactivate()
         escalationTask?.cancel()
+        return state
     }
 
-    private func armCancellationEscalationLocked(
+    private func requestTermination(
+        terminationGrace: Duration,
+        isCancellation: Bool
+    ) {
+        lock.lock()
+        guard !finalized else {
+            lock.unlock()
+            return
+        }
+        if isCancellation {
+            cancellationRequested = true
+        } else {
+            internalTerminationRequested = true
+        }
+        let target = self.target
+        if let target {
+            armTerminationEscalationLocked(
+                target: target,
+                terminationGrace: terminationGrace
+            )
+        }
+        lock.unlock()
+
+        target?.terminate()
+    }
+
+    private func armTerminationEscalationLocked(
         target: GitProcessLifecycleTarget,
         terminationGrace: Duration
     ) {
-        guard cancellationEscalationTask == nil else { return }
-        cancellationEscalationTask = Task.detached { [self] in
+        guard terminationEscalationTask == nil else { return }
+        terminationEscalationTask = Task.detached { [self] in
             do {
                 try await Task.sleep(for: terminationGrace)
             } catch {
                 return
             }
-            sendCancellationKillIfNeeded(target: target)
+            sendTerminationKillIfNeeded(target: target)
         }
     }
 
-    private func sendCancellationKillIfNeeded(target: GitProcessLifecycleTarget) {
+    private func sendTerminationKillIfNeeded(target: GitProcessLifecycleTarget) {
         lock.lock()
-        defer { lock.unlock() }
-        guard cancellationRequested,
-              !terminated,
-              self.target === target,
-              target.isRunning
-        else {
-            return
+        let shouldSignal = !finalized
+            && (cancellationRequested || internalTerminationRequested)
+            && self.target === target
+        lock.unlock()
+        if shouldSignal {
+            target.forceKill()
         }
-        target.forceKill()
     }
 }

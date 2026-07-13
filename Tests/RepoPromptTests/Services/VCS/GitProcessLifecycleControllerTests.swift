@@ -29,7 +29,7 @@ final class GitProcessLifecycleControllerTests: XCTestCase {
 
     func testTerminationBeforeSpawnReportsTerminatedState() {
         let controller = GitProcessLifecycleController()
-        controller.didTerminate()
+        _ = controller.commitFinalization()
 
         let target = GitProcessLifecycleTarget(processIdentifier: 0, processGroupID: nil)
         XCTAssertEqual(
@@ -40,10 +40,44 @@ final class GitProcessLifecycleControllerTests: XCTestCase {
         XCTAssertFalse(controller.shouldKeepNormalTimeout())
     }
 
+    func testCancellationAcceptedBeforeFinalizationIsCommitted() {
+        let controller = GitProcessLifecycleController()
+        let target = GitProcessLifecycleTarget(processIdentifier: 0, processGroupID: nil)
+        XCTAssertEqual(
+            controller.didSpawn(target: target, terminationGrace: .seconds(1)),
+            .running
+        )
+
+        controller.requestCancellation(terminationGrace: .seconds(1))
+        let finalization = controller.commitFinalization()
+
+        XCTAssertTrue(finalization.cancellationRequested)
+        XCTAssertTrue(finalization.requiresProcessGroupCleanup)
+        XCTAssertNotNil(finalization.cancellationError)
+        XCTAssertEqual(controller.commitFinalization(), finalization)
+    }
+
+    func testCancellationAfterFinalizationIsConsistentlyTooLate() {
+        let controller = GitProcessLifecycleController()
+        let target = GitProcessLifecycleTarget(processIdentifier: 0, processGroupID: nil)
+        XCTAssertEqual(
+            controller.didSpawn(target: target, terminationGrace: .seconds(1)),
+            .running
+        )
+
+        let finalization = controller.commitFinalization()
+        controller.requestCancellation(terminationGrace: .seconds(1))
+
+        XCTAssertFalse(finalization.cancellationRequested)
+        XCTAssertFalse(finalization.requiresProcessGroupCleanup)
+        XCTAssertNil(controller.cancellationErrorIfRequested())
+        XCTAssertEqual(controller.commitFinalization(), finalization)
+    }
+
     func testCancellationEscalatesToSIGKILLWhenChildIgnoresSIGTERM() async throws {
         let spawned = try ProcessLauncher.spawn(
             command: "/bin/sh",
-            arguments: ["-c", "trap '' TERM; while :; do sleep 0.05; done"],
+            arguments: ["-c", "trap '' TERM; printf READY; while :; do sleep 0.05; done"],
             environment: [:],
             workingDirectory: nil
         )
@@ -52,6 +86,9 @@ final class GitProcessLifecycleControllerTests: XCTestCase {
             processIdentifier: spawned.pid,
             processGroupID: spawned.processGroupID
         )
+        // Do not signal until the child confirms its TERM trap is installed.
+        XCTAssertEqual(spawned.stdout.readData(ofLength: 5), Data("READY".utf8))
+
         let controller = GitProcessLifecycleController()
         XCTAssertEqual(
             controller.didSpawn(target: target, terminationGrace: .milliseconds(100)),
@@ -71,6 +108,6 @@ final class GitProcessLifecycleControllerTests: XCTestCase {
         XCTAssertEqual(outcome.status, .uncaughtSignal(signal: SIGKILL))
 
         target.markTerminated()
-        controller.didTerminate()
+        _ = controller.commitFinalization()
     }
 }

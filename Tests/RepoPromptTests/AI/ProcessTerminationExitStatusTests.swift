@@ -34,6 +34,60 @@ final class ProcessTerminationExitStatusTests: XCTestCase {
         XCTAssertEqual(stopped.normalizedExitCode, 0x7F)
     }
 
+    func testBlockingReapChildStatusPreservesExitAndSignalSemantics() async throws {
+        let exiting = try ProcessLauncher.spawn(
+            command: "/bin/sh",
+            arguments: ["-c", "exit 7"],
+            environment: [:],
+            workingDirectory: nil
+        )
+        exiting.stdin?.closeFile()
+        let target = GitProcessLifecycleTarget(
+            processIdentifier: exiting.pid,
+            processGroupID: exiting.processGroupID
+        )
+        let exitStatus = try await ProcessTermination.reapChildStatus(
+            pid: exiting.pid,
+            onReaped: { target.markTerminated() }
+        )
+        XCTAssertEqual(exitStatus, .exited(code: 7))
+        XCTAssertFalse(target.isRunning)
+
+        let signaled = try ProcessLauncher.spawn(
+            command: "/bin/sh",
+            arguments: ["-c", "kill -KILL $$"],
+            environment: [:],
+            workingDirectory: nil
+        )
+        signaled.stdin?.closeFile()
+        let signalStatus = try await ProcessTermination.reapChildStatus(pid: signaled.pid)
+        XCTAssertEqual(signalStatus, .uncaughtSignal(signal: SIGKILL))
+    }
+
+    func testBlockingReapChildStatusTreatsECHILDAsOwnershipError() async throws {
+        let spawned = try ProcessLauncher.spawn(
+            command: "/bin/sh",
+            arguments: ["-c", "exit 0"],
+            environment: [:],
+            workingDirectory: nil
+        )
+        spawned.stdin?.closeFile()
+        let firstStatus = try await ProcessTermination.reapChildStatus(pid: spawned.pid)
+        XCTAssertEqual(firstStatus, .exited(code: 0))
+
+        do {
+            _ = try await ProcessTermination.reapChildStatus(pid: spawned.pid)
+            XCTFail("A second sole-reaper wait must not fabricate a successful exit")
+        } catch let error as ProcessTerminationError {
+            guard case let .childOwnershipLost(pid) = error else {
+                return XCTFail("Expected childOwnershipLost, got \(error)")
+            }
+            XCTAssertEqual(pid, spawned.pid)
+        } catch {
+            XCTFail("Expected ProcessTerminationError, got \(error)")
+        }
+    }
+
     func testWaitForTerminationStatusReportsRealChildExitAndSignal() async throws {
         let exiting = try ProcessLauncher.spawn(
             command: "/bin/sh",

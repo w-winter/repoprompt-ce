@@ -4,6 +4,53 @@ import XCTest
 
 #if DEBUG
     final class GitProcessActivityTimeoutControllerTests: XCTestCase {
+        func testExpiredInitialTimeoutClaimsSynchronouslyWithoutSleeping() async {
+            let driver = TimeoutCheckpointDriver()
+            let signals = TimeoutSignalRecorder()
+            let controller = makeController(driver: driver, signals: signals)
+            let target = GitProcessLifecycleTarget(processIdentifier: 100, processGroupID: nil)
+
+            controller.schedule(
+                target: target,
+                timeout: .zero,
+                terminationGrace: .seconds(1)
+            )
+
+            XCTAssertTrue(controller.didTimeOut)
+            XCTAssertEqual(signals.terminateCount, 1)
+            XCTAssertEqual(signals.forceKillCount, 0)
+
+            await driver.waitFor(.sleep(1, .terminationGrace))
+            XCTAssertEqual(signals.forceKillCount, 0)
+            await driver.release(.sleep(1, .terminationGrace))
+            await driver.waitFor(.beforeKillClaim(1))
+            XCTAssertEqual(signals.forceKillCount, 0)
+            await driver.release(.beforeKillClaim(1))
+            await driver.waitFor(.killClaimResult(1, true))
+
+            XCTAssertEqual(signals.forceKillCount, 1)
+        }
+
+        func testExpiredTimeoutLosesWhenTargetSignalCannotBeClaimed() {
+            let signals = TimeoutSignalRecorder(signalAccepted: false)
+            let controller = GitProcessActivityTimeoutController(testingHooks: .init(
+                isProcessRunning: { _ in true },
+                terminate: { _ in signals.recordTerminate() },
+                forceKill: { processIdentifier in signals.recordForceKill(processIdentifier) }
+            ))
+            let target = GitProcessLifecycleTarget(processIdentifier: 100, processGroupID: nil)
+
+            controller.schedule(
+                target: target,
+                timeout: .zero,
+                terminationGrace: .seconds(1)
+            )
+
+            XCTAssertFalse(controller.didTimeOut)
+            XCTAssertEqual(signals.terminateCount, 1)
+            XCTAssertEqual(signals.forceKillCount, 0)
+        }
+
         func testRescheduleFencesSupersededActivityTimeoutBeforeTerminateClaim() async {
             let driver = TimeoutCheckpointDriver()
             let signals = TimeoutSignalRecorder()
@@ -183,8 +230,13 @@ import XCTest
 
     private final class TimeoutSignalRecorder: @unchecked Sendable {
         private let lock = NSLock()
+        private let signalAccepted: Bool
         private var terminateSignals = 0
         private var forceKillSignals: [pid_t] = []
+
+        init(signalAccepted: Bool = true) {
+            self.signalAccepted = signalAccepted
+        }
 
         var terminateCount: Int {
             lock.lock()
@@ -198,16 +250,20 @@ import XCTest
             return forceKillSignals.count
         }
 
-        func recordTerminate() {
+        @discardableResult
+        func recordTerminate() -> Bool {
             lock.lock()
             terminateSignals += 1
             lock.unlock()
+            return signalAccepted
         }
 
-        func recordForceKill(_ processIdentifier: pid_t) {
+        @discardableResult
+        func recordForceKill(_ processIdentifier: pid_t) -> Bool {
             lock.lock()
             forceKillSignals.append(processIdentifier)
             lock.unlock()
+            return signalAccepted
         }
     }
 #endif

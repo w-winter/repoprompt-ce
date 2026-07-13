@@ -1,4 +1,5 @@
 import Darwin
+import Dispatch
 import Foundation
 
 /// Detailed child termination outcome preserving the exited-vs-signaled
@@ -41,10 +42,13 @@ enum ProcessExitStatus: Equatable, Sendable {
 }
 
 enum ProcessTerminationError: Error, LocalizedError {
+    case childOwnershipLost(pid: pid_t)
     case waitFailed(String)
 
     var errorDescription: String? {
         switch self {
+        case let .childOwnershipLost(pid):
+            "waitpid reported ECHILD for sole-reaper child \(pid)"
         case let .waitFailed(message):
             "waitpid failed: \(message)"
         }
@@ -69,6 +73,11 @@ enum ProcessTermination {
     private static let appTerminationCooperativeWaitTimeout: TimeInterval = 0.75
     private static let terminationModeLock = NSLock()
     private static var appTerminationFastPathEnabled = false
+    private static let blockingReapQueue = DispatchQueue(
+        label: "com.repoprompt.process-termination.waitpid",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
 
     static func beginAppTerminationFastPath() {
         terminationModeLock.lock()
@@ -155,6 +164,21 @@ enum ProcessTermination {
     }
 
     @discardableResult
+    static func signalProcessGroupOnly(
+        processGroupID: pid_t,
+        signal: Int32,
+        logger: (String) -> Void = { _ in }
+    ) -> Bool {
+        guard let processGroupID = safeProcessGroupID(processGroupID) else { return false }
+        if killpg(processGroupID, signal) == 0 { return true }
+        if errno != ESRCH {
+            let message = String(cString: strerror(errno))
+            logger("killpg(\(processGroupID), \(signal)) failed: \(message)")
+        }
+        return false
+    }
+
+    @discardableResult
     static func signalProcessGroupOrPID(
         pid: pid_t,
         processGroupID: pid_t?,
@@ -180,12 +204,12 @@ enum ProcessTermination {
         pid: pid_t,
         processGroupID: pid_t?,
         status: inout Int32,
+        rootExited: inout Bool,
         deadline: TimeInterval,
         pollIntervalNs: UInt64,
         waitForProcessGroupExit: Bool,
         logger: (String) -> Void
     ) async -> Bool {
-        var rootExited = false
         while ProcessInfo.processInfo.systemUptime < deadline {
             if !rootExited {
                 let r = waitpid(pid, &status, WNOHANG)
@@ -239,6 +263,7 @@ enum ProcessTermination {
     ) async -> ProcessExitStatus {
         let shortPollNs = UInt64(pollInterval * 1_000_000_000)
         var lastSignal: Int32?
+        var rootExited = false
 
         if signalProcessGroupOrPID(pid: pid, processGroupID: processGroupID, signal: SIGTERM, logger: logger) {
             lastSignal = SIGTERM
@@ -252,6 +277,7 @@ enum ProcessTermination {
             pid: pid,
             processGroupID: processGroupID,
             status: &status,
+            rootExited: &rootExited,
             deadline: sigtermDeadline,
             pollIntervalNs: shortPollNs,
             waitForProcessGroupExit: waitForProcessGroupExit,
@@ -261,7 +287,26 @@ enum ProcessTermination {
         }
 
         logger("Process \(pid) family did not exit after SIGTERM; sending SIGKILL")
-        if signalProcessGroupOrPID(pid: pid, processGroupID: processGroupID, signal: SIGKILL, logger: logger) {
+        let sentSIGKILL: Bool
+        if rootExited {
+            if let processGroupID = safeProcessGroupID(processGroupID) {
+                sentSIGKILL = signalProcessGroupOnly(
+                    processGroupID: processGroupID,
+                    signal: SIGKILL,
+                    logger: logger
+                )
+            } else {
+                sentSIGKILL = false
+            }
+        } else {
+            sentSIGKILL = signalProcessGroupOrPID(
+                pid: pid,
+                processGroupID: processGroupID,
+                signal: SIGKILL,
+                logger: logger
+            )
+        }
+        if sentSIGKILL {
             lastSignal = SIGKILL
         } else {
             logger("Process \(pid) could not be signaled with SIGKILL; waiting for exit/reap")
@@ -272,6 +317,7 @@ enum ProcessTermination {
             pid: pid,
             processGroupID: processGroupID,
             status: &status,
+            rootExited: &rootExited,
             deadline: sigkillDeadline,
             pollIntervalNs: shortPollNs,
             waitForProcessGroupExit: waitForProcessGroupExit,
@@ -284,6 +330,91 @@ enum ProcessTermination {
             return .uncaughtSignal(signal: signal)
         }
         return decodeWaitStatus(status)
+    }
+
+    /// Reaps one direct child with a blocking kernel wait performed outside
+    /// Swift's cooperative executor. Git owns cancellation and timeout
+    /// signaling separately; this method is deliberately the sole waitpid
+    /// authority and never abandons the child on task cancellation.
+    ///
+    /// The callback runs synchronously on the blocking reaper queue after a
+    /// successful waitpid and before the async continuation is resumed. This
+    /// lets lifecycle owners close their PID-signaling window at the kernel
+    /// reap boundary rather than after executor scheduling.
+    static func reapChildStatus(
+        pid: pid_t,
+        onReaped: @escaping @Sendable () -> Void = {}
+    ) async throws -> ProcessExitStatus {
+        try await withCheckedThrowingContinuation { continuation in
+            blockingReapQueue.async {
+                var status: Int32 = 0
+                while true {
+                    let result = waitpid(pid, &status, 0)
+                    if result == pid {
+                        let exitStatus = decodeWaitStatus(status)
+                        onReaped()
+                        continuation.resume(returning: exitStatus)
+                        return
+                    }
+                    if result == -1, errno == EINTR {
+                        continue
+                    }
+                    if result == -1, errno == ECHILD {
+                        continuation.resume(
+                            throwing: ProcessTerminationError.childOwnershipLost(pid: pid)
+                        )
+                        return
+                    }
+                    let message = String(cString: strerror(errno))
+                    continuation.resume(throwing: ProcessTerminationError.waitFailed(message))
+                    return
+                }
+            }
+        }
+    }
+
+    /// Cleans descendants after the direct child has already been reaped.
+    /// The API intentionally accepts no PID: signaling is process-group-only,
+    /// and no second waitpid or reused-PID fallback is possible.
+    static func terminateProcessGroupAfterRootReap(
+        processGroupID: pid_t?,
+        sigtermGrace: TimeInterval? = nil,
+        sigkillGrace: TimeInterval? = nil,
+        logger: (String) -> Void = { _ in }
+    ) async {
+        guard let processGroupID = safeProcessGroupID(processGroupID),
+              processGroupExists(processGroupID)
+        else {
+            return
+        }
+
+        let timing = currentTiming()
+        _ = signalProcessGroupOnly(
+            processGroupID: processGroupID,
+            signal: SIGTERM,
+            logger: logger
+        )
+        let shortPollNs = UInt64(pollInterval * 1_000_000_000)
+        let termDeadline = ProcessInfo.processInfo.systemUptime + max(sigtermGrace ?? timing.sigtermGrace, 0)
+        while ProcessInfo.processInfo.systemUptime < termDeadline {
+            guard processGroupExists(processGroupID) else { return }
+            try? await Task.sleep(nanoseconds: shortPollNs)
+        }
+        guard processGroupExists(processGroupID) else { return }
+
+        _ = signalProcessGroupOnly(
+            processGroupID: processGroupID,
+            signal: SIGKILL,
+            logger: logger
+        )
+        let killDeadline = ProcessInfo.processInfo.systemUptime + max(sigkillGrace ?? timing.sigkillGrace, 0)
+        while ProcessInfo.processInfo.systemUptime < killDeadline {
+            guard processGroupExists(processGroupID) else { return }
+            try? await Task.sleep(nanoseconds: shortPollNs)
+        }
+        if processGroupExists(processGroupID) {
+            logger("Process group \(processGroupID) remained after bounded SIGKILL cleanup")
+        }
     }
 
     static func waitForTermination(

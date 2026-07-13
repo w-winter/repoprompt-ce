@@ -21,7 +21,11 @@ enum GitProcessSpawnDiagnostics {
         family: GitProcessCommandFamily,
         priority: GitProcessAdmissionPriority
     ) -> OSSignpostIntervalState {
-        signposter.beginInterval("git-spawn", id: signposter.makeSignpostID())
+        signposter.beginInterval(
+            "git-spawn",
+            id: signposter.makeSignpostID(),
+            "family=\(family.rawValue, privacy: .public) priority=\(priority.rawValue, privacy: .public)"
+        )
     }
 
     static func endSpawnInterval(

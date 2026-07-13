@@ -425,6 +425,33 @@ actor GitService {
             )
         }
 
+        /// Test-only entry to the spooling implementation without target-
+        /// evidence parsing, so launch, timer, and process-family lifecycle
+        /// contracts can be covered directly.
+        func runGitSpoolingForTesting(
+            _ args: [String],
+            at repoURL: URL,
+            activityTimeout: Duration = .seconds(30)
+        ) async throws -> (GitRawOutputSpoolLease, Data, Int32, Process.TerminationReason) {
+            var environment = await processEnvironment()
+            environment["GIT_TERMINAL_PROMPT"] = "0"
+            environment["LC_ALL"] = "C"
+            environment["LANG"] = "C"
+            return try await runAdmittedGitSpooling(
+                args,
+                at: repoURL,
+                environment: environment,
+                diagnosticRepositoryPath: repoURL.standardizedFileURL.path,
+                processQueueWaitMicroseconds: 0,
+                resourcePolicy: GitRawOutputSpoolResourcePolicy(
+                    minimumFreeDiskBytes: 0,
+                    activityTimeout: activityTimeout
+                ),
+                admissionPriority: .rootBootstrap,
+                commandFamily: .repositoryRead
+            )
+        }
+
         func waitForWorktreeMutationWaiterForTesting(at repoURL: URL) async {
             let mutationKey = getLayout(for: repoURL)?.commonDir.standardizedFileURL.path
                 ?? repoURL.standardizedFileURL.path
@@ -4325,6 +4352,13 @@ actor GitService {
         if let error = error as? GitWorktreeInitializationError {
             return GitTargetEvidenceCollectionError.gitInitialization(error)
         }
+        if let error = error as? ProcessLauncherError {
+            let failure = error.processLaunchFailure
+            return GitTargetEvidenceCollectionError.processLaunch(
+                domain: failure.domain,
+                code: failure.code
+            )
+        }
         if let error = error as? GitProcessCaptureError {
             return switch error {
             case .timedOut:
@@ -6892,7 +6926,6 @@ actor GitService {
             return result
         } catch {
             await processAdmissionController.release(lease)
-            try Task.checkCancellation()
             throw error
         }
     }
@@ -7071,14 +7104,34 @@ actor GitService {
                     processIdentifier: spawned.pid,
                     processGroupID: spawned.processGroupID
                 )
+                let spawnState = lifecycleController.didSpawn(
+                    target: target,
+                    terminationGrace: terminationGrace
+                )
+                if spawnState == .running {
+                    // Install the spawn-adjusted generation before drains or
+                    // callbacks can report newer activity. A later callback may
+                    // supersede this generation; the reverse is impossible.
+                    let spawnElapsed = Duration.microseconds(elapsedMicroseconds(since: spawnStartedAt))
+                    let remainingTimeout = max(Duration.zero, resourcePolicy.activityTimeout - spawnElapsed)
+                    lifecycleController.installNormalTimeoutIfActive {
+                        timeoutController.schedule(
+                            target: target,
+                            timeout: remainingTimeout,
+                            terminationGrace: terminationGrace
+                        )
+                    }
+                }
 
                 let activityHandler: @Sendable () -> Void = {
                     guard target.isRunning else { return }
-                    timeoutController.schedule(
-                        target: target,
-                        timeout: resourcePolicy.activityTimeout,
-                        terminationGrace: terminationGrace
-                    )
+                    lifecycleController.installNormalTimeoutIfActive {
+                        timeoutController.schedule(
+                            target: target,
+                            timeout: resourcePolicy.activityTimeout,
+                            terminationGrace: terminationGrace
+                        )
+                    }
                 }
 
                 var partialOutDrain: GitProcessPipeSpoolDrain?
@@ -7110,13 +7163,18 @@ actor GitService {
                             sigtermGrace: terminationGraceSeconds
                         )
                         target.markTerminated()
-                        lifecycleController.didTerminate()
+                        timeoutController.cancel()
+                        let finalization = lifecycleController.commitFinalization()
                         createdOutDrain?.cancel()
                         spool.cancel()
                         recordCommandOutcome(0)
-                        continuation.resume(
-                            throwing: lifecycleController.cancellationErrorIfRequested() ?? error
-                        )
+                        if timeoutController.didTimeOut {
+                            continuation.resume(throwing: GitProcessCaptureError.timedOut)
+                        } else {
+                            continuation.resume(
+                                throwing: finalization.cancellationError ?? error
+                            )
+                        }
                     }
                     return
                 }
@@ -7134,7 +7192,8 @@ actor GitService {
                         handle.readabilityHandler = nil
                     }
                     if outDrain.terminalError != nil {
-                        lifecycleController.requestCancellation(terminationGrace: terminationGrace)
+                        timeoutController.cancel()
+                        lifecycleController.requestInternalTermination(terminationGrace: terminationGrace)
                     }
                 }
                 spawned.stderr.readabilityHandler = { handle in
@@ -7144,43 +7203,44 @@ actor GitService {
                         activityHandler()
                     }
                     if errDrain.didExceedByteLimit {
-                        lifecycleController.requestCancellation(terminationGrace: terminationGrace)
+                        timeoutController.cancel()
+                        lifecycleController.requestInternalTermination(terminationGrace: terminationGrace)
                     }
                 }
 
-                // The reaper replaces Foundation's terminationHandler: wait for the
-                // child through the shared ProcessTermination authority, then close
-                // out drains, the spool, diagnostics, and the continuation.
+                // Blocking waitpid runs on ProcessTermination's dedicated
+                // queue. This task remains the sole reaping authority.
                 Task.detached(priority: .userInitiated) {
                     let reapOutcome: Result<ProcessExitStatus, any Error>
+                    let reapRequiresGroupCleanup: Bool
                     do {
-                        let outcome = try await ProcessTermination.waitForTerminationStatus(
-                            pid: spawned.pid,
-                            processGroupID: spawned.processGroupID,
-                            timeout: nil
+                        reapOutcome = .success(
+                            try await ProcessTermination.reapChildStatus(
+                                pid: spawned.pid,
+                                onReaped: { target.markTerminated() }
+                            )
                         )
-                        reapOutcome = .success(outcome.status)
+                        reapRequiresGroupCleanup = false
                     } catch {
                         reapOutcome = .failure(error)
+                        reapRequiresGroupCleanup = true
+                        // The sole reaper cannot safely issue a second waitpid
+                        // after an ownership/error result. Close PID signaling
+                        // and constrain recovery to the launcher-owned group.
+                        target.markTerminated()
                     }
-                    target.markTerminated()
-                    // The direct child is reaped, but cancellation/timeout
-                    // signaling can leave TERM-resistant descendants alive in
-                    // the spawned process group. Escalate through the shared
-                    // authority and hold this command (and its admission
-                    // lease) open until the whole group has exited or been
-                    // SIGKILLed. Normal successful commands skip this wait.
-                    if lifecycleController.cancellationErrorIfRequested() != nil
+                    let finalization = lifecycleController.commitFinalization()
+                    timeoutController.cancel()
+                    if finalization.requiresProcessGroupCleanup
                         || timeoutController.didTimeOut
+                        || reapRequiresGroupCleanup
                     {
-                        _ = await ProcessTermination.terminateAndReap(
-                            pid: spawned.pid,
+                        await ProcessTermination.terminateProcessGroupAfterRootReap(
                             processGroupID: spawned.processGroupID,
                             sigtermGrace: terminationGraceSeconds
                         )
                     }
-                    lifecycleController.didTerminate()
-                    timeoutController.cancel()
+
                     spawned.stdout.readabilityHandler = nil
                     spawned.stderr.readabilityHandler = nil
                     outDrain.finishReading()
@@ -7193,6 +7253,23 @@ actor GitService {
                     } catch {
                         stdoutResult = .failure(error)
                     }
+
+                    let stdoutFailed: Bool = switch stdoutResult {
+                    case .success: false
+                    case .failure: true
+                    }
+                    if (outDrain.terminalError != nil
+                        || errDrain.didExceedByteLimit
+                        || stdoutFailed)
+                        && !finalization.requiresProcessGroupCleanup
+                        && !timeoutController.didTimeOut
+                    {
+                        await ProcessTermination.terminateProcessGroupAfterRootReap(
+                            processGroupID: spawned.processGroupID,
+                            sigtermGrace: terminationGraceSeconds
+                        )
+                    }
+
                     let stdoutByteCount: UInt64 = switch stdoutResult {
                     case let .success(lease): lease.byteCount
                     case .failure: 0
@@ -7210,6 +7287,8 @@ actor GitService {
                         continuation.resume(throwing: GitProcessCaptureError.stderrByteLimitExceeded)
                     } else if timeoutController.didTimeOut {
                         continuation.resume(throwing: GitProcessCaptureError.timedOut)
+                    } else if let cancellationError = finalization.cancellationError {
+                        continuation.resume(throwing: cancellationError)
                     } else if case let .failure(reapFailure) = reapOutcome {
                         continuation.resume(throwing: reapFailure)
                     } else if case let .success(stdoutLease) = stdoutResult,
@@ -7225,34 +7304,14 @@ actor GitService {
                     }
                 }
 
-                let spawnState = lifecycleController.didSpawn(
-                    target: target,
-                    terminationGrace: terminationGrace
-                )
-                if spawnState == .running {
-                    // Charge time spent inside the synchronous spawn call against
-                    // the first activity timeout so a slow launch cannot extend it.
-                    let spawnElapsed = Duration.microseconds(elapsedMicroseconds(since: spawnStartedAt))
-                    let remainingTimeout = max(Duration.zero, resourcePolicy.activityTimeout - spawnElapsed)
-                    timeoutController.schedule(
-                        target: target,
-                        timeout: remainingTimeout,
-                        terminationGrace: terminationGrace
-                    )
-                    if !lifecycleController.shouldKeepNormalTimeout() {
-                        timeoutController.cancel()
-                    }
-                }
-
                 // Spooling authority commands take no stdin: close immediately so
                 // the child sees EOF rather than waiting on an open pipe.
                 spawned.stdin?.closeFile()
             }
         }, onCancel: {
-            timeoutController.cancel()
             lifecycleController.requestCancellation(terminationGrace: terminationGrace)
+            timeoutController.cancel()
         })
-        try Task.checkCancellation()
         return result
     }
 
@@ -7439,6 +7498,23 @@ actor GitService {
                     processIdentifier: spawned.pid,
                     processGroupID: spawned.processGroupID
                 )
+                let spawnState = lifecycleController.didSpawn(
+                    target: target,
+                    terminationGrace: terminationGrace
+                )
+                if spawnState == .running {
+                    // Install the spawn-adjusted timeout before any output
+                    // callback or reaper can observe the child.
+                    let spawnElapsed = Duration.microseconds(elapsedMicroseconds(since: spawnStartedAt))
+                    let remainingTimeout = max(Duration.zero, commandTimeout - spawnElapsed)
+                    lifecycleController.installNormalTimeoutIfActive {
+                        timeoutController.schedule(
+                            target: target,
+                            timeout: remainingTimeout,
+                            terminationGrace: terminationGrace
+                        )
+                    }
+                }
 
                 // Build async streams for stdout/stderr and single consumer tasks to collect data.
                 // GitProcessPipeDrain serializes readability callbacks with termination/cancellation
@@ -7477,12 +7553,17 @@ actor GitService {
                             sigtermGrace: terminationGraceSeconds
                         )
                         target.markTerminated()
-                        lifecycleController.didTerminate()
+                        timeoutController.cancel()
+                        let finalization = lifecycleController.commitFinalization()
                         createdOutDrain?.cancel()
                         recordCommandOutcome(0)
-                        continuation.resume(
-                            throwing: lifecycleController.cancellationErrorIfRequested() ?? error
-                        )
+                        if timeoutController.didTimeOut {
+                            continuation.resume(throwing: GitProcessCaptureError.timedOut)
+                        } else {
+                            continuation.resume(
+                                throwing: finalization.cancellationError ?? error
+                            )
+                        }
                     }
                     return
                 }
@@ -7508,7 +7589,8 @@ actor GitService {
                         handle.readabilityHandler = nil
                     }
                     if outDrain.didExceedByteLimit {
-                        lifecycleController.requestCancellation(terminationGrace: terminationGrace)
+                        timeoutController.cancel()
+                        lifecycleController.requestInternalTermination(terminationGrace: terminationGrace)
                     }
                 }
                 // Drain stderr
@@ -7517,45 +7599,47 @@ actor GitService {
                         handle.readabilityHandler = nil
                     }
                     if errDrain.didExceedByteLimit {
-                        lifecycleController.requestCancellation(terminationGrace: terminationGrace)
+                        timeoutController.cancel()
+                        lifecycleController.requestInternalTermination(terminationGrace: terminationGrace)
                     }
                 }
 
-                // The reaper replaces Foundation's terminationHandler: wait for the
-                // child through the shared ProcessTermination authority, then close
-                // out drains, collectors, diagnostics, and the continuation.
+                // Blocking waitpid runs on ProcessTermination's dedicated
+                // queue. This task remains the sole reaping authority.
                 Task.detached(priority: .userInitiated) {
                     let reapOutcome: Result<ProcessExitStatus, any Error>
+                    let reapRequiresGroupCleanup: Bool
                     do {
-                        let outcome = try await ProcessTermination.waitForTerminationStatus(
-                            pid: spawned.pid,
-                            processGroupID: spawned.processGroupID,
-                            timeout: nil
+                        reapOutcome = .success(
+                            try await ProcessTermination.reapChildStatus(
+                                pid: spawned.pid,
+                                onReaped: { target.markTerminated() }
+                            )
                         )
-                        reapOutcome = .success(outcome.status)
+                        reapRequiresGroupCleanup = false
                     } catch {
                         reapOutcome = .failure(error)
+                        reapRequiresGroupCleanup = true
+                        // Never hand an ownership error to a second waitpid.
+                        // Recovery is process-group-only after PID signaling closes.
+                        target.markTerminated()
                     }
-                    target.markTerminated()
-                    // The direct child is reaped, but cancellation/timeout
-                    // signaling can leave TERM-resistant descendants alive in
-                    // the spawned process group. Escalate through the shared
-                    // authority and hold this command (and its admission
-                    // lease) open until the whole group has exited or been
-                    // SIGKILLed. Normal successful commands skip this wait.
-                    if lifecycleController.cancellationErrorIfRequested() != nil
+
+                    // Commit before cleanup so cancellation is linearized while
+                    // handlers remain active to drain TERM-time output.
+                    let finalization = lifecycleController.commitFinalization()
+                    timeoutController.cancel()
+                    if finalization.requiresProcessGroupCleanup
                         || timeoutController.didTimeOut
+                        || reapRequiresGroupCleanup
                     {
-                        _ = await ProcessTermination.terminateAndReap(
-                            pid: spawned.pid,
+                        await ProcessTermination.terminateProcessGroupAfterRootReap(
                             processGroupID: spawned.processGroupID,
                             sigtermGrace: terminationGraceSeconds
                         )
                     }
-                    lifecycleController.didTerminate()
-                    timeoutController.cancel()
 
-                    // Stop handlers to break strong reference cycles
+                    // Stop handlers to break strong reference cycles.
                     spawned.stdout.readabilityHandler = nil
                     spawned.stderr.readabilityHandler = nil
 
@@ -7566,6 +7650,15 @@ actor GitService {
 
                     let stdoutData = await outCollector.value
                     let stderrData = await errCollector.value
+                    if (outDrain.didExceedByteLimit || errDrain.didExceedByteLimit)
+                        && !finalization.requiresProcessGroupCleanup
+                        && !timeoutController.didTimeOut
+                    {
+                        await ProcessTermination.terminateProcessGroupAfterRootReap(
+                            processGroupID: spawned.processGroupID,
+                            sigtermGrace: terminationGraceSeconds
+                        )
+                    }
 
                     recordCommandOutcome(stdoutData.count + stderrData.count)
 
@@ -7573,7 +7666,6 @@ actor GitService {
                         continuation.resume(throwing: GitProcessCaptureError.timedOut)
                         return
                     }
-
                     if outDrain.didExceedByteLimit {
                         continuation.resume(throwing: GitProcessCaptureError.stdoutByteLimitExceeded)
                         return
@@ -7583,30 +7675,15 @@ actor GitService {
                         return
                     }
 
+                    if let cancellationError = finalization.cancellationError {
+                        continuation.resume(throwing: cancellationError)
+                        return
+                    }
                     switch reapOutcome {
                     case let .success(exitStatus):
                         continuation.resume(returning: (stdoutData, stderrData, exitStatus.terminationStatus))
                     case let .failure(reapFailure):
                         continuation.resume(throwing: reapFailure)
-                    }
-                }
-
-                let spawnState = lifecycleController.didSpawn(
-                    target: target,
-                    terminationGrace: terminationGrace
-                )
-                if spawnState == .running {
-                    // Charge time spent inside the synchronous spawn call against
-                    // the command timeout so a slow launch cannot extend it.
-                    let spawnElapsed = Duration.microseconds(elapsedMicroseconds(since: spawnStartedAt))
-                    let remainingTimeout = max(Duration.zero, commandTimeout - spawnElapsed)
-                    timeoutController.schedule(
-                        target: target,
-                        timeout: remainingTimeout,
-                        terminationGrace: terminationGrace
-                    )
-                    if !lifecycleController.shouldKeepNormalTimeout() {
-                        timeoutController.cancel()
                     }
                 }
 
@@ -7632,13 +7709,12 @@ actor GitService {
                 spawned.stdin?.closeFile()
             }
         }, onCancel: {
-            timeoutController.cancel()
             // Keep stdout/stderr drains active until termination. A child may flush more than
             // pipe capacity while handling SIGTERM; closing the drains here can block that
             // flush forever and prevent the reaper from observing process exit.
             lifecycleController.requestCancellation(terminationGrace: terminationGrace)
+            timeoutController.cancel()
         })
-        try Task.checkCancellation()
         return result
     }
 
