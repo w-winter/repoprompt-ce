@@ -2898,12 +2898,12 @@ class PromptViewModel: ObservableObject {
             return adjacentTabID(afterClosing: previousActiveID, tabs: tabsBeforeClose, closingIDs: tabsBeingClosed)
         }()
 
-        // Notify listeners BEFORE mutation so they can cancel running tasks
+        // Notify listeners BEFORE mutation so they can cancel running tasks.
+        // This begins destructive cleanup, so the tab removal must commit even if
+        // listener cleanup invalidates the caller's session-based mutation context.
         guard mutationContextIsCurrent() else { return }
         await notifyComposeTabsWillClose(tabsBeingClosed, reason: reason)
-        guard mutationContextIsCurrent() else { return }
         await cleanupMCPStateForClosingTabs(tabsBeingClosed)
-        guard mutationContextIsCurrent() else { return }
         #if DEBUG
             for tabID in tabsBeingClosed {
                 AgentModePerfDiagnostics.markSidebarDeleteFullCleanupComplete(

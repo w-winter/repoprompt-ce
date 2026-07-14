@@ -164,6 +164,25 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         }
     }
 
+    func testGuardedCloseCommitsTabRemovalAfterListenerCleanupInvalidatesTarget() async throws {
+        try await withFixture { fixture in
+            let target = try XCTUnwrap(fixture.window.agentChatTitleClusterMenuSnapshot()?.target)
+            XCTAssertTrue(fixture.window.agentChatTitleClusterMenuTargetIsValid(target))
+
+            await fixture.window.promptManager.closeComposeTab(
+                fixture.tabAID,
+                isMutationContextCurrent: {
+                    fixture.window.agentChatTitleClusterMenuTargetIsValid(target)
+                }
+            )
+
+            XCTAssertNil(fixture.tab(fixture.tabAID))
+            XCTAssertNotNil(fixture.tab(fixture.tabBID))
+            XCTAssertNil(fixture.viewModel.explicitActiveSessionID(for: fixture.tabAID))
+            XCTAssertFalse(fixture.window.agentChatTitleClusterMenuTargetIsValid(target))
+        }
+    }
+
     private func withFixture(_ body: (Fixture) async throws -> Void) async throws {
         let fixture = try await makeFixture()
         do {
