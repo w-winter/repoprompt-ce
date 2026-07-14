@@ -28,7 +28,7 @@ on accessibilityPermissionPreflight()
     end if
 end accessibilityPermissionPreflight
 
-on targetProcessForPID(targetPID)
+on assertProcessExistsForPID(targetPID)
     tell application "System Events"
         -- System Events incorrectly resolves a variable inside a `whose unix id`
         -- filter to the first matching application process on this host. Enumerate
@@ -38,25 +38,13 @@ on targetProcessForPID(targetPID)
             try
                 set candidatePID to (unix id of candidateProcess) as integer
                 if candidatePID is targetPID then
-                    -- Keep the enumerated reference; coercing it with `contents of`
-                    -- loses the PID-qualified object specifier on this host.
-                    set resolvedProcess to candidateProcess
-                    if ((unix id of resolvedProcess) as integer) is targetPID then return resolvedProcess
+                    if ((unix id of candidateProcess) as integer) is targetPID then return
                 end if
             end try
         end repeat
     end tell
     error "Could not find the RepoPrompt debug process with PID " & targetPID
-end targetProcessForPID
-
-on assertProcessPID(processRef, targetPID)
-    tell application "System Events"
-        try
-            if (unix id of processRef) is targetPID then return
-        end try
-    end tell
-    error "Resolved accessibility process no longer matches RepoPrompt debug PID " & targetPID
-end assertProcessPID
+end assertProcessExistsForPID
 
 on firstElementWithIdentifier(containerRef, targetIdentifier)
     tell application "System Events"
@@ -76,12 +64,15 @@ end firstElementWithIdentifier
 
 on waitForElement(targetPID, targetIdentifier, shouldExist)
     repeat 40 times
-        set processRef to my targetProcessForPID(targetPID)
-        my assertProcessPID(processRef, targetPID)
-        set foundRef to my firstElementWithIdentifier(processRef, targetIdentifier)
-        my assertProcessPID(processRef, targetPID)
-        if shouldExist and foundRef is not missing value then return foundRef
-        if not shouldExist and foundRef is missing value then return missing value
+        tell application "System Events"
+            repeat with candidateProcess in application processes
+                if ((unix id of candidateProcess) as integer) is targetPID then
+                    set foundRef to my firstElementWithIdentifier(candidateProcess, targetIdentifier)
+                    if shouldExist and foundRef is not missing value then return foundRef
+                    if not shouldExist and foundRef is missing value then return missing value
+                end if
+            end repeat
+        end tell
         delay 0.1
     end repeat
     if shouldExist then error "Could not find accessibility element " & targetIdentifier
@@ -89,24 +80,33 @@ on waitForElement(targetPID, targetIdentifier, shouldExist)
 end waitForElement
 
 on clickElementForPID(targetPID, targetIdentifier)
-    set processRef to my targetProcessForPID(targetPID)
-    my assertProcessPID(processRef, targetPID)
-    set elementRef to my firstElementWithIdentifier(processRef, targetIdentifier)
-    my assertProcessPID(processRef, targetPID)
-    if elementRef is missing value then error "Could not find accessibility element " & targetIdentifier
-    tell application "System Events" to click elementRef
+    tell application "System Events"
+        repeat with candidateProcess in application processes
+            if ((unix id of candidateProcess) as integer) is targetPID then
+                set elementRef to my firstElementWithIdentifier(candidateProcess, targetIdentifier)
+                if elementRef is not missing value then
+                    if ((unix id of candidateProcess) as integer) is targetPID then click elementRef
+                    return
+                end if
+            end if
+        end repeat
+    end tell
+    error "Could not find accessibility element " & targetIdentifier
 end clickElementForPID
 
 on waitForTerminalState(targetPID)
     set terminalIdentifiers to {"agent-execution-location-existing-list", "agent-execution-location-existing-empty", "agent-execution-location-existing-error"}
     repeat 60 times
-        set processRef to my targetProcessForPID(targetPID)
-        my assertProcessPID(processRef, targetPID)
-        repeat with terminalIdentifier in terminalIdentifiers
-            set foundRef to my firstElementWithIdentifier(processRef, terminalIdentifier as text)
-            my assertProcessPID(processRef, targetPID)
-            if foundRef is not missing value then return foundRef
-        end repeat
+        tell application "System Events"
+            repeat with candidateProcess in application processes
+                if ((unix id of candidateProcess) as integer) is targetPID then
+                    repeat with terminalIdentifier in terminalIdentifiers
+                        set foundRef to my firstElementWithIdentifier(candidateProcess, terminalIdentifier as text)
+                        if foundRef is not missing value then return foundRef
+                    end repeat
+                end if
+            end repeat
+        end tell
         delay 0.1
     end repeat
     error "Existing-worktree picker did not transition from loading to a terminal state"
@@ -143,11 +143,29 @@ on windowMatchesIdentity(windowRef, identity)
     end tell
 end windowMatchesIdentity
 
-on hasWindowWithIdentity(processRef, identity)
+on captureWindowIdentityForPID(targetPID)
+    tell application "System Events"
+        repeat with candidateProcess in application processes
+            if ((unix id of candidateProcess) as integer) is targetPID then
+                if not (exists window 1 of candidateProcess) then error "RepoPrompt debug app has no front window"
+                set windowRef to window 1 of candidateProcess
+                return my captureWindowIdentity(windowRef)
+            end if
+        end repeat
+    end tell
+    error "Could not find the RepoPrompt debug process with PID " & targetPID
+end captureWindowIdentityForPID
+
+on hasWindowWithIdentity(targetPID, identity)
     set matchingWindowCount to 0
     tell application "System Events"
-        repeat with candidateWindow in windows of processRef
-            if my windowMatchesIdentity(contents of candidateWindow, identity) then set matchingWindowCount to matchingWindowCount + 1
+        repeat with candidateProcess in application processes
+            if ((unix id of candidateProcess) as integer) is targetPID then
+                repeat with candidateWindow in windows of candidateProcess
+                    if my windowMatchesIdentity(candidateWindow, identity) then set matchingWindowCount to matchingWindowCount + 1
+                end repeat
+                exit repeat
+            end if
         end repeat
     end tell
     if matchingWindowCount > 1 then error "RepoPrompt debug host window identity is ambiguous during execution-location UI smoke"
@@ -155,12 +173,41 @@ on hasWindowWithIdentity(processRef, identity)
 end hasWindowWithIdentity
 
 on assertHostSurvived(targetPID, originalIdentity)
-    set processRef to my targetProcessForPID(targetPID)
-    my assertProcessPID(processRef, targetPID)
-    if not my hasWindowWithIdentity(processRef, originalIdentity) then
+    if not my hasWindowWithIdentity(targetPID, originalIdentity) then
         error "RepoPrompt debug host lost its original window identity during execution-location UI smoke"
     end if
 end assertHostSurvived
+
+on focusProcessForPID(targetPID)
+    tell application "System Events"
+        repeat with candidateProcess in application processes
+            if ((unix id of candidateProcess) as integer) is targetPID then
+                set frontmost of candidateProcess to true
+                if ((unix id of candidateProcess) as integer) is not targetPID then error "RepoPrompt debug PID changed during focus"
+                repeat 30 times
+                    if exists window 1 of candidateProcess then return
+                    delay 0.2
+                end repeat
+                error "RepoPrompt debug app has no front window"
+            end if
+        end repeat
+    end tell
+    error "Could not find the RepoPrompt debug process with PID " & targetPID
+end focusProcessForPID
+
+on escapePopoverForPID(targetPID)
+    tell application "System Events"
+        repeat with candidateProcess in application processes
+            if ((unix id of candidateProcess) as integer) is targetPID then
+                set frontmost of candidateProcess to true
+                if ((unix id of candidateProcess) as integer) is not targetPID then error "RepoPrompt debug PID changed before Escape"
+                key code 53
+                return
+            end if
+        end repeat
+    end tell
+    error "Could not find the RepoPrompt debug process with PID " & targetPID
+end escapePopoverForPID
 
 on run argv
     set targetPID to item 1 of argv as integer
@@ -168,24 +215,11 @@ on run argv
     set openCloseCycles to item 3 of argv as integer
 
     my accessibilityPermissionPreflight()
-    set processRef to my targetProcessForPID(targetPID)
-    my assertProcessPID(processRef, targetPID)
-    tell application "System Events"
-        tell processRef
-            set frontmost to true
-            repeat 30 times
-                if exists window 1 then exit repeat
-                delay 0.2
-            end repeat
-            if not (exists window 1) then error "RepoPrompt debug app has no front window"
-            set originalWindow to window 1
-        end tell
-    end tell
-    set originalIdentity to my captureWindowIdentity(originalWindow)
+    my focusProcessForPID(targetPID)
+    set originalIdentity to my captureWindowIdentityForPID(targetPID)
 
     repeat with cycleIndex from 1 to openCloseCycles
-        set processRef to my targetProcessForPID(targetPID)
-        my assertProcessPID(processRef, targetPID)
+        my assertProcessExistsForPID(targetPID)
         my waitForElement(targetPID, "agent-execution-location-pill", true)
         my clickElementForPID(targetPID, "agent-execution-location-pill")
         -- Require both built-in options so a failed pill click cannot pass vacuously.
@@ -197,19 +231,12 @@ on run argv
         my waitForTerminalState(targetPID)
         my assertHostSurvived(targetPID, originalIdentity)
 
-        set processRef to my targetProcessForPID(targetPID)
-        my assertProcessPID(processRef, targetPID)
-        tell application "System Events"
-            tell processRef to set frontmost to true
-            my waitForElement(targetPID, "agent-execution-location-option-local", true)
-            my waitForElement(targetPID, "agent-execution-location-option-new-worktree", true)
-            set processRef to my targetProcessForPID(targetPID)
-            my assertProcessPID(processRef, targetPID)
-            tell processRef to set frontmost to true
-            key code 53
-            my waitForElement(targetPID, "agent-execution-location-option-local", false)
-            my waitForElement(targetPID, "agent-execution-location-option-new-worktree", false)
-        end tell
+        my focusProcessForPID(targetPID)
+        my waitForElement(targetPID, "agent-execution-location-option-local", true)
+        my waitForElement(targetPID, "agent-execution-location-option-new-worktree", true)
+        my escapePopoverForPID(targetPID)
+        my waitForElement(targetPID, "agent-execution-location-option-local", false)
+        my waitForElement(targetPID, "agent-execution-location-option-new-worktree", false)
 
         my assertHostSurvived(targetPID, originalIdentity)
     end repeat
