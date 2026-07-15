@@ -773,7 +773,7 @@ final class CodexCLIProvider: AIProvider {
             runID: UUID(),
             tabID: UUID(),
             windowID: 0,
-            workspacePath: workingDirectory,
+            workspacePaths: .uniform(workingDirectory),
             options: options,
             // The transport is owned by the outer request lifecycle, not by the
             // single-turn controller.

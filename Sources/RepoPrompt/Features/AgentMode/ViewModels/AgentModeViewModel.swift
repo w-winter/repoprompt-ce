@@ -42,7 +42,7 @@ final class AgentModeViewModel: ObservableObject {
         _ runID: UUID,
         _ tabID: UUID,
         _ windowID: Int,
-        _ workspacePath: String?,
+        _ workspacePaths: CodexRuntimeWorkspacePaths,
         _ permissionProfile: AgentPermissionProfile,
         _ taskLabelKind: AgentModelCatalog.TaskLabelKind?
     ) -> any CodexSessionControlling
@@ -1419,6 +1419,12 @@ final class AgentModeViewModel: ObservableObject {
                 fallbackWorkspacePath: codexWorkspacePathProvider()
             )
         }
+        let codexRuntimeWorkspacePathsProvider: (TabSession) throws -> CodexRuntimeWorkspacePaths = { session in
+            try Self.codexRuntimeWorkspacePaths(
+                for: session,
+                fallbackWorkspacePath: codexWorkspacePathProvider()
+            )
+        }
         workspacePathProvider = codexWorkspacePathProvider
         attachmentWorkspaceDirectoryProvider = { [weak workspaceManager] in
             guard let workspaceManager, workspaceManager.activeWorkspace != nil else {
@@ -1426,7 +1432,7 @@ final class AgentModeViewModel: ObservableObject {
             }
             return FileManager.default.temporaryDirectory
         }
-        let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePath, permissionProfile, _, computerUseEnabled in
+        let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePaths, permissionProfile, _, computerUseEnabled in
             let client = CodexAppServerClient()
             let options = CodexNativeSessionController.Options.agentModeDefault(
                 forceExperimentalSteering: true,
@@ -1444,7 +1450,7 @@ final class AgentModeViewModel: ObservableObject {
                 runID: runID,
                 tabID: tabID,
                 windowID: windowID,
-                workspacePath: workspacePath,
+                workspacePaths: workspacePaths,
                 options: options,
                 clientShutdownBehavior: .stopOnShutdown,
                 expectedMCPClientName: AgentProviderKind.codexExec.mcpClientNameHint
@@ -1492,7 +1498,7 @@ final class AgentModeViewModel: ObservableObject {
         usesProductionAgentDefaultsAndModelPolling = true
         codexCoordinator = CodexAgentModeCoordinator(
             windowID: windowID,
-            workspacePathProvider: sessionWorkspacePathProvider,
+            runtimeWorkspacePathsProvider: codexRuntimeWorkspacePathsProvider,
             codexControllerFactory: codexControllerFactory,
             connectionPolicyInstaller: connectionPolicyInstaller,
             shouldManageCodexTooling: true,
@@ -1647,10 +1653,16 @@ final class AgentModeViewModel: ObservableObject {
                     fallbackWorkspacePath: codexWorkspacePathProvider()
                 )
             }
+            let codexRuntimeWorkspacePathsProvider: (TabSession) throws -> CodexRuntimeWorkspacePaths = { session in
+                try Self.codexRuntimeWorkspacePaths(
+                    for: session,
+                    fallbackWorkspacePath: codexWorkspacePathProvider()
+                )
+            }
             workspacePathProvider = codexWorkspacePathProvider
             let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = codexControllerFactoryWithComputerUse
-                ?? { runID, tabID, windowID, workspacePath, permissionProfile, taskLabelKind, _ in
-                    codexControllerFactory(runID, tabID, windowID, workspacePath, permissionProfile, taskLabelKind)
+                ?? { runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind, _ in
+                    codexControllerFactory(runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind)
                 }
             self.headlessProviderFactory = headlessProviderFactory
             self.acpProviderFactory = acpProviderFactory
@@ -1675,7 +1687,7 @@ final class AgentModeViewModel: ObservableObject {
             }
             codexCoordinator = CodexAgentModeCoordinator(
                 windowID: testWindowID,
-                workspacePathProvider: sessionWorkspacePathProvider,
+                runtimeWorkspacePathsProvider: codexRuntimeWorkspacePathsProvider,
                 codexControllerFactory: codexControllerFactory,
                 connectionPolicyInstaller: connectionPolicyInstaller,
                 shouldManageCodexTooling: shouldManageCodexTooling,
@@ -1844,6 +1856,13 @@ final class AgentModeViewModel: ObservableObject {
         )
     }
 
+    func codexRuntimeWorkspacePaths(for session: TabSession) throws -> CodexRuntimeWorkspacePaths {
+        try Self.codexRuntimeWorkspacePaths(
+            for: session,
+            fallbackWorkspacePath: workspacePathProvider()
+        )
+    }
+
     func primaryExecutionBinding(for session: TabSession) -> AgentSessionWorktreeBinding? {
         Self.primaryExecutionBinding(in: session.worktreeBindings, fallbackWorkspacePath: workspacePathProvider())
     }
@@ -1874,6 +1893,16 @@ final class AgentModeViewModel: ObservableObject {
         fallbackWorkspacePath: String?
     ) throws -> String? {
         try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
+            bindings: session.worktreeBindings,
+            fallbackWorkspacePath: fallbackWorkspacePath
+        )
+    }
+
+    private static func codexRuntimeWorkspacePaths(
+        for session: TabSession,
+        fallbackWorkspacePath: String?
+    ) throws -> CodexRuntimeWorkspacePaths {
+        try AgentWorktreeRuntimeWorkspaceResolver.codexRuntimeWorkspacePaths(
             bindings: session.worktreeBindings,
             fallbackWorkspacePath: fallbackWorkspacePath
         )

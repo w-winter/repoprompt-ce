@@ -96,7 +96,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
                 commandName: executableURL.path,
                 additionalPathHints: [],
                 requestTimeout: 5,
-                workingDirectory: directory.path
+                processLaunchDirectory: directory.path
             )
         )
 
@@ -122,7 +122,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
                 commandName: executableURL.path,
                 additionalPathHints: [],
                 requestTimeout: 5,
-                workingDirectory: directory.path,
+                processLaunchDirectory: directory.path,
                 processModelReasoningSummary: .auto
             )
         )
@@ -133,6 +133,138 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         let arguments = try recordedProcessArguments(at: recordURL)
         XCTAssertTrue(arguments.contains("app-server"))
         XCTAssertTrue(arguments.contains("model_reasoning_summary=auto"))
+    }
+
+    func testProcessLaunchDirectoryUpdateKeepsRunningTransportAndAppliesAfterRestart() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexNativeSessionControllerGoalConfigTests-\(UUID().uuidString)", isDirectory: true)
+        let launchDirectoryA = directory.appendingPathComponent("launch-a", isDirectory: true)
+        let launchDirectoryB = directory.appendingPathComponent("launch-b", isDirectory: true)
+        try FileManager.default.createDirectory(at: launchDirectoryA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: launchDirectoryB, withIntermediateDirectories: true)
+        temporaryDirectories.append(directory)
+
+        let recordURL = directory.appendingPathComponent("requests.jsonl")
+        let executableURL = try makeFakeCodexAppServer(in: directory, recordURL: recordURL)
+        let client = CodexAppServerClient()
+        await client.updateConfig(
+            CodexAppServerClient.Config(
+                commandName: executableURL.path,
+                additionalPathHints: [],
+                requestTimeout: 5,
+                processLaunchDirectory: launchDirectoryA.path
+            )
+        )
+
+        try await client.startIfNeeded()
+        let initialProcessIDValue = await client.debugProcessID()
+        let initialProcessID = try XCTUnwrap(initialProcessIDValue)
+        let initialGeneration = await client.debugTransportGeneration()
+
+        await client.updateProcessLaunchDirectory(launchDirectoryB.path)
+
+        let updatedProcessID = await client.debugProcessID()
+        let updatedGeneration = await client.debugTransportGeneration()
+        let isRunningAfterDirectoryUpdate = await client.debugIsProcessRunning()
+        XCTAssertEqual(updatedProcessID, initialProcessID)
+        XCTAssertEqual(updatedGeneration, initialGeneration)
+        XCTAssertTrue(isRunningAfterDirectoryUpdate)
+        XCTAssertEqual(
+            try recordedRequests(for: "__process_args", at: recordURL)
+                .compactMap { $0["cwd"] as? String }
+                .map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path },
+            [launchDirectoryA.resolvingSymlinksInPath().path]
+        )
+
+        await client.stop()
+        try await client.startIfNeeded()
+
+        let restartedGeneration = await client.debugTransportGeneration()
+        let isRunningAfterRestart = await client.debugIsProcessRunning()
+        XCTAssertEqual(restartedGeneration, initialGeneration + 1)
+        XCTAssertTrue(isRunningAfterRestart)
+        XCTAssertEqual(
+            try recordedRequests(for: "__process_args", at: recordURL)
+                .compactMap { $0["cwd"] as? String }
+                .map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path },
+            [
+                launchDirectoryA.resolvingSymlinksInPath().path,
+                launchDirectoryB.resolvingSymlinksInPath().path
+            ]
+        )
+        await client.stop()
+    }
+
+    func testProcessLaunchPolicyUpdateRestartsOnlyForEffectiveChanges() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexNativeSessionControllerGoalConfigTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        temporaryDirectories.append(directory)
+
+        let recordURL = directory.appendingPathComponent("requests.jsonl")
+        let executableURL = try makeFakeCodexAppServer(in: directory, recordURL: recordURL)
+        let client = CodexAppServerClient()
+        await client.updateConfig(
+            CodexAppServerClient.Config(
+                commandName: executableURL.path,
+                additionalPathHints: [],
+                requestTimeout: 5,
+                processLaunchDirectory: directory.path
+            )
+        )
+
+        try await client.startIfNeeded()
+        let initialProcessIDValue = await client.debugProcessID()
+        let initialProcessID = try XCTUnwrap(initialProcessIDValue)
+        let initialGeneration = await client.debugTransportGeneration()
+
+        await client.updateProcessLaunchPolicy(
+            featurePolicy: .defaultDisabled,
+            modelReasoningSummary: nil
+        )
+
+        let unchangedProcessID = await client.debugProcessID()
+        let unchangedGeneration = await client.debugTransportGeneration()
+        let isRunningAfterUnchangedPolicy = await client.debugIsProcessRunning()
+        let unchangedTerminationReason = await client.debugLastTransportTerminationReason()
+        XCTAssertEqual(unchangedProcessID, initialProcessID)
+        XCTAssertEqual(unchangedGeneration, initialGeneration)
+        XCTAssertTrue(isRunningAfterUnchangedPolicy)
+        XCTAssertNil(unchangedTerminationReason)
+
+        await client.updateProcessLaunchPolicy(
+            featurePolicy: .enabledForGoals,
+            modelReasoningSummary: nil
+        )
+
+        let isRunningAfterFeaturePolicyChange = await client.debugIsProcessRunning()
+        let processIDAfterFeaturePolicyChange = await client.debugProcessID()
+        let generationAfterFeaturePolicyChange = await client.debugTransportGeneration()
+        let featurePolicyTerminationReason = await client.debugLastTransportTerminationReason()
+        XCTAssertFalse(isRunningAfterFeaturePolicyChange)
+        XCTAssertNil(processIDAfterFeaturePolicyChange)
+        XCTAssertEqual(generationAfterFeaturePolicyChange, initialGeneration)
+        XCTAssertEqual(featurePolicyTerminationReason, .explicitStop)
+
+        try await client.startIfNeeded()
+        let restartedGeneration = await client.debugTransportGeneration()
+        let isRunningAfterPolicyRestart = await client.debugIsProcessRunning()
+        XCTAssertEqual(restartedGeneration, initialGeneration + 1)
+        XCTAssertTrue(isRunningAfterPolicyRestart)
+
+        await client.updateProcessLaunchPolicy(
+            featurePolicy: .enabledForGoals,
+            modelReasoningSummary: .detailed
+        )
+
+        let isRunningAfterReasoningSummaryChange = await client.debugIsProcessRunning()
+        let processIDAfterReasoningSummaryChange = await client.debugProcessID()
+        let generationAfterReasoningSummaryChange = await client.debugTransportGeneration()
+        let reasoningSummaryTerminationReason = await client.debugLastTransportTerminationReason()
+        XCTAssertFalse(isRunningAfterReasoningSummaryChange)
+        XCTAssertNil(processIDAfterReasoningSummaryChange)
+        XCTAssertEqual(generationAfterReasoningSummaryChange, restartedGeneration)
+        XCTAssertEqual(reasoningSummaryTerminationReason, .explicitStop)
     }
 
     func testNativeSessionControllerDefaultOptionsOmitProcessReasoningSummaryOverride() async throws {
@@ -380,7 +512,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
                 commandName: executableURL.path,
                 additionalPathHints: [],
                 requestTimeout: 5,
-                workingDirectory: directory.path
+                processLaunchDirectory: directory.path
             )
         )
 
@@ -389,7 +521,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             runID: UUID(),
             tabID: UUID(),
             windowID: 0,
-            workspacePath: directory.path,
+            workspacePaths: .uniform(directory.path),
             options: options,
             clientShutdownBehavior: .stopOnShutdown
         )
@@ -405,13 +537,14 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         let script = """
         #!/usr/bin/env python3
         import json
+        import os
         import sys
 
         record_path = \(String(reflecting: recordURL.path))
         ignore_memory_mode_requests = \(ignoreMemoryModeRequests ? "True" : "False")
 
         with open(record_path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"method": "__process_args", "argv": sys.argv[1:]}) + "\\n")
+            handle.write(json.dumps({"method": "__process_args", "argv": sys.argv[1:], "cwd": os.getcwd()}) + "\\n")
 
         def respond(request_id, result):
             print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)

@@ -133,21 +133,22 @@ actor CodexAppServerClient {
         let additionalPathHints: [String]
         let enableDebugLogging: Bool
         let requestTimeout: TimeInterval?
-        /// Working directory for the Codex app-server process.
+        /// Launch directory for the Codex app-server process. Distinct from the thread/turn
+        /// execution cwd, which the controller sends per request.
         /// When nil, falls back to temp directory via CLIProcessConfiguration default.
-        let workingDirectory: String?
-        let processFeaturePolicy: CodexOverrides.FeaturePolicy
+        private(set) var processLaunchDirectory: String?
+        private(set) var processFeaturePolicy: CodexOverrides.FeaturePolicy
         /// Process-level `model_reasoning_summary` override for app-server launch.
         /// Nil preserves Codex CLI process defaults; pass a value only for an intentional process override.
         /// Agent Mode should prefer per-thread config instead of process launch config.
-        let processModelReasoningSummary: CodexOverrides.ReasoningSummary?
+        private(set) var processModelReasoningSummary: CodexOverrides.ReasoningSummary?
 
         init(
             commandName: String = CLILaunchProfiles.codex.commandName,
             additionalPathHints: [String] = CLILaunchProfiles.codex.supplementalSearchPaths,
             enableDebugLogging: Bool = false,
             requestTimeout: TimeInterval? = nil,
-            workingDirectory: String? = nil,
+            processLaunchDirectory: String? = nil,
             processFeaturePolicy: CodexOverrides.FeaturePolicy = .defaultDisabled,
             processModelReasoningSummary: CodexOverrides.ReasoningSummary? = nil
         ) {
@@ -155,9 +156,21 @@ actor CodexAppServerClient {
             self.additionalPathHints = additionalPathHints
             self.enableDebugLogging = enableDebugLogging
             self.requestTimeout = requestTimeout
-            self.workingDirectory = workingDirectory
+            self.processLaunchDirectory = processLaunchDirectory
             self.processFeaturePolicy = processFeaturePolicy
             self.processModelReasoningSummary = processModelReasoningSummary
+        }
+
+        mutating func replaceProcessLaunchDirectory(_ path: String?) {
+            processLaunchDirectory = path
+        }
+
+        mutating func replaceProcessLaunchPolicy(
+            featurePolicy: CodexOverrides.FeaturePolicy,
+            modelReasoningSummary: CodexOverrides.ReasoningSummary?
+        ) {
+            processFeaturePolicy = featurePolicy
+            processModelReasoningSummary = modelReasoningSummary
         }
     }
 
@@ -398,20 +411,12 @@ actor CodexAppServerClient {
         return registered
     }
 
-    /// Updates the working directory for the next process start.
+    /// Updates the process launch directory for the next process start.
     /// Must be called before `startIfNeeded()` to take effect.
-    func updateWorkingDirectory(_ path: String?) {
+    func updateProcessLaunchDirectory(_ path: String?) {
         let trimmed = path?.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalized = (trimmed?.isEmpty == false) ? trimmed : nil
-        config = Config(
-            commandName: config.commandName,
-            additionalPathHints: config.additionalPathHints,
-            enableDebugLogging: config.enableDebugLogging,
-            requestTimeout: config.requestTimeout,
-            workingDirectory: normalized,
-            processFeaturePolicy: config.processFeaturePolicy,
-            processModelReasoningSummary: config.processModelReasoningSummary
-        )
+        config.replaceProcessLaunchDirectory(normalized)
     }
 
     func updateProcessFeaturePolicy(_ featurePolicy: CodexOverrides.FeaturePolicy) async {
@@ -428,14 +433,9 @@ actor CodexAppServerClient {
         guard featurePolicy != config.processFeaturePolicy
             || modelReasoningSummary != config.processModelReasoningSummary
         else { return }
-        config = Config(
-            commandName: config.commandName,
-            additionalPathHints: config.additionalPathHints,
-            enableDebugLogging: config.enableDebugLogging,
-            requestTimeout: config.requestTimeout,
-            workingDirectory: config.workingDirectory,
-            processFeaturePolicy: featurePolicy,
-            processModelReasoningSummary: modelReasoningSummary
+        config.replaceProcessLaunchPolicy(
+            featurePolicy: featurePolicy,
+            modelReasoningSummary: modelReasoningSummary
         )
         if process != nil {
             await terminateTransport(flushStdout: true, reason: .explicitStop)
@@ -955,7 +955,7 @@ actor CodexAppServerClient {
             command: resolution.resolvedCommand,
             arguments: args,
             environment: environment,
-            workingDirectory: config.workingDirectory
+            workingDirectory: config.processLaunchDirectory
         )
         stdoutFramer = LineFramer()
         stdoutTail.removeAll(keepingCapacity: false)
