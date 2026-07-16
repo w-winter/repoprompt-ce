@@ -623,24 +623,19 @@ actor CodexAppServerClient {
         reason: TransportTerminationReason
     ) -> Task<Void, Never>? {
         if let expectedGeneration, expectedGeneration != transportGeneration { return nil }
-        if let existing = transportTerminationTask,
-           existing.generation == transportGeneration
-        {
-            return existing.task
-        }
-        guard claimTransportTermination(reason: reason) else { return nil }
-        lastTransportFailure = requestFailure
         let generation = transportGeneration
-        let task = Task { [weak self] in
-            guard let self else { return }
-            await completeTransportTermination(
-                generation: generation,
-                flushStdout: flushStdout,
-                requestFailure: requestFailure
-            )
-        }
-        transportTerminationTask = (generation: generation, task: task)
-        return task
+        return installTransportTermination(
+            generation: generation,
+            reason: reason,
+            afterClaim: { lastTransportFailure = requestFailure },
+            operation: { client in
+                await client.completeTransportTermination(
+                    generation: generation,
+                    flushStdout: flushStdout,
+                    requestFailure: requestFailure
+                )
+            }
+        )
     }
 
     private func beginObservedProcessExitTermination(
@@ -655,26 +650,54 @@ actor CodexAppServerClient {
         else {
             return nil
         }
+        let expectedAgentPIDToClear = ClaimCapture<RegisteredExpectedAgentPID>()
+        return installTransportTermination(
+            generation: generation,
+            reason: .observedProcessExit(status: status),
+            afterClaim: {
+                expectedAgentPIDToClear.value = takeRegisteredExpectedAgentPIDForDeferredClear()
+            },
+            operation: { client in
+                await client.completeObservedProcessExitTermination(
+                    status: status,
+                    observer: observer,
+                    generation: generation,
+                    expectedAgentPIDToClear: expectedAgentPIDToClear.value
+                )
+            }
+        )
+    }
+
+    /// Shared first-claim arbitration for every transport-termination origin:
+    /// same-generation task reuse, the terminal-cause claim, post-claim state
+    /// capture, and termination-task publication happen identically here so a
+    /// new termination cause cannot skip or reorder any step of the protocol.
+    private func installTransportTermination(
+        generation: UInt64,
+        reason: TransportTerminationReason,
+        afterClaim: () -> Void,
+        operation: @escaping @Sendable (CodexAppServerClient) async -> Void
+    ) -> Task<Void, Never>? {
         if let existing = transportTerminationTask,
            existing.generation == generation
         {
             return existing.task
         }
-        guard claimTransportTermination(reason: .observedProcessExit(status: status)) else {
-            return nil
-        }
-        let expectedAgentPIDToClear = takeRegisteredExpectedAgentPIDForDeferredClear()
+        guard claimTransportTermination(reason: reason) else { return nil }
+        afterClaim()
         let task = Task { [weak self] in
             guard let self else { return }
-            await completeObservedProcessExitTermination(
-                status: status,
-                observer: observer,
-                generation: generation,
-                expectedAgentPIDToClear: expectedAgentPIDToClear
-            )
+            await operation(self)
         }
         transportTerminationTask = (generation: generation, task: task)
         return task
+    }
+
+    /// Box for a value produced at claim time (synchronously, before the
+    /// termination task is published) and consumed inside the escaping
+    /// termination operation.
+    private final class ClaimCapture<Value>: @unchecked Sendable {
+        var value: Value?
     }
 
     private func claimTransportTermination(reason: TransportTerminationReason) -> Bool {
