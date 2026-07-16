@@ -77,21 +77,32 @@ private final class ChildStatusReaperRegistry: @unchecked Sendable {
     private final class Entry {
         let token: UUID
         let source: any DispatchSourceProcess
+        let fallbackProbeTimer: any DispatchSourceTimer
         let beforeReap: @Sendable () -> Void
         let completion: @Sendable (Result<ProcessExitStatus, ProcessTerminationError>) -> Void
 
         init(
             token: UUID,
             source: any DispatchSourceProcess,
+            fallbackProbeTimer: any DispatchSourceTimer,
             beforeReap: @escaping @Sendable () -> Void,
             completion: @escaping @Sendable (Result<ProcessExitStatus, ProcessTerminationError>) -> Void
         ) {
             self.token = token
             self.source = source
+            self.fallbackProbeTimer = fallbackProbeTimer
             self.beforeReap = beforeReap
             self.completion = completion
         }
     }
+
+    /// kevent exit delivery is not contractual under load: a process source
+    /// can rarely miss NOTE_EXIT even though it registered while the child was
+    /// alive, which would strand the observer and the child's zombie forever.
+    /// Each registration therefore keeps a low-frequency non-destructive probe
+    /// that self-heals a missed notification through the same token-guarded
+    /// sole-reap path.
+    private static let fallbackProbeInterval: TimeInterval = 0.5
 
     private let queue = DispatchQueue(
         label: "com.repoprompt.process-termination.child-status-registry",
@@ -117,9 +128,11 @@ private final class ChildStatusReaperRegistry: @unchecked Sendable {
                 eventMask: .exit,
                 queue: queue
             )
+            let fallbackProbeTimer = DispatchSource.makeTimerSource(queue: queue)
             let entry = Entry(
                 token: token,
                 source: source,
+                fallbackProbeTimer: fallbackProbeTimer,
                 beforeReap: beforeReap,
                 completion: completion
             )
@@ -132,6 +145,16 @@ private final class ChildStatusReaperRegistry: @unchecked Sendable {
                 self?.reapAfterExitNotification(pid: pid, token: token)
             }
             source.activate()
+
+            fallbackProbeTimer.schedule(
+                deadline: .now() + Self.fallbackProbeInterval,
+                repeating: Self.fallbackProbeInterval,
+                leeway: .milliseconds(100)
+            )
+            fallbackProbeTimer.setEventHandler { [weak self] in
+                self?.probeWithoutBlocking(pid: pid, token: token)
+            }
+            fallbackProbeTimer.activate()
 
             // Activation and registration are distinct libdispatch steps. This
             // probe plus the registration-handler probe cover exits on either
@@ -224,6 +247,7 @@ private final class ChildStatusReaperRegistry: @unchecked Sendable {
         guard entries[pid]?.token == token else { return }
         entries.removeValue(forKey: pid)
         entry.source.cancel()
+        entry.fallbackProbeTimer.cancel()
     }
 }
 
