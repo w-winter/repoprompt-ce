@@ -68,6 +68,7 @@ final class CodexNativeSessionControllerTurnDispatchTests: XCTestCase {
     }
 
     func testTurnStartPreservesImageEntriesWhenAddingTextPayload() async throws {
+        let inlineImageDataURL = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
         let recorder = TurnRequestRecorder(result: [
             "turn": ["id": "submission-1"]
         ])
@@ -77,7 +78,7 @@ final class CodexNativeSessionControllerTurnDispatchTests: XCTestCase {
         _ = try await controller.startUserTurn(
             text: "describe these",
             images: [
-                AgentImageAttachment(source: .url("https://example.com/image.png")),
+                AgentImageAttachment(source: .url(inlineImageDataURL)),
                 AgentImageAttachment(source: .localFile(path: "/tmp/local-image.png"))
             ],
             model: nil,
@@ -90,7 +91,7 @@ final class CodexNativeSessionControllerTurnDispatchTests: XCTestCase {
         XCTAssertEqual(input.count, 3)
         XCTAssertEqual(Set(input[0].keys), Set(["type", "url"]))
         XCTAssertEqual(input[0]["type"] as? String, "image")
-        XCTAssertEqual(input[0]["url"] as? String, "https://example.com/image.png")
+        XCTAssertEqual(input[0]["url"] as? String, inlineImageDataURL)
         XCTAssertEqual(Set(input[1].keys), Set(["type", "path"]))
         XCTAssertEqual(input[1]["type"] as? String, "localImage")
         XCTAssertEqual(input[1]["path"] as? String, "/tmp/local-image.png")
