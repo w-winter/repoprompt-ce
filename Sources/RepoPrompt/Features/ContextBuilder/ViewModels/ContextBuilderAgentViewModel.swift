@@ -456,6 +456,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             let committedTabSnapshotCaptured: (
                 (_ runID: UUID, _ snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot) -> Void
             )?
+            let afterCommittedTabSnapshotCaptured: (@MainActor @Sendable (
+                _ runID: UUID,
+                _ snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot
+            ) async -> Void)?
 
             init(
                 beforeProcessingProviderEvent: ((_ result: AIStreamResult, _ runID: UUID) async -> Void)?,
@@ -467,7 +471,11 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 validateContextBuilderProviders: (@MainActor @Sendable () async -> Void)? = nil,
                 committedTabSnapshotCaptured: (
                     (_ runID: UUID, _ snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot) -> Void
-                )? = nil
+                )? = nil,
+                afterCommittedTabSnapshotCaptured: (@MainActor @Sendable (
+                    _ runID: UUID,
+                    _ snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot
+                ) async -> Void)? = nil
             ) {
                 self.beforeProcessingProviderEvent = beforeProcessingProviderEvent
                 self.providerEventDisposition = providerEventDisposition
@@ -477,6 +485,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 self.runMCPFollowUp = runMCPFollowUp
                 self.validateContextBuilderProviders = validateContextBuilderProviders
                 self.committedTabSnapshotCaptured = committedTabSnapshotCaptured
+                self.afterCommittedTabSnapshotCaptured = afterCommittedTabSnapshotCaptured
             }
         }
 
@@ -2091,14 +2100,18 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private func launchContextBuilderRun(_ record: ContextBuilderRunRecord) {
         let task = Task { @MainActor [weak self, weak record] in
             guard let self, let record else { return }
-            let outcome = await performContextBuilderAgentRun(record: record)
+            var outcome = await performContextBuilderAgentRun(record: record)
             await record.reportProgress(.runFinalization)
+            let deferredCancellationPolicy = record.consumeDeferredCancellationAtSafeBoundary()
+            if deferredCancellationPolicy != nil {
+                outcome = .cancelled
+            }
             finalizeContextBuilderRun(
                 record,
                 outcome: outcome,
-                waiterResolution: .snapshot,
+                waiterResolution: deferredCancellationPolicy?.waiterResolution ?? .snapshot,
                 cancelExecution: false,
-                saveHistory: true,
+                saveHistory: deferredCancellationPolicy?.saveHistory ?? true,
                 source: "contextBuilder.execution"
             )
             await restoreToolRestrictions(agent: record.agentKind, runID: record.runID)
@@ -2873,7 +2886,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             debugLog("cancelMCPContextBuilderRun: no active MCP record for runID \(runID)")
             return
         }
-        cancelRun(record, waiterResolution: .cancellationError, saveHistory: true)
+        cancelRun(
+            record,
+            waiterResolution: .cancellationError,
+            deferredWaiterResolution: .snapshot,
+            saveHistory: true
+        )
     }
 
     /// Cancel a MCP-triggered discovery run by tab ID.
@@ -2883,12 +2901,18 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             debugLog("cancelMCPContextBuilderRun: no active MCP record for tabID \(tabID)")
             return
         }
-        cancelRun(record, waiterResolution: .cancellationError, saveHistory: true)
+        cancelRun(
+            record,
+            waiterResolution: .cancellationError,
+            deferredWaiterResolution: .snapshot,
+            saveHistory: true
+        )
     }
 
     private func cancelRun(
         _ record: ContextBuilderRunRecord,
         waiterResolution: ContextBuilderRunWaiterResolution,
+        deferredWaiterResolution: ContextBuilderRunWaiterResolution? = nil,
         saveHistory: Bool
     ) {
         guard acceptsEvents(from: record) else {
@@ -2900,21 +2924,30 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             )
             return
         }
-        guard record.canAcceptCancellation else {
-            debugLog("Cancel ignored after final context commit claim for run \(record.runID)")
-            return
-        }
-        _ = beginCancellation(forTabID: record.tabID)
-        debugLog("Cancel requested for run \(record.runID) tab \(record.tabID)")
-
-        finalizeContextBuilderRun(
-            record,
-            outcome: .cancelled,
-            waiterResolution: waiterResolution,
-            cancelExecution: true,
-            saveHistory: saveHistory,
-            source: "contextBuilder.cancel"
+        let deferredSettlementPolicy = ContextBuilderRunCancellationSettlementPolicy(
+            waiterResolution: deferredWaiterResolution ?? waiterResolution,
+            saveHistory: saveHistory
         )
+        switch record.requestCancellation(deferredSettlementPolicy: deferredSettlementPolicy) {
+        case .settleImmediately:
+            _ = beginCancellation(forTabID: record.tabID)
+            debugLog("Cancel requested for run \(record.runID) tab \(record.tabID)")
+            finalizeContextBuilderRun(
+                record,
+                outcome: .cancelled,
+                waiterResolution: waiterResolution,
+                cancelExecution: true,
+                saveHistory: saveHistory,
+                source: "contextBuilder.cancel"
+            )
+        case .deferredUntilFinalContextCommitCompletes:
+            _ = beginCancellation(forTabID: record.tabID)
+            debugLog("Cancel deferred until final context commit completes for run \(record.runID)")
+        case .alreadyRequested:
+            debugLog("Cancel already requested for run \(record.runID)")
+        case .terminal:
+            debugLog("Cancel ignored for terminal run \(record.runID)")
+        }
     }
 
     @discardableResult
@@ -3005,10 +3038,11 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private func retainCommittedTabSnapshot(
         _ snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot,
         on record: ContextBuilderRunRecord
-    ) -> Bool {
+    ) async -> Bool {
         guard record.installCommittedTabSnapshot(snapshot) else { return false }
         #if DEBUG
             runTestHooks?.committedTabSnapshotCaptured?(record.runID, snapshot)
+            await runTestHooks?.afterCommittedTabSnapshotCaptured?(record.runID, snapshot)
         #endif
         return true
     }
@@ -3046,8 +3080,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     guard matches.count == 1,
                           let identity = matches.first,
                           var tab = manager.composeTab(for: identity),
-                          activeAgentRuns.remove(runID) != nil,
-                          acceptsEvents(from: record)
+                          activeAgentRuns.contains(runID),
+                          acceptsEvents(from: record),
+                          record.claimFinalContextCommit(),
+                          activeAgentRuns.remove(runID) != nil
                     else {
                         return MCPServerViewModel.ContextBuilderTabContextCommitResult(
                             outcome: .staleOrNoLongerCurrent,
@@ -3084,7 +3120,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                         ),
                         usedAgentOutputAsPrompt: usedAgentOutputAsPrompt
                     )
-                    guard retainCommittedTabSnapshot(snapshot, on: record) else {
+                    guard await retainCommittedTabSnapshot(snapshot, on: record) else {
                         return MCPServerViewModel.ContextBuilderTabContextCommitResult(
                             outcome: .failed("Context Builder could not retain its committed tab snapshot."),
                             committedTab: nil
@@ -3260,10 +3296,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 #endif
                 guard result.outcome == .committed,
                       let committedTab = result.committedTab,
-                      retainCommittedTabSnapshot(committedTab, on: record)
+                      await retainCommittedTabSnapshot(committedTab, on: record)
                 else { return false }
                 record.session.usedAgentOutputAsPrompt = committedTab.usedAgentOutputAsPrompt
-                return activeAgentRuns.contains(runID) && acceptsEvents(from: record)
+                return !record.hasDeferredCancellationPending
+                    && activeAgentRuns.contains(runID)
+                    && acceptsEvents(from: record)
             },
             beforeTerminationRequest: {
                 await record.reportProgress(.childConnectionTermination)
