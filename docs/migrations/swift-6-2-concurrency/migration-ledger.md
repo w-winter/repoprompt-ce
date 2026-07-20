@@ -13,7 +13,8 @@ Updated: 2026-07-20
 | Boundary | Commit / state | Language/checking | Evidence |
 | --- | --- | --- | --- |
 | Dependency/grammar upgrade and broad parser-lock removal | `3b330db9fdfad6c23e715c84d47877995214f1c7` | Swift 5 | Exact SwiftTreeSitter 0.10/runtime 0.25.10 and grammar revisions; scanner shim retained after clean-link proof. |
-| Official-source cleanup (Item 8 partial) | This change | Swift 6 unchanged | PHP now resolves from the official v0.24.2 source with updated cache identity; the wrapper URL migration remains blocked by Neon’s released dependency identity. |
+| Official-source cleanup (Item 8) | `bb8c38e664c4f7fa99cf500a1c89bb757ccfe242` | Swift 6 unchanged | PHP resolves from the official v0.24.2 source with updated cache identity; the wrapper URL migration remains blocked by Neon’s released dependency identity. |
+| Generated-Xcode official-graph acquisition (Item 9) | This change | Swift 6 unchanged | Xcode package acquisition retains the authoritative graph and uses a process-local same-host HTTPS transport for public GitHub SSH submodule URLs; no dependency target, identity, revision, source, or language setting changes. |
 | `RepoPromptRegexCore` | extraction `6feead2fcfbbd53bc9d4b9d0255401ec51bfd374`; Item 6 this change | Swift 6 | Production and owner-test targets compile with `-swift-version 6`; eight owner tests and Swift 5 app-consumer linkage pass. |
 | `RepoPromptCodeMapCore` / owner tests | extraction `22bfff1c5904d5f02c0a881055142c94f4783a84`; Item 6 this change | Swift 6 | Production and owner-test targets compile with `-swift-version 6`; 16 owner tests, mixed-mode app tests, and both Swift 5 product builds pass. |
 
@@ -82,4 +83,8 @@ No new escape hatch or source annotation was added for Item 6. The four target l
 
 ## Generated-Xcode status
 
-`make xcode-generator-test` passes all 23 generator contracts. A fresh `make xcode-validate` still stops at `xcodebuild -list` with error 74, `Couldn’t update repository submodules`. This remains the separately documented upstream SwiftTreeSitter/Neon `tree-sitter-swift` gitlink/custom-path generated-workspace blocker. It does not invalidate the clean SwiftPM target-local Swift 6 compiler evidence, and Item 6 does not create forks, rewrite dependency URLs, or apply an unsafe package workaround.
+Item 9 traced the acquisition boundary with an isolated Xcode source-package directory. The official SwiftTreeSitter and Neon gitlinks materialized at their pinned commits; the remaining failure was the pinned Dart grammar’s unreachable test-support gitlink, whose public GitHub URL is expressed as `git@github.com:` and therefore required an SSH credential even though the repository is public. Xcode performs this recursive repository update before RepoPrompt scheme reachability can exclude external test support.
+
+The generated-workspace validator now appends a process-local Git configuration entry that uses the same official GitHub repository over HTTPS while preserving any caller-supplied `GIT_CONFIG_*` entries. It creates no fork, mirror, branch pin, vendored source, persistent Git configuration, package override, or extra scheme target. `Package.swift`, `Package.resolved`, all grammar dependencies, `TreeSitterScannerSupport`, and the four target-local Swift 6 settings remain unchanged. `make xcode` runs this acquisition/list gate before opening the workspace.
+
+Validation: all 26 focused generator contracts passed. A clean `make xcode-clean && make xcode-validate` regenerated the workspace and completed `xcodebuild -list`, discovering the native `RepoPrompt` product and all three repository convenience schemes against the pinned official package graph.

@@ -39,6 +39,9 @@ CUSTOM_DESTINATION_ROOT = REPO_ROOT / ".build/xcode-custom"
 DEFAULT_DEBUG_APP_BUNDLE = (
     Path.home() / "Library/Application Support/RepoPrompt CE/DebugApps/RepoPrompt.app"
 )
+GITHUB_SSH_TRANSPORT = "git@github.com:"
+GITHUB_HTTPS_TRANSPORT = "https://github.com/"
+GITHUB_TRANSPORT_CONFIG_KEY = f"url.{GITHUB_HTTPS_TRANSPORT}.insteadOf"
 
 
 class GeneratorError(RuntimeError):
@@ -885,11 +888,40 @@ def check_outputs(destination: Path, outputs: dict[Path, bytes]) -> None:
         validate_structure(destination)
 
 
+def xcodebuild_environment(base: dict[str, str] | None = None) -> dict[str, str]:
+    environment = dict(os.environ if base is None else base)
+    raw_count = environment.get("GIT_CONFIG_COUNT", "0")
+    try:
+        count = int(raw_count)
+    except ValueError as error:
+        raise GeneratorError("GIT_CONFIG_COUNT must be a non-negative integer") from error
+    if count < 0:
+        raise GeneratorError("GIT_CONFIG_COUNT must be a non-negative integer")
+
+    for index in range(count):
+        if (
+            environment.get(f"GIT_CONFIG_KEY_{index}") == GITHUB_TRANSPORT_CONFIG_KEY
+            and environment.get(f"GIT_CONFIG_VALUE_{index}") == GITHUB_SSH_TRANSPORT
+        ):
+            return environment
+
+    environment["GIT_CONFIG_COUNT"] = str(count + 1)
+    environment[f"GIT_CONFIG_KEY_{count}"] = GITHUB_TRANSPORT_CONFIG_KEY
+    environment[f"GIT_CONFIG_VALUE_{count}"] = GITHUB_SSH_TRANSPORT
+    return environment
+
+
 def validate_xcodebuild_list(destination: Path) -> None:
     workspace = destination / WORKSPACE_NAME
     command = ["xcodebuild", "-list", "-json", "-workspace", str(workspace)]
     try:
-        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=xcodebuild_environment(),
+        )
     except FileNotFoundError as error:
         raise GeneratorError("xcodebuild is required; install/select Xcode") from error
     if result.returncode != 0:
