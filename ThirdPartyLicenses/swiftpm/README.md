@@ -19,6 +19,11 @@ Tree-sitter grammar packages and `SwiftTreeSitter` use the separately curated
 grammar snapshots, wrapper license, resolved runtime license, and ICU subset
 notice. Its own `SHA256SUMS` file protects the complete curated bundle.
 
+Two source-control requirements are intentional release-gap exceptions: Dart
+publishes no semantic-version releases, and Neon remains at revision
+`07a325403534f4759c814aff0a58ac69144a524c` because its latest release, 0.6.0,
+is older and incompatible with the exact SwiftTreeSitter 0.10.0 graph.
+
 [`SHA256SUMS`](SHA256SUMS) records checksums for the copied notice files. Run:
 
 ```bash

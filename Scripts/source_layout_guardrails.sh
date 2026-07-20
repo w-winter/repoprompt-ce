@@ -115,19 +115,19 @@ import subprocess
 from pathlib import Path
 
 expected_packages = {
-    "tree-sitter-c": ("https://github.com/tree-sitter/tree-sitter-c", "b780e47fc780ddc8da13afa35a3f4ed5c157823d", "TreeSitterC"),
-    "tree-sitter-dart": ("https://github.com/UserNobody14/tree-sitter-dart", "be07cf7118d3dba06236a3f19541685a68209934", "TreeSitterDart"),
-    "tree-sitter-go": ("https://github.com/tree-sitter/tree-sitter-go", "1547678a9da59885853f5f5cc8a99cc203fa2e2c", "TreeSitterGo"),
-    "tree-sitter-java": ("https://github.com/tree-sitter/tree-sitter-java", "94703d5a6bed02b98e438d7cad1136c01a60ba2c", "TreeSitterJava"),
-    "tree-sitter-javascript": ("https://github.com/tree-sitter/tree-sitter-javascript", "44c892e0be055ac465d5eeddae6d3e194424e7de", "TreeSitterJavaScript"),
-    "tree-sitter-python": ("https://github.com/tree-sitter/tree-sitter-python", "293fdc02038ee2bf0e2e206711b69c90ac0d413f", "TreeSitterPython"),
-    "tree-sitter-rust": ("https://github.com/tree-sitter/tree-sitter-rust", "77a3747266f4d621d0757825e6b11edcbf991ca5", "TreeSitterRust"),
-    "tree-sitter-typescript": ("https://github.com/tree-sitter/tree-sitter-typescript", "f975a621f4e7f532fe322e13c4f79495e0a7b2e7", "TreeSitterTypeScript"),
-    "tree-sitter-ruby": ("https://github.com/tree-sitter/tree-sitter-ruby", "71bd32fb7607035768799732addba884a37a6210", "TreeSitterRuby"),
-    "tree-sitter-swift": ("https://github.com/alex-pinkus/tree-sitter-swift", "31d17fe7e818a2048c808b5c6fdc2dc792f4f5b5", "TreeSitterSwift"),
-    "tree-sitter-c-sharp": ("https://github.com/tree-sitter/tree-sitter-c-sharp.git", "cac6d5fb595f5811a076336682d5d595ac1c9e85", "TreeSitterCSharp"),
-    "tree-sitter-cpp": ("https://github.com/tree-sitter/tree-sitter-cpp", "f41e1a044c8a84ea9fa8577fdd2eab92ec96de02", "TreeSitterCPP"),
-    "tree-sitter-php": ("https://github.com/tree-sitter/tree-sitter-php.git", "5b5627faaa290d89eb3d01b9bf47c3bb9e797dea", "TreeSitterPHP"),
+    "tree-sitter-c": ("https://github.com/tree-sitter/tree-sitter-c", "0.24.2", "b780e47fc780ddc8da13afa35a3f4ed5c157823d", "TreeSitterC"),
+    "tree-sitter-dart": ("https://github.com/UserNobody14/tree-sitter-dart", None, "be07cf7118d3dba06236a3f19541685a68209934", "TreeSitterDart"),
+    "tree-sitter-go": ("https://github.com/tree-sitter/tree-sitter-go", "0.25.0", "1547678a9da59885853f5f5cc8a99cc203fa2e2c", "TreeSitterGo"),
+    "tree-sitter-java": ("https://github.com/tree-sitter/tree-sitter-java", "0.23.5", "94703d5a6bed02b98e438d7cad1136c01a60ba2c", "TreeSitterJava"),
+    "tree-sitter-javascript": ("https://github.com/tree-sitter/tree-sitter-javascript", "0.25.0", "44c892e0be055ac465d5eeddae6d3e194424e7de", "TreeSitterJavaScript"),
+    "tree-sitter-python": ("https://github.com/tree-sitter/tree-sitter-python", "0.25.0", "293fdc02038ee2bf0e2e206711b69c90ac0d413f", "TreeSitterPython"),
+    "tree-sitter-rust": ("https://github.com/tree-sitter/tree-sitter-rust", "0.24.2", "77a3747266f4d621d0757825e6b11edcbf991ca5", "TreeSitterRust"),
+    "tree-sitter-typescript": ("https://github.com/tree-sitter/tree-sitter-typescript", "0.23.2", "f975a621f4e7f532fe322e13c4f79495e0a7b2e7", "TreeSitterTypeScript"),
+    "tree-sitter-ruby": ("https://github.com/tree-sitter/tree-sitter-ruby", "0.23.1", "71bd32fb7607035768799732addba884a37a6210", "TreeSitterRuby"),
+    "tree-sitter-swift": ("https://github.com/alex-pinkus/tree-sitter-swift", "0.7.3-with-generated-files", "31d17fe7e818a2048c808b5c6fdc2dc792f4f5b5", "TreeSitterSwift"),
+    "tree-sitter-c-sharp": ("https://github.com/tree-sitter/tree-sitter-c-sharp.git", "0.23.5", "cac6d5fb595f5811a076336682d5d595ac1c9e85", "TreeSitterCSharp"),
+    "tree-sitter-cpp": ("https://github.com/tree-sitter/tree-sitter-cpp", "0.23.4", "f41e1a044c8a84ea9fa8577fdd2eab92ec96de02", "TreeSitterCPP"),
+    "tree-sitter-php": ("https://github.com/tree-sitter/tree-sitter-php.git", "0.24.2", "5b5627faaa290d89eb3d01b9bf47c3bb9e797dea", "TreeSitterPHP"),
 }
 errors = []
 manifest_text = Path("Package.swift").read_text()
@@ -192,16 +192,23 @@ for forbidden_consumer in ("RepoPrompt", "RepoPromptMCP", "RepoPromptShared", "R
 for product in package.get("products", []):
     if "RepoPromptWorkspaceCore" in product.get("targets", []): errors.append("RepoPromptWorkspaceCore must not be exposed as a package product")
 
-for identity, (url, revision, product) in expected_packages.items():
-    manifest_pin = f'.package(url: "{url}", revision: "{revision}")'
-    if manifest_pin not in manifest_text: errors.append(f"Package.swift missing exact pin: {identity} {revision}")
+for identity, (url, version, revision, product) in expected_packages.items():
+    requirement = f'exact: "{version}"' if version is not None else f'revision: "{revision}"'
+    manifest_pin = f'.package(url: "{url}", {requirement})'
+    if manifest_pin not in manifest_text:
+        errors.append(f"Package.swift missing exact pin: {identity} {version or revision}")
     pin = resolved_pins.get(identity)
+    state = pin.get("state", {}) if pin is not None else {}
     if pin is None:
         errors.append(f"Package.resolved missing pin: {identity}")
-    elif pin.get("location") != url or pin.get("state", {}).get("revision") != revision:
+    elif pin.get("location") != url or state.get("revision") != revision or state.get("version") != version:
         errors.append(f"Package.resolved pin drift: {identity}")
     if (product, identity) not in repo_prompt_code_map_core_products:
         errors.append(f"RepoPromptCodeMapCore missing upstream grammar product dependency: {product} ({identity})")
+
+dart = resolved_pins.get("tree-sitter-dart", {})
+if dart.get("state", {}) != {"revision": "be07cf7118d3dba06236a3f19541685a68209934"}:
+    errors.append("Dart must remain the canonical exact revision exception because it has no releases")
 
 wrapper = resolved_pins.get("swifttreesitter", {})
 if '.package(url: "https://github.com/ChimeHQ/SwiftTreeSitter", exact: "0.10.0")' not in manifest_text:
@@ -219,9 +226,9 @@ if runtime.get("location") != "https://github.com/tree-sitter/tree-sitter" or ru
 
 neon = resolved_pins.get("neon", {})
 if '.package(url: "https://github.com/ChimeHQ/Neon.git", revision: "07a325403534f4759c814aff0a58ac69144a524c")' not in manifest_text:
-    errors.append("Package.swift must retain the SwiftTreeSitter-0.10-compatible Neon revision")
-if neon.get("state", {}).get("revision") != "07a325403534f4759c814aff0a58ac69144a524c":
-    errors.append("Neon resolved revision drifted")
+    errors.append("Package.swift must retain the unreleased SwiftTreeSitter-0.10-compatible Neon revision; released Neon is older/incompatible")
+if neon.get("state", {}) != {"revision": "07a325403534f4759c814aff0a58ac69144a524c"}:
+    errors.append("Neon must remain an exact revision exception without a version or branch")
 
 support = targets.get("TreeSitterScannerSupport")
 if support is None:

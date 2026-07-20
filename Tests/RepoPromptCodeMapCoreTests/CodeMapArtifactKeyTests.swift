@@ -76,9 +76,7 @@ final class CodeMapArtifactKeyTests: XCTestCase {
             XCTAssertTrue(stableIDs.insert(descriptor.stableLanguageID).inserted, language.rawValue)
             XCTAssertEqual(descriptor.grammarRevision, registration.revision, language.rawValue)
             XCTAssertTrue(
-                packageManifest.contains(
-                    ".package(url: \"\(registration.packageURL)\", revision: \"\(registration.revision)\")"
-                ),
+                packageManifest.contains(expectedPackagePin(for: language, registration: registration)),
                 language.rawValue
             )
             XCTAssertEqual(descriptor.queryBytes, Data(registration.query.utf8), language.rawValue)
@@ -365,6 +363,30 @@ final class CodeMapArtifactKeyTests: XCTestCase {
         revision: String,
         query: String
     )
+
+    private func expectedPackagePin(
+        for language: LanguageType,
+        registration: ExpectedRegistration
+    ) -> String {
+        let version: String? = switch language {
+        case .c: "0.24.2"
+        case .cpp: "0.23.4"
+        case .c_sharp: "0.23.5"
+        case .go: "0.25.0"
+        case .java: "0.23.5"
+        case .js: "0.25.0"
+        case .python: "0.25.0"
+        case .rust: "0.24.2"
+        case .ts, .tsx: "0.23.2"
+        case .ruby: "0.23.1"
+        case .php: "0.24.2"
+        case .swift: "0.7.3-with-generated-files"
+        case .dart: nil
+        }
+        let requirement = version.map { "exact: \"\($0)\"" }
+            ?? "revision: \"\(registration.revision)\""
+        return ".package(url: \"\(registration.packageURL)\", \(requirement))"
+    }
 
     private static func canonicalOutcome(_ outcome: CodeMapSyntaxArtifactOutcome) throws -> String {
         let encoder = JSONEncoder()
