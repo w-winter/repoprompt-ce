@@ -27,9 +27,28 @@ enum ContextBuilderRunTerminalOutcome: Equatable {
     }
 }
 
-enum ContextBuilderRunWaiterResolution {
+enum ContextBuilderRunWaiterResolution: Equatable {
     case snapshot
     case cancellationError
+}
+
+struct ContextBuilderRunCancellationSettlementPolicy: Equatable {
+    let waiterResolution: ContextBuilderRunWaiterResolution
+    let saveHistory: Bool
+}
+
+enum ContextBuilderRunCancellationState: Equatable {
+    case none
+    case requested
+    case deferredUntilFinalContextCommitCompletes
+    case applied
+}
+
+enum ContextBuilderRunCancellationDisposition: Equatable {
+    case settleImmediately
+    case deferredUntilFinalContextCommitCompletes
+    case alreadyRequested
+    case terminal
 }
 
 enum ContextBuilderResponseDeliveryDrainOutcome: Equatable {
@@ -167,6 +186,8 @@ final class ContextBuilderRunRecord {
     private var continuation: CheckedContinuation<ContextBuilderAgentViewModel.MCPContextBuilderRunCompletion, Error>?
     private var provider: HeadlessAgentProvider?
     private(set) var finalContextCommitClaimed = false
+    private(set) var cancellationState = ContextBuilderRunCancellationState.none
+    private(set) var deferredCancellationSettlementPolicy: ContextBuilderRunCancellationSettlementPolicy?
     private(set) var terminalOutcome: ContextBuilderRunTerminalOutcome?
     private(set) var teardownStartedAt: Date?
     private(set) var teardownFinishedAt: Date?
@@ -209,8 +230,8 @@ final class ContextBuilderRunRecord {
         terminalOutcome != nil
     }
 
-    var canAcceptCancellation: Bool {
-        terminalOutcome == nil && !finalContextCommitClaimed
+    var hasDeferredCancellationPending: Bool {
+        cancellationState == .deferredUntilFinalContextCommitCompletes
     }
 
     var isTeardownPending: Bool {
@@ -219,9 +240,36 @@ final class ContextBuilderRunRecord {
 
     @discardableResult
     func claimFinalContextCommit() -> Bool {
-        guard terminalOutcome == nil, !finalContextCommitClaimed else { return false }
+        guard terminalOutcome == nil,
+              cancellationState == .none,
+              !finalContextCommitClaimed
+        else { return false }
         finalContextCommitClaimed = true
         return true
+    }
+
+    func requestCancellation(
+        deferredSettlementPolicy: ContextBuilderRunCancellationSettlementPolicy
+    ) -> ContextBuilderRunCancellationDisposition {
+        guard terminalOutcome == nil else { return .terminal }
+        guard cancellationState == .none else { return .alreadyRequested }
+
+        if finalContextCommitClaimed {
+            cancellationState = .deferredUntilFinalContextCommitCompletes
+            deferredCancellationSettlementPolicy = deferredSettlementPolicy
+            return .deferredUntilFinalContextCommitCompletes
+        }
+        cancellationState = .requested
+        return .settleImmediately
+    }
+
+    func consumeDeferredCancellationAtSafeBoundary() -> ContextBuilderRunCancellationSettlementPolicy? {
+        guard terminalOutcome == nil,
+              cancellationState == .deferredUntilFinalContextCommitCompletes,
+              let deferredCancellationSettlementPolicy
+        else { return nil }
+        cancellationState = .applied
+        return deferredCancellationSettlementPolicy
     }
 
     @discardableResult

@@ -527,14 +527,8 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     "Context Builder run complete, building selection..."
                 )
 
-                let resultTab: ComposeTabState
-                switch snapshot.terminalDisposition {
-                case .completed:
-                    guard let committedTab = snapshot.committedTab else {
-                        throw MCPError.internalError(
-                            "Context Builder completed without an exact committed tab snapshot"
-                        )
-                    }
+                let committedResultTab: ComposeTabState?
+                if let committedTab = snapshot.committedTab {
                     guard committedTab.nestedRunID == snapshot.runID,
                           committedTab.identity == resolvedIdentity,
                           committedTab.tab.id == finalTabID
@@ -543,36 +537,52 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                             "Context Builder committed tab identity does not match the completed run"
                         )
                     }
-                    let canonicalState = await MainActor.run { () -> (ComposeTabState?, UInt64) in
-                        let manager = targetWindow.workspaceManager
-                        return (
-                            manager.composeTab(for: committedTab.identity),
-                            manager.selectionRevisionForMCP(
-                                workspaceID: committedTab.identity.workspaceID,
-                                tabID: committedTab.identity.tabID
+                    if snapshot.terminalDisposition == .completed {
+                        let canonicalState = await MainActor.run { () -> (ComposeTabState?, UInt64) in
+                            let manager = targetWindow.workspaceManager
+                            return (
+                                manager.composeTab(for: committedTab.identity),
+                                manager.selectionRevisionForMCP(
+                                    workspaceID: committedTab.identity.workspaceID,
+                                    tabID: committedTab.identity.tabID
+                                )
                             )
-                        )
-                    }
-                    let committedSnapshotIsCurrent: Bool = if responseType == .review {
-                        canonicalState.1 == committedTab.selectionRevision
-                            && canonicalState.0?.selection == committedTab.tab.selection
-                    } else {
-                        canonicalState.1 >= committedTab.selectionRevision
-                            && (
-                                canonicalState.1 != committedTab.selectionRevision
-                                    || canonicalState.0?.selection == committedTab.tab.selection
+                        }
+                        let committedSnapshotIsCurrent: Bool = if responseType == .review {
+                            canonicalState.1 == committedTab.selectionRevision
+                                && canonicalState.0?.selection == committedTab.tab.selection
+                        } else {
+                            canonicalState.1 >= committedTab.selectionRevision
+                                && (
+                                    canonicalState.1 != committedTab.selectionRevision
+                                        || canonicalState.0?.selection == committedTab.tab.selection
+                                )
+                        }
+                        guard committedSnapshotIsCurrent else {
+                            throw MCPError.internalError(
+                                "Context Builder committed tab snapshot is no longer valid"
                             )
+                        }
                     }
-                    guard committedSnapshotIsCurrent else {
+                    committedResultTab = committedTab.tab
+                } else {
+                    committedResultTab = nil
+                }
+
+                let resultTab: ComposeTabState
+                switch snapshot.terminalDisposition {
+                case .completed:
+                    guard let committedResultTab else {
                         throw MCPError.internalError(
-                            "Context Builder committed tab snapshot is no longer valid"
+                            "Context Builder completed without an exact committed tab snapshot"
                         )
                     }
-                    resultTab = committedTab.tab
+                    resultTab = committedResultTab
                 case .cancelled, .failed:
-                    // Genuine discovery failures retain the exact immutable pre-run tab instead of
-                    // falling back to an active or duplicate tab after child cleanup.
-                    resultTab = initialResultTab
+                    // Cancellation or failure after a successful commit must report the exact
+                    // committed prompt and selection. Pre-commit outcomes retain the immutable
+                    // initial tab instead of consulting mutable active-tab state.
+                    resultTab = committedResultTab ?? initialResultTab
                 }
 
                 let overrides = resultTab.contextOverrides

@@ -30,10 +30,10 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
 
         await Task.yield()
         let record = try XCTUnwrap(capturedRecord)
-        XCTAssertTrue(record.canAcceptCancellation)
+        XCTAssertEqual(record.cancellationState, .none)
         XCTAssertTrue(record.claimFinalContextCommit())
         XCTAssertTrue(record.finalContextCommitClaimed)
-        XCTAssertFalse(record.canAcceptCancellation)
+        XCTAssertEqual(record.cancellationState, .none)
         XCTAssertFalse(record.claimFinalContextCommit())
         XCTAssertTrue(record.claimTerminal(.completed))
         XCTAssertFalse(record.claimTerminal(.cancelled))
@@ -57,6 +57,144 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         let snapshot = try await waiter.value
         XCTAssertEqual(snapshot.runID, record.runID)
         XCTAssertEqual(snapshot.agentOutput, "done")
+    }
+
+    func testCancellationDuringFinalCommitDefersUntilSafeBoundary() {
+        let tabID = UUID()
+        let session = ContextBuilderAgentViewModel.TabSession(tabID: tabID)
+        let record = makeRecord(
+            tabID: tabID,
+            session: session,
+            ownership: session.beginRunAttempt(source: "deferred-cancel")
+        )
+        let settlementPolicy = ContextBuilderRunCancellationSettlementPolicy(
+            waiterResolution: .snapshot,
+            saveHistory: true
+        )
+
+        XCTAssertTrue(record.claimFinalContextCommit())
+        XCTAssertEqual(
+            record.requestCancellation(deferredSettlementPolicy: settlementPolicy),
+            .deferredUntilFinalContextCommitCompletes
+        )
+        XCTAssertEqual(record.cancellationState, .deferredUntilFinalContextCommitCompletes)
+        XCTAssertEqual(record.deferredCancellationSettlementPolicy, settlementPolicy)
+        XCTAssertTrue(record.hasDeferredCancellationPending)
+        XCTAssertEqual(
+            record.requestCancellation(deferredSettlementPolicy: settlementPolicy),
+            .alreadyRequested
+        )
+
+        XCTAssertEqual(record.consumeDeferredCancellationAtSafeBoundary(), settlementPolicy)
+        XCTAssertEqual(record.cancellationState, .applied)
+        XCTAssertNil(record.consumeDeferredCancellationAtSafeBoundary())
+        XCTAssertTrue(record.claimTerminal(.cancelled))
+        XCTAssertFalse(record.claimTerminal(.completed))
+    }
+
+    func testDeferredWorkspaceCancellationPreservesErrorPolicyAfterCommitBoundaryCheck() {
+        let tabID = UUID()
+        let session = ContextBuilderAgentViewModel.TabSession(tabID: tabID)
+        let record = makeRecord(
+            tabID: tabID,
+            session: session,
+            ownership: session.beginRunAttempt(source: "workspace-cancel")
+        )
+        let workspaceCancellationPolicy = ContextBuilderRunCancellationSettlementPolicy(
+            waiterResolution: .cancellationError,
+            saveHistory: false
+        )
+
+        XCTAssertTrue(record.claimFinalContextCommit())
+        XCTAssertNil(record.consumeDeferredCancellationAtSafeBoundary())
+        XCTAssertEqual(
+            record.requestCancellation(deferredSettlementPolicy: workspaceCancellationPolicy),
+            .deferredUntilFinalContextCommitCompletes
+        )
+        XCTAssertEqual(
+            record.consumeDeferredCancellationAtSafeBoundary(),
+            workspaceCancellationPolicy
+        )
+        XCTAssertTrue(record.claimTerminal(.cancelled))
+        XCTAssertFalse(record.claimTerminal(.completed))
+    }
+
+    func testCancelCommitRaceResolvesExactlyOnceForEitherOrdering() {
+        let settlementPolicy = ContextBuilderRunCancellationSettlementPolicy(
+            waiterResolution: .snapshot,
+            saveHistory: true
+        )
+        let cancelFirstTabID = UUID()
+        let cancelFirstSession = ContextBuilderAgentViewModel.TabSession(tabID: cancelFirstTabID)
+        let cancelFirst = makeRecord(
+            tabID: cancelFirstTabID,
+            session: cancelFirstSession,
+            ownership: cancelFirstSession.beginRunAttempt(source: "cancel-first")
+        )
+
+        XCTAssertEqual(
+            cancelFirst.requestCancellation(deferredSettlementPolicy: settlementPolicy),
+            .settleImmediately
+        )
+        XCTAssertFalse(cancelFirst.claimFinalContextCommit())
+        XCTAssertTrue(cancelFirst.claimTerminal(.cancelled))
+        XCTAssertFalse(cancelFirst.claimTerminal(.completed))
+        XCTAssertEqual(
+            cancelFirst.requestCancellation(deferredSettlementPolicy: settlementPolicy),
+            .terminal
+        )
+
+        let commitFirstTabID = UUID()
+        let commitFirstSession = ContextBuilderAgentViewModel.TabSession(tabID: commitFirstTabID)
+        let commitFirst = makeRecord(
+            tabID: commitFirstTabID,
+            session: commitFirstSession,
+            ownership: commitFirstSession.beginRunAttempt(source: "commit-first")
+        )
+
+        XCTAssertTrue(commitFirst.claimFinalContextCommit())
+        XCTAssertEqual(
+            commitFirst.requestCancellation(deferredSettlementPolicy: settlementPolicy),
+            .deferredUntilFinalContextCommitCompletes
+        )
+        XCTAssertEqual(
+            commitFirst.consumeDeferredCancellationAtSafeBoundary(),
+            settlementPolicy
+        )
+        XCTAssertTrue(commitFirst.claimTerminal(.cancelled))
+        XCTAssertFalse(commitFirst.claimTerminal(.completed))
+        XCTAssertEqual(
+            commitFirst.requestCancellation(deferredSettlementPolicy: settlementPolicy),
+            .terminal
+        )
+    }
+
+    func testPreCommitCancellationRemainsImmediate() {
+        let tabID = UUID()
+        let session = ContextBuilderAgentViewModel.TabSession(tabID: tabID)
+        let record = makeRecord(
+            tabID: tabID,
+            session: session,
+            ownership: session.beginRunAttempt(source: "pre-commit-cancel")
+        )
+        let settlementPolicy = ContextBuilderRunCancellationSettlementPolicy(
+            waiterResolution: .cancellationError,
+            saveHistory: false
+        )
+
+        XCTAssertEqual(
+            record.requestCancellation(deferredSettlementPolicy: settlementPolicy),
+            .settleImmediately
+        )
+        XCTAssertEqual(record.cancellationState, .requested)
+        XCTAssertNil(record.deferredCancellationSettlementPolicy)
+        XCTAssertFalse(record.hasDeferredCancellationPending)
+        XCTAssertFalse(record.claimFinalContextCommit())
+        XCTAssertTrue(record.claimTerminal(.cancelled))
+        XCTAssertEqual(
+            record.requestCancellation(deferredSettlementPolicy: settlementPolicy),
+            .terminal
+        )
     }
 
     func testTerminalCommitCapturesPromptFallbackBeforeContextCleanup() async throws {
