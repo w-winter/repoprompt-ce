@@ -755,14 +755,100 @@ enum SwiftCodeMapStrategy {
     }
 
     private static func extractSwiftParamType(from paramText: String) -> String? {
-        guard let colonIndex = paramText.firstIndex(of: ":") else { return nil }
-        var afterColon = paramText[paramText.index(after: colonIndex)...]
-        if let eqIndex = afterColon.firstIndex(of: "=") {
+        let parameter = paramText[...]
+        guard let colonIndex = firstTopLevelSwiftDelimiter(":", in: parameter) else { return nil }
+        var afterColon = parameter[parameter.index(after: colonIndex)...]
+        if let eqIndex = firstTopLevelSwiftDelimiter("=", in: afterColon) {
             afterColon = afterColon[..<eqIndex]
         }
         let trimmed = afterColon.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
+
+	private static func firstTopLevelSwiftDelimiter(
+		_ target: Character,
+		in text: Substring
+	) -> String.Index? {
+		let characters = Array(text)
+		var delimiterStack: [Character] = []
+		var stringDelimiter: (pounds: Int, quotes: Int)?
+		var offset = 0
+
+		while offset < characters.count {
+			if let activeStringDelimiter = stringDelimiter {
+				if characters[offset] == "\\", activeStringDelimiter.pounds == 0 {
+					offset = min(offset + 2, characters.count)
+					continue
+				}
+				if isSwiftStringTerminator(
+					at: offset,
+					characters: characters,
+					delimiter: activeStringDelimiter
+				) {
+					offset += activeStringDelimiter.quotes + activeStringDelimiter.pounds
+					stringDelimiter = nil
+					continue
+				}
+				offset += 1
+				continue
+			}
+
+			if let opening = swiftStringDelimiterStarting(at: offset, characters: characters) {
+				stringDelimiter = (opening.pounds, opening.quotes)
+				offset += opening.pounds + opening.quotes
+				continue
+			}
+
+			let character = characters[offset]
+			switch character {
+			case "(", "[", "{":
+				delimiterStack.append(character)
+			case ")":
+				if delimiterStack.last == "(" { delimiterStack.removeLast() }
+			case "]":
+				if delimiterStack.last == "[" { delimiterStack.removeLast() }
+			case "}":
+				if delimiterStack.last == "{" { delimiterStack.removeLast() }
+			default:
+				if character == target, delimiterStack.isEmpty {
+					return text.index(text.startIndex, offsetBy: offset)
+				}
+			}
+			offset += 1
+		}
+
+		return nil
+	}
+
+	private static func swiftStringDelimiterStarting(
+		at offset: Int,
+		characters: [Character]
+	) -> (pounds: Int, quotes: Int)? {
+		var quoteOffset = offset
+		while quoteOffset < characters.count, characters[quoteOffset] == "#" {
+			quoteOffset += 1
+		}
+		guard quoteOffset < characters.count, characters[quoteOffset] == "\"" else { return nil }
+		let quoteCount = quoteOffset + 2 < characters.count &&
+			characters[quoteOffset + 1] == "\"" && characters[quoteOffset + 2] == "\"" ? 3 : 1
+		return (quoteOffset - offset, quoteCount)
+	}
+
+	private static func isSwiftStringTerminator(
+		at offset: Int,
+		characters: [Character],
+		delimiter: (pounds: Int, quotes: Int)
+	) -> Bool {
+		guard offset + delimiter.quotes + delimiter.pounds <= characters.count else { return false }
+		for quoteOffset in 0 ..< delimiter.quotes where characters[offset + quoteOffset] != "\"" {
+			return false
+		}
+		for poundOffset in 0 ..< delimiter.pounds
+		where characters[offset + delimiter.quotes + poundOffset] != "#" {
+			return false
+		}
+		return true
+	}
 
 	private static func extractSwiftReturnType(from signature: String, perfStats: CodeMapPerformanceCollector? = nil) -> String? {
         if let fast = SwiftSignatureParser.extractReturnType(from: signature) {

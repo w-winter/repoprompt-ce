@@ -195,6 +195,20 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
         XCTAssertEqual(tsxCollector.tsDuplicateFunctionVariableSuppressions, 1)
     }
 
+    func testSwiftParameterFallbackSkipsNestedAttributeColons() throws {
+        let source = """
+        struct Example {
+            func wrapped(@Wrapper(label: "x:y") value: Int = 42) {}
+        }
+        """
+        let artifact = try build(source: source, language: .swift)
+        let example = try XCTUnwrap(artifact.classes.first { $0.name == "Example" })
+        let wrapped = try XCTUnwrap(example.methods.first { $0.name == "wrapped" })
+
+        XCTAssertEqual(wrapped.parameters.map(\.localName), ["value"])
+        XCTAssertEqual(wrapped.parameters.map(\.typeName), ["Int"])
+    }
+
     func testTypeScriptUncontainedMembersFallThroughBeforeExtraction() throws {
         let source = """
         class Example {

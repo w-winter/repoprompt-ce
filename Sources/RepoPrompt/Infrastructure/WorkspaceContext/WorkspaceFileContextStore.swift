@@ -421,6 +421,9 @@ actor WorkspaceFileContextStore {
                         lock.unlock()
                         deadlineTask.cancel()
                     }
+                    if Task.isCancelled {
+                        resume(waiterID)
+                    }
                 }
             } onCancel: {
                 self.resume(waiterID)
