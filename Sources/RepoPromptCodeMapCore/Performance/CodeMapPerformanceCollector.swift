@@ -143,6 +143,9 @@ package final class CodeMapPerformanceCollector {
     package var captureDeclarationCalls = 0
     package var jstsSignatureCallsFunctionLike = 0
     package var jstsSignatureCallsStatementLike = 0
+    package var jstsNormalizationASCIINoOpCount = 0
+    package var jstsNormalizationASCIIRewriteCount = 0
+    package var jstsNormalizationUnicodeFallbackCount = 0
 
     // LanguageTypeExtractor
     package var lteMatchAnyFunctionCalls = 0
@@ -250,6 +253,8 @@ package final class CodeMapPerformanceCollector {
     package var fallbackFunctionSkippedDuration: TimeInterval = 0
     package var captureDeclarationDuration: TimeInterval = 0
     package var jstsSignatureDuration: TimeInterval = 0
+    package var jstsNormalizationASCIIFastPathDuration: TimeInterval = 0
+    package var jstsNormalizationLegacyFallbackDuration: TimeInterval = 0
     package var languageTypeExtractorFunctionDuration: TimeInterval = 0
     package var languageTypeExtractorVariableDuration: TimeInterval = 0
     package var typeCleanerDuration: TimeInterval = 0

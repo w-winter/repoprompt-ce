@@ -368,6 +368,196 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
         #endif
     }
 
+    func testJSTSSignatureNormalizerMatchesLegacyBehavior() {
+        let cases: [(name: String, input: String, expected: String)] = [
+            ("empty", "", ""),
+            ("already normalized", "function value(input: string): string", "function value(input: string): string"),
+            ("no whitespace", "constValue", "constValue"),
+            ("spaces", "  const   value: string  ", "const value: string"),
+            ("tab", "const\tvalue: string", "const value: string"),
+            ("newline", "const\nvalue: string", "const value: string"),
+            ("vertical tab", "const\u{000B}value: string", "const value: string"),
+            ("form feed", "const\u{000C}value: string", "const value: string"),
+            ("carriage return", "const\rvalue: string", "const value: string"),
+            ("mixed whitespace", "\tconst \n\u{000B}\u{000C}\r value: string\r\n", "const value: string"),
+            ("one semicolon", "const value: string;", "const value: string"),
+            ("space before semicolon", "const value: string ;", "const value: string"),
+            ("two semicolons", "const value: string;;", "const value: string;"),
+            ("three semicolons", "const value: string;;;", "const value: string;;"),
+            ("semicolon only", ";", ""),
+            ("arrow", "const map = ( value: T ): U =>", "const map = ( value: T ): U =>"),
+            ("generic", "method<T extends { value: string }>(input: T): Promise<T>", "method<T extends { value: string }>(input: T): Promise<T>"),
+            ("object literal", "type Payload = { value: string; count: number };", "type Payload = { value: string; count: number }"),
+            ("union", "type State = Ready | Pending | Failed;", "type State = Ready | Pending | Failed"),
+            ("conditional", "type Pick<T> = T extends string ? Text<T> : Other<T>;", "type Pick<T> = T extends string ? Text<T> : Other<T>"),
+            ("template", "const value = `a  b; ${item}`;", "const value = `a b; ${item}`"),
+            ("line comment", "const value = 1; //  comment", "const value = 1; // comment"),
+            ("block comment", "const value = /*  comment  */ 1;", "const value = /* comment */ 1"),
+            ("JSX", "const view = <section  data-id=\"x\"> {value} </section>;", "const view = <section data-id=\"x\"> {value} </section>"),
+            ("string default", #"function value(text = "a  b;")"#, #"function value(text = "a b;")"#),
+            ("template default", "function value(text = `a  b;`)", "function value(text = `a b;`)")
+        ]
+
+        for testCase in cases {
+            let legacy = JSTSSignatureExtractor.normalizeSingleLineLegacy(testCase.input)
+            XCTAssertEqual(legacy, testCase.expected, "legacy: \(testCase.name)")
+            XCTAssertEqual(
+                JSTSSignatureExtractor.normalizeSingleLine(testCase.input),
+                legacy,
+                testCase.name
+            )
+        }
+    }
+
+    func testJSTSSignatureNormalizerUnicodeUsesLegacyFallback() {
+        let inputs = [
+            "const café: Type = value;",
+            "const value: Café = item;",
+            "const\u{00A0}value: Type = item;",
+            "const\u{2003}value: Type = item;",
+            "const emoji = \"🙂  value;\";",
+            "前  const value: Type;",
+            "const value: Type;  後",
+        ]
+        let collector = CodeMapPerformanceCollector()
+
+        for input in inputs {
+            XCTAssertEqual(
+                JSTSSignatureExtractor.normalizeSingleLine(
+                    input,
+                    perfStats: collector,
+                    perfOptions: .countersOnly
+                ),
+                JSTSSignatureExtractor.normalizeSingleLineLegacy(input),
+                String(reflecting: input)
+            )
+        }
+
+        XCTAssertEqual(collector.jstsNormalizationASCIINoOpCount, 0)
+        XCTAssertEqual(collector.jstsNormalizationASCIIRewriteCount, 0)
+        XCTAssertEqual(collector.jstsNormalizationUnicodeFallbackCount, inputs.count)
+        XCTAssertGreaterThanOrEqual(collector.jstsNormalizationLegacyFallbackDuration, 0)
+    }
+
+    func testJSTSSignatureNormalizerGeneratedASCIIEquivalenceAndCounters() {
+        let alphabet = Array("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_".utf8) + [
+            0x20, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x22, 0x27, 0x60, 0x2F, 0x5C,
+            0x28, 0x29, 0x5B, 0x5D, 0x7B, 0x7D, 0x3C, 0x3E,
+            0x3A, 0x3D, 0x2D, 0x2C, 0x2E, 0x3F, 0x21, 0x26, 0x7C, 0x3B,
+        ]
+        let caseCount = 2_000
+        var state: UInt64 = 0xA5C1_17E5_51A6_0001
+        let collector = CodeMapPerformanceCollector()
+
+        func nextRandom() -> UInt64 {
+            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return state
+        }
+
+        for caseIndex in 0 ..< caseCount {
+            let input: String
+            switch caseIndex {
+            case 0:
+                input = "function value(input: string): string"
+            case 1:
+                input = "  function\tvalue( input: string );  "
+            default:
+                let length = Int(nextRandom() % 161)
+                var bytes: [UInt8] = []
+                bytes.reserveCapacity(length)
+                for _ in 0 ..< length {
+                    bytes.append(alphabet[Int(nextRandom() % UInt64(alphabet.count))])
+                }
+                input = String(decoding: bytes, as: UTF8.self)
+            }
+
+            XCTAssertEqual(
+                JSTSSignatureExtractor.normalizeSingleLine(
+                    input,
+                    perfStats: collector,
+                    perfOptions: .countersOnly
+                ),
+                JSTSSignatureExtractor.normalizeSingleLineLegacy(input),
+                "generated case \(caseIndex): \(String(reflecting: input))"
+            )
+        }
+
+        XCTAssertGreaterThan(collector.jstsNormalizationASCIINoOpCount, 0)
+        XCTAssertGreaterThan(collector.jstsNormalizationASCIIRewriteCount, 0)
+        XCTAssertEqual(collector.jstsNormalizationUnicodeFallbackCount, 0)
+        XCTAssertEqual(
+            collector.jstsNormalizationASCIINoOpCount +
+                collector.jstsNormalizationASCIIRewriteCount,
+            caseCount
+        )
+        XCTAssertGreaterThanOrEqual(collector.jstsNormalizationASCIIFastPathDuration, 0)
+        XCTAssertEqual(collector.jstsNormalizationLegacyFallbackDuration, 0)
+    }
+
+    func testJSTSSignatureNormalizerRoutesSharedJavaScriptTypeScriptAndTSXPipeline() throws {
+        let cases: [(name: String, language: LanguageType, source: String)] = [
+            (
+                "javascript",
+                .js,
+                """
+                export function run(value) { return value; }
+                export const payload = value;
+                """
+            ),
+            (
+                "typescript",
+                .ts,
+                """
+                export interface Example {
+                    value: string;
+                    run(input: string): Promise<string>;
+                }
+                export const transform = (input: string): string => input;
+                """
+            ),
+            (
+                "tsx",
+                .tsx,
+                """
+                export interface Props {
+                    title: string;
+                }
+                export function Card(props: Props): JSX.Element {
+                    return <section>{props.title}</section>;
+                }
+                """
+            ),
+        ]
+
+        for testCase in cases {
+            let collector = CodeMapPerformanceCollector()
+            _ = try build(
+                source: testCase.source,
+                language: testCase.language,
+                options: .countersOnly,
+                collector: collector
+            )
+
+            let extractorCalls = collector.jstsSignatureCallsFunctionLike +
+                collector.jstsSignatureCallsStatementLike
+            let normalizationRoutes = collector.jstsNormalizationASCIINoOpCount +
+                collector.jstsNormalizationASCIIRewriteCount +
+                collector.jstsNormalizationUnicodeFallbackCount
+            XCTAssertGreaterThan(extractorCalls, 0, testCase.name)
+            XCTAssertEqual(normalizationRoutes, extractorCalls, testCase.name)
+            XCTAssertGreaterThan(
+                collector.jstsNormalizationASCIINoOpCount +
+                    collector.jstsNormalizationASCIIRewriteCount,
+                0,
+                testCase.name
+            )
+            XCTAssertEqual(collector.jstsNormalizationUnicodeFallbackCount, 0, testCase.name)
+            XCTAssertGreaterThanOrEqual(collector.jstsNormalizationASCIIFastPathDuration, 0, testCase.name)
+            XCTAssertEqual(collector.jstsNormalizationLegacyFallbackDuration, 0, testCase.name)
+        }
+    }
+
     func testSwiftSignatureWhitespaceNormalizerMatchesLegacyBehavior() {
         let cases: [(name: String, input: String)] = [
             ("space run", "func  value()"),
@@ -1073,6 +1263,19 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
             )
             let repeatArtifactEquality = attributedArtifact == expectedArtifact
             XCTAssertTrue(repeatArtifactEquality)
+            if benchmark.language == .ts || benchmark.language == .tsx {
+                XCTAssertEqual(
+                    collector.jstsNormalizationASCIINoOpCount +
+                        collector.jstsNormalizationASCIIRewriteCount +
+                        collector.jstsNormalizationUnicodeFallbackCount,
+                    collector.jstsSignatureCallsFunctionLike + collector.jstsSignatureCallsStatementLike
+                )
+                XCTAssertGreaterThan(
+                    collector.jstsNormalizationASCIINoOpCount +
+                        collector.jstsNormalizationASCIIRewriteCount,
+                    0
+                )
+            }
 
             var record = [
                 "CODEMAP_PREMATERIALIZED_GENERATOR_BENCHMARK",
@@ -1126,6 +1329,19 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
             XCTAssertTrue(repeatArtifactEquality)
             XCTAssertEqual(collector.syntaxQueryExecutes, 1)
             XCTAssertGreaterThan(collector.syntaxCaptures, 0)
+            if benchmark.language == .ts || benchmark.language == .tsx {
+                XCTAssertEqual(
+                    collector.jstsNormalizationASCIINoOpCount +
+                        collector.jstsNormalizationASCIIRewriteCount +
+                        collector.jstsNormalizationUnicodeFallbackCount,
+                    collector.jstsSignatureCallsFunctionLike + collector.jstsSignatureCallsStatementLike
+                )
+                XCTAssertGreaterThan(
+                    collector.jstsNormalizationASCIINoOpCount +
+                        collector.jstsNormalizationASCIIRewriteCount,
+                    0
+                )
+            }
 
             var record = [
                 "CODEMAP_QUERY_BENCHMARK",
@@ -1387,6 +1603,8 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
             "capture_loop_ms=\(milliseconds(collector.captureLoopDuration))",
             "ts_loop_ms=\(milliseconds(collector.captureLoopTSStrategyDuration))",
             "jsts_ms=\(milliseconds(collector.jstsSignatureDuration))",
+            "jsts_normalization_ascii_ms=\(milliseconds(collector.jstsNormalizationASCIIFastPathDuration))",
+            "jsts_normalization_legacy_ms=\(milliseconds(collector.jstsNormalizationLegacyFallbackDuration))",
             "lte_function_ms=\(milliseconds(collector.languageTypeExtractorFunctionDuration))",
             "lte_variable_ms=\(milliseconds(collector.languageTypeExtractorVariableDuration))",
             "type_cleaner_ms=\(milliseconds(collector.typeCleanerDuration))",
@@ -1398,6 +1616,9 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
             "ts_strategy_handled=\(collector.tsStrategyHandled)",
             "jsts_function_calls=\(collector.jstsSignatureCallsFunctionLike)",
             "jsts_statement_calls=\(collector.jstsSignatureCallsStatementLike)",
+            "jsts_normalization_ascii_noop=\(collector.jstsNormalizationASCIINoOpCount)",
+            "jsts_normalization_ascii_rewrite=\(collector.jstsNormalizationASCIIRewriteCount)",
+            "jsts_normalization_unicode_fallback=\(collector.jstsNormalizationUnicodeFallbackCount)",
             "lte_function_calls=\(collector.lteMatchAnyFunctionCalls)",
             "lte_variable_calls=\(collector.lteMatchAnyVariableCalls)",
             "ts_duplicate_suppressions=\(collector.tsDuplicateFunctionVariableSuppressions)",

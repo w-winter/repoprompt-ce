@@ -84,6 +84,8 @@ struct CodeMapPipelinePerfSnapshot: Equatable {
     var generatorFallbackFunctionSkippedDuration: TimeInterval = 0
     var generatorDeclarationExtractionDuration: TimeInterval = 0
     var generatorJSTSSignatureDuration: TimeInterval = 0
+    var generatorJSTSNormalizationASCIIFastPathDuration: TimeInterval = 0
+    var generatorJSTSNormalizationLegacyFallbackDuration: TimeInterval = 0
     var generatorLanguageTypeExtractorFunctionDuration: TimeInterval = 0
     var generatorLanguageTypeExtractorVariableDuration: TimeInterval = 0
     var generatorTypeCleanerDuration: TimeInterval = 0
@@ -162,6 +164,9 @@ struct CodeMapPipelinePerfSnapshot: Equatable {
     var captureDeclarationCalls = 0
     var jstsSignatureCallsFunctionLike = 0
     var jstsSignatureCallsStatementLike = 0
+    var jstsNormalizationASCIINoOpCount = 0
+    var jstsNormalizationASCIIRewriteCount = 0
+    var jstsNormalizationUnicodeFallbackCount = 0
     var lteMatchAnyFunctionCalls = 0
     var lteMatchAnyVariableCalls = 0
     var typeCleanerExtractCalls = 0
@@ -313,6 +318,8 @@ final class CodeMapPipelinePerfStats: @unchecked Sendable {
             storage.generatorFallbackFunctionSkippedDuration += stats.fallbackFunctionSkippedDuration
             storage.generatorDeclarationExtractionDuration += stats.captureDeclarationDuration
             storage.generatorJSTSSignatureDuration += stats.jstsSignatureDuration
+            storage.generatorJSTSNormalizationASCIIFastPathDuration += stats.jstsNormalizationASCIIFastPathDuration
+            storage.generatorJSTSNormalizationLegacyFallbackDuration += stats.jstsNormalizationLegacyFallbackDuration
             storage.generatorLanguageTypeExtractorFunctionDuration += stats.languageTypeExtractorFunctionDuration
             storage.generatorLanguageTypeExtractorVariableDuration += stats.languageTypeExtractorVariableDuration
             storage.generatorTypeCleanerDuration += stats.typeCleanerDuration
@@ -374,6 +381,9 @@ final class CodeMapPipelinePerfStats: @unchecked Sendable {
             storage.captureDeclarationCalls += stats.captureDeclarationCalls
             storage.jstsSignatureCallsFunctionLike += stats.jstsSignatureCallsFunctionLike
             storage.jstsSignatureCallsStatementLike += stats.jstsSignatureCallsStatementLike
+            storage.jstsNormalizationASCIINoOpCount += stats.jstsNormalizationASCIINoOpCount
+            storage.jstsNormalizationASCIIRewriteCount += stats.jstsNormalizationASCIIRewriteCount
+            storage.jstsNormalizationUnicodeFallbackCount += stats.jstsNormalizationUnicodeFallbackCount
             storage.lteMatchAnyFunctionCalls += stats.lteMatchAnyFunctionCalls
             storage.lteMatchAnyVariableCalls += stats.lteMatchAnyVariableCalls
             storage.typeCleanerExtractCalls += stats.typeCleanerExtractCalls

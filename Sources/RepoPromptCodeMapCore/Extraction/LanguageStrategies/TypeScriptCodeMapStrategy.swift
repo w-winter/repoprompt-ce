@@ -454,13 +454,12 @@ enum TypeScriptCodeMapStrategy {
     ) -> String {
 		let activePerfStats = perfStats
 		let activePerfOptions = perfOptions
-        let extracted = extractionMemo.jstsSignature(
+		return extractionMemo.jstsSignature(
             from: line,
             context: context,
             perfStats: activePerfStats,
             perfOptions: activePerfOptions
         )
-        return extracted.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func stripTSInitializer(_ line: String) -> String {
