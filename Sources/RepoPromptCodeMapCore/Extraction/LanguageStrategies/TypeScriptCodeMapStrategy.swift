@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import SwiftTreeSitter
 
 /// TypeScript/TSX-specific code map generation strategy.
 /// Handles TS class/interface declarations and members using range-based containment.
@@ -46,8 +45,8 @@ enum TypeScriptCodeMapStrategy {
         )
 
         func mapNamesToSmallestContainingDecl(
-            nameCaps: [NamedRange],
-            declCaps: [NamedRange]
+            nameCaps: [CodeMapIndexedCapture],
+            declCaps: [CodeMapIndexedCapture]
         ) -> [NSRange: String] {
             var mapping: [NSRange: String] = [:]
             guard !nameCaps.isEmpty, !declCaps.isEmpty else { return mapping }
@@ -55,7 +54,7 @@ enum TypeScriptCodeMapStrategy {
             let orderedDecls = declCaps
             let orderedNames = nameCaps
 
-            var stack: [NamedRange] = []
+            var stack: [CodeMapIndexedCapture] = []
             var declIndex = 0
 
             for nameCap in orderedNames {
@@ -80,7 +79,7 @@ enum TypeScriptCodeMapStrategy {
                 }
 
                 // Fallback scan (should be rare if ranges are nested)
-                var bestDecl: NamedRange? = nil
+                var bestDecl: CodeMapIndexedCapture? = nil
                 for decl in orderedDecls where rangeContains(decl.range, nameCap.range) {
                     if bestDecl == nil || decl.range.length < bestDecl!.range.length {
                         bestDecl = decl
@@ -147,7 +146,7 @@ enum TypeScriptCodeMapStrategy {
 
     /// Handles a TS-specific capture. Returns true if handled, false to fall through to default handling.
     static func handleCapture(
-        _ cap: NamedRange,
+        _ cap: CodeMapIndexedCapture,
         context: Context,
         index: CodeMapCaptureIndex,
         content: String,

@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import SwiftTreeSitter
 
 /// Swift-specific code map generation strategy.
 /// Handles Swift type declarations, protocols, functions, and properties using range-based containment.
@@ -38,7 +37,7 @@ enum SwiftCodeMapStrategy {
         var typeBoundaries: [TypeBoundary] = []
         var typeNamesByRange: [NSRange: String] = [:]
         var protocolNamesByRange: [NSRange: String] = [:]
-        var functionCaptures: [NamedRange] = []
+        var functionCaptures: [CodeMapIndexedCapture] = []
     }
 
     private enum SwiftStrategyAttributionCategory {
@@ -103,13 +102,13 @@ enum SwiftCodeMapStrategy {
         let nsContent = content as NSString
 
         func mapNamesToSmallestContainingDecl(
-            nameCaps: [NamedRange],
-            declCaps: [NamedRange]
+            nameCaps: [CodeMapIndexedCapture],
+            declCaps: [CodeMapIndexedCapture]
         ) -> [NSRange: String] {
             var mapping: [NSRange: String] = [:]
             guard !nameCaps.isEmpty, !declCaps.isEmpty else { return mapping }
 
-            var stack: [NamedRange] = []
+            var stack: [CodeMapIndexedCapture] = []
             var declIndex = 0
 
             for nameCap in nameCaps {
@@ -134,7 +133,7 @@ enum SwiftCodeMapStrategy {
                 }
 
                 // Fallback scan (should be rare if ranges are nested)
-                var bestDecl: NamedRange? = nil
+                var bestDecl: CodeMapIndexedCapture? = nil
                 for decl in declCaps where rangeContains(decl.range, nameCap.range) {
                     if bestDecl == nil || decl.range.length < bestDecl!.range.length {
                         bestDecl = decl
@@ -247,7 +246,7 @@ enum SwiftCodeMapStrategy {
 
     /// Handles a Swift-specific capture. Returns true if handled, false to fall through to default handling.
     static func handleCapture(
-        _ cap: NamedRange,
+        _ cap: CodeMapIndexedCapture,
         context: Context,
         index: CodeMapCaptureIndex,
         content: String,
@@ -822,11 +821,14 @@ enum SwiftCodeMapStrategy {
         return trimmed
     }
 
-    private static func smallestContainingRange(in ranges: [NamedRange], for target: NSRange) -> NamedRange? {
+    private static func smallestContainingRange(
+        in ranges: [CodeMapIndexedCapture],
+        for target: NSRange
+    ) -> CodeMapIndexedCapture? {
         let endIdx = ranges.binarySearch { $0.range.location <= target.location }
         guard endIdx > 0 else { return nil }
 
-        var best: NamedRange? = nil
+        var best: CodeMapIndexedCapture? = nil
         for i in stride(from: endIdx - 1, through: 0, by: -1) {
             let candidate = ranges[i]
             if rangeContains(candidate.range, target),

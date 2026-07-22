@@ -419,7 +419,7 @@ struct CodeMapGenerator {
             // Prefer range-based class boundaries when available
             let classDeclCaps = captureIndex.captures(named: "type.class.decl")
             let enumDeclCaps = captureIndex.captures(named: "type.enum.decl")
-            var declCaps: [NamedRange] = []
+            var declCaps: [CodeMapIndexedCapture] = []
             declCaps.reserveCapacity(classDeclCaps.count + enumDeclCaps.count)
             declCaps.append(contentsOf: classDeclCaps)
             declCaps.append(contentsOf: enumDeclCaps)

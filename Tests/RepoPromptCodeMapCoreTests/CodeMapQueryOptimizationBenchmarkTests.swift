@@ -3,6 +3,79 @@ import XCTest
 @testable import RepoPromptCodeMapCore
 
 final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
+    func testPreMaterializedSwiftAndTypeScriptGeneratorAttribution() throws {
+        let cases: [(name: String, language: LanguageType, source: String)] = [
+            ("swift", .swift, Self.swiftSource(declarationCount: 200)),
+            ("typescript", .ts, Self.typeScriptSource(declarationCount: 200)),
+        ]
+
+        for benchmark in cases {
+            let queryOutcome = try CodeMapSyntaxEngine.shared.codeMap(
+                content: benchmark.source,
+                language: benchmark.language
+            )
+            guard case let .captures(captures) = queryOutcome else {
+                throw BenchmarkError.queryNotReady(queryOutcome)
+            }
+            guard let expectedArtifact = CodeMapGenerator.generateSyntaxArtifact(
+                from: captures,
+                content: benchmark.source,
+                language: benchmark.language
+            ) else {
+                throw BenchmarkError.generatorReturnedNil
+            }
+
+            for _ in 0 ..< 2 {
+                let artifact = CodeMapGenerator.generateSyntaxArtifact(
+                    from: captures,
+                    content: benchmark.source,
+                    language: benchmark.language
+                )
+                XCTAssertEqual(artifact, expectedArtifact)
+            }
+
+            var samplesMS: [Double] = []
+            samplesMS.reserveCapacity(20)
+            for _ in 0 ..< 20 {
+                let start = ProcessInfo.processInfo.systemUptime
+                let artifact = CodeMapGenerator.generateSyntaxArtifact(
+                    from: captures,
+                    content: benchmark.source,
+                    language: benchmark.language
+                )
+                samplesMS.append((ProcessInfo.processInfo.systemUptime - start) * 1_000)
+                XCTAssertEqual(artifact, expectedArtifact)
+            }
+
+            let collector = CodeMapPerformanceCollector(collectsCaptureNames: false)
+            let attributedArtifact = CodeMapGenerator.generateSyntaxArtifact(
+                from: captures,
+                content: benchmark.source,
+                language: benchmark.language,
+                perfOptions: .countersOnly,
+                perfStats: collector
+            )
+            let repeatArtifactEquality = attributedArtifact == expectedArtifact
+            XCTAssertTrue(repeatArtifactEquality)
+
+            print(
+                [
+                    "CODEMAP_PREMATERIALIZED_GENERATOR_BENCHMARK",
+                    "language=\(benchmark.name)",
+                    "declarations=200",
+                    "raw_samples_ms=\(Self.formattedSamples(samplesMS))",
+                    "median_ms=\(Self.formattedMilliseconds(Self.median(samplesMS)))",
+                    "p95_ms=\(Self.formattedMilliseconds(Self.percentile95(samplesMS)))",
+                    "max_ms=\(Self.formattedMilliseconds(samplesMS.max() ?? 0))",
+                    "capture_index_ms=\(Self.milliseconds(collector.captureIndexDuration))",
+                    "capture_loop_ms=\(Self.milliseconds(collector.captureLoopDuration))",
+                    "captures=\(captures.count)",
+                    "repeat_artifact_equality=\(repeatArtifactEquality)",
+                ].joined(separator: " ")
+            )
+        }
+    }
+
     func testSyntheticSwiftAndTypeScriptAttribution() throws {
         let cases: [(name: String, language: LanguageType, source: String)] = [
             ("swift", .swift, Self.swiftSource(declarationCount: 200)),
@@ -149,9 +222,9 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
             "construct_signature",
             "index_signature",
         ]
-        let targetCaptures = captures.filter { targetNames.contains($0.name) }
-        XCTAssertEqual(Set(targetCaptures.map(\.name)), targetNames)
         let index = CodeMapCaptureIndex(captures)
+        let targetCaptures = index.all.filter { targetNames.contains($0.name) }
+        XCTAssertEqual(Set(targetCaptures.map(\.name)), targetNames)
         let nsContent = source as NSString
 
         for capture in targetCaptures {
@@ -196,6 +269,8 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
 
     private enum BenchmarkError: Error {
         case notReady(CodeMapSyntaxArtifactOutcome)
+        case queryNotReady(CodeMapSyntaxQueryOutcome)
+        case generatorReturnedNil
     }
 
     private func build(
@@ -218,6 +293,31 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
 
     private static func milliseconds(_ duration: TimeInterval) -> String {
         String(format: "%.3f", duration * 1_000)
+    }
+
+    private static func formattedMilliseconds(_ milliseconds: Double) -> String {
+        String(format: "%.3f", milliseconds)
+    }
+
+    private static func formattedSamples(_ samples: [Double]) -> String {
+        "[\(samples.map(formattedMilliseconds).joined(separator: ","))]"
+    }
+
+    private static func median(_ samples: [Double]) -> Double {
+        let sorted = samples.sorted()
+        guard !sorted.isEmpty else { return 0 }
+        let midpoint = sorted.count / 2
+        if sorted.count.isMultiple(of: 2) {
+            return (sorted[midpoint - 1] + sorted[midpoint]) / 2
+        }
+        return sorted[midpoint]
+    }
+
+    private static func percentile95(_ samples: [Double]) -> Double {
+        let sorted = samples.sorted()
+        guard !sorted.isEmpty else { return 0 }
+        let index = max(0, Int(ceil(Double(sorted.count) * 0.95)) - 1)
+        return sorted[index]
     }
 
     private static func swiftSource(declarationCount: Int) -> String {
