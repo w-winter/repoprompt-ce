@@ -58,7 +58,6 @@ var repoPromptAppDependencies: [Target.Dependency] = [
     .product(name: "MarkdownUI", package: "swift-markdown-ui"),
     .product(name: "Markdown", package: "swift-markdown"),
     .product(name: "MCP", package: "swift-sdk"),
-    .product(name: "SwiftTreeSitter", package: "swift-tree-sitter"),
     .product(name: "SwiftAnthropic", package: "SwiftAnthropic"),
     .product(name: "SwiftOpenAI", package: "SwiftOpenAI"),
     .product(name: "UniversalCharsetDetection", package: "UniversalCharsetDetection"),
@@ -88,6 +87,10 @@ var repoPromptTestSwiftSettings: [SwiftSetting] = [
     .define("DEBUG", .when(configuration: .debug))
 ]
 
+var repoPromptCodeMapTestSwiftSettings: [SwiftSetting] = [
+    .define("DEBUG", .when(configuration: .debug))
+]
+
 if sentryEnabled {
     let sentryDependency = Target.Dependency.product(name: "Sentry", package: "sentry-cocoa")
     repoPromptAppDependencies.append(sentryDependency)
@@ -98,6 +101,7 @@ if sentryEnabled {
 
 if benchmarkTestsEnabled {
     repoPromptTestSwiftSettings.append(.define("RPCE_BENCHMARK_TESTS"))
+    repoPromptCodeMapTestSwiftSettings.append(.define("RPCE_BENCHMARK_TESTS"))
 }
 
 let swift6LanguageMode: [SwiftSetting] = [
@@ -194,9 +198,7 @@ let package = Package(
                 .copy("Fixtures"),
                 .copy("Goldens")
             ],
-            swiftSettings: swift6LanguageMode + [
-                .define("DEBUG", .when(configuration: .debug))
-            ]
+            swiftSettings: swift6LanguageMode + repoPromptCodeMapTestSwiftSettings
         ),
         .testTarget(
             name: "RepoPromptTests",
